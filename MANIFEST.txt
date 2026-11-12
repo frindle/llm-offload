@@ -1,0 +1,106 @@
+# What offload-repo-sync copies into this repo (one-way: live -> repo; the live files are never written).
+# One entry per line; '#' starts a comment. Sections:
+#   [bin-exclude]  ~/bin paths (fnmatch globs) left out of bin/: separate projects that only share the folder.
+#                  Everything else committed in ~/bin (HEAD, not the working tree) is copied, symlinks excepted.
+#   [git-sources]  dest|checkout|ref: that commit of another local checkout becomes <dest>/ (minus its .github/).
+#   [runtime]      globs of files that machines run straight from this repo or its images. They must be free of
+#                  private info BEFORE the scrub, because a scrubbed address would break them.
+#   [hooks]        ~/.claude/hooks/<name>             -> hooks/
+#   [launchd]      ~/Library/LaunchAgents/<name>      -> launchd/
+#   [config]       ~/.ollama-dispatch/<name>          -> config/
+#   [state-docs]   ~/.ollama-dispatch/<name>          -> docs/state/
+#   In the last four, a name with * ? or [ must match exactly one file.
+# Every file is scrubbed and scanned for secrets and private info before anything is committed.
+
+[bin-exclude]
+# media server
+arr-dedup-snapshot.py
+deluge-supersede-scan.py
+# Plex bypass forwarder
+plex_bypass*.py
+test_plex_bypass*.py
+# image / video generation runners
+comfyui-render.py
+txt2img-render.py
+txt2img_exec.py
+img2vid-render.py
+pet-portrait-render.py
+# Darkbloom provider bookkeeping (earnings, power, ledger): a separate project, not offload
+bloom-archive.py
+bloom-backup.py
+bloom-earnings-archive.py
+bloom-influx-push.py
+bloom-integration-livetest.sh
+bloom-manifest.py
+bloom-power-*
+bloom-ship.py
+bloom_archive.py
+bloom_influx.py
+bloom_ledger.py
+bloom_power_lib.py
+bloom_ship.py
+test-bloom-power.py
+test_archive_*.py
+test_ship_*.py
+test_sampler_*.py
+# server monitoring
+unraid_influx.py
+test-unraid-influx.py
+unraid-syslog-receiver.py
+# host upkeep
+net-watch.sh
+remount-data-share.sh
+mount-ollama-models.sh
+restart-claude-sessions.sh
+# vault and knowledge tools (vault-log-append stays: the pipeline logs through it)
+vault-graph.py
+vault-semantic.py
+test_vault_graph.py
+briefd-knowledge-sync.py
+briefd-serve-launcher.sh
+# third-party code vendored for a test tool
+ts-mutator/node_modules/*
+
+[git-sources]
+dashboard|~/Desktop/GitHub Projects.nosync/ollama-queue-dashboard|HEAD
+cpu-runner|~/Desktop/GitHub Projects.nosync/dispatch-cpu-runner|HEAD
+
+[runtime]
+cpu-runner/*
+
+[hooks]
+claude-active-touch.sh
+dispatch-handauthor-gate.sh
+dispatch-handauthor-guard.sh
+dispatch-to-qwen-reminder.sh
+dispatch-troubleshoot-gate.sh
+dispatch-worktree-guard.sh
+ollama-prep-tokens-inject.sh
+ollama-prep-tokens-reminder.sh
+ollama-queue-watch-reminder.sh
+pipeline-canary-reminder.sh
+queue-events-inject.sh
+session-start-escalations.sh
+session-start-handoff-panel.sh
+session-start-live-validation.sh
+vault-agent-dispatch-reminder.sh
+
+[launchd]
+com.*.ollama-queue-daemon.plist
+com.*.ollama-queue-api.plist
+com.*.queue-event-log.plist
+com.*.dispatch-ack-reconcile.plist
+com.*.dispatch-escalation-watcher.plist
+com.*.cpu-prefetch.plist
+com.*.verify-orphan-reap.plist
+com.*.bloomgauge-lease-guard.plist
+com.*.darkbloom-boot-start.plist
+com.*.docsum-ui.plist
+com.*.log-rotate.plist
+
+[config]
+defaults.json
+model-ladder.json
+
+[state-docs]
+mini-swe-workflow-design.md

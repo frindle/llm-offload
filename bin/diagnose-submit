@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Generic offloaded-diagnosis submitter (project-agnostic).
+
+Stages a self-contained workdir (code files + evidence + symptoms), renders a
+symptom-only task from one template, and enqueues it on the local Darkbloom lane.
+The model must return DIAGNOSIS.md + a failing test (test_repro.py) -- nothing else.
+
+Per-project inputs (the only things that change between bugs):
+  --symptoms FILE   observed bad behaviour only; do NOT name a suspect
+  --evidence FILE   output of any read-only collector (repeatable)
+  --code FILE       source file(s) to copy in (repeatable)
+  --pointers TEXT   where to look (file:line ranges), still no conclusion
+  --test-hint TEXT  how a test should load evidence / import the code
+
+Usage: diagnose-submit --name NAME --workdir DIR --symptoms F --evidence F --code F
+       [--pointers T] [--test-hint T] [--model M] [--num-ctx N] [--dry-run]
+Verify afterwards with: diagnose-verify WORKDIR [--mutate FILE:OLD:NEW]
+"""
+import argparse, os, shutil, subprocess, sys
+
+TEMPLATE = """# Diagnosis task: {name}
+
+You are diagnosing a bug. Investigate only; do NOT fix anything.
+
+## Observed symptoms (facts, not causes)
+{symptoms}
+
+## Where to look
+{pointers}
+Evidence files (real captured state, read-only): {evidence}
+Code files (import-only; do NOT read them whole): {code}
+{excerpts}{harness}
+## Deliverables (write both files in the working directory)
+1. `test_repro.py` -- a pytest that loads the evidence and drives the REAL code
+   (import it, do not re-implement it). It must FAIL on the current code and
+   assert the correct behaviour implied by the symptoms. {test_hint}
+2. `DIAGNOSIS.md` -- (a) one-paragraph root cause with file:line, (b) which
+   assertion in test_repro.py demonstrates it, (c) what would change the result.
+
+Rules: use request_diagnostics to run the test and paste its real failing output
+into DIAGNOSIS.md. If the test passes, your hypothesis is wrong; revise it.
+Never report an outcome you did not observe.
+
+Budget and hygiene (you have about 30 tool calls total; test_repro.py must stay under 120 lines):
+- Do not page through the whole code file; read only the line ranges under "Where to look".
+- Never create stub or fake modules to make an import work. If an import fails,
+  set the missing env vars / sys.modules entries inside test_repro.py itself.
+- Write DIAGNOSIS.md only once, at the end, with the file-write tool, never with shell redirects.
+- Write test_repro.py early, run it, then refine. A test that passes means the hypothesis is wrong.
+{retry}
+"""
+
+
+def symbol_excerpts(code_files, names):
+    """Function body + caller sites for each name, via AST (local stand-in for a code graph)."""
+    import ast
+    out = []
+    for f in code_files:
+        src = open(f).read()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for name in names:
+            for fn in (x for x in funcs if x.name == name):
+                body = "\n".join(f"{fn.lineno + i}: {l}" for i, l in enumerate(lines[fn.lineno - 1:fn.end_lineno]))
+                callers = sorted({(c.name, c.lineno) for c in funcs if c is not fn for n in ast.walk(c)
+                                  if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", None)) == name})
+                out.append(f"## {name} ({os.path.basename(f)}:{fn.lineno}-{fn.end_lineno})\nCalled from: "
+                           + (", ".join(f"{c}:{ln}" for c, ln in callers) or "(no callers found)")
+                           + f"\n```python\n{body}\n```\n")
+    return out
+
+
+def git_root(start):
+    """Nearest ancestor of `start` containing .git, or None."""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        up = os.path.dirname(d)
+        if up == d:
+            return None
+        d = up
+
+
+def replay_repo(a):
+    """The repo the replay runs in: --replay-cwd, else the git root above the first --code file. None if neither."""
+    if a.replay_cwd:
+        return os.path.abspath(a.replay_cwd)
+    return git_root(os.path.dirname(os.path.abspath(a.code[0]))) if a.code else None
+
+
+def localize_parts(a):
+    """EXCERPTS parts from `diag-localize slice` (CPU only, no model): ranked suspects, then bodies of the top three."""
+    import json
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diag-localize")
+    cwd = replay_repo(a)
+    if not cwd:
+        print("--localize: no git root above the --code file; pass --replay-cwd. Skipping the slice", file=sys.stderr)
+        return []
+    # the full result (replay/passing commands, output tail, repo path) stays OUTSIDE the model's workdir
+    localdir = a.workdir.rstrip("/") + ".local"
+    os.makedirs(localdir, exist_ok=True)
+    out = os.path.join(localdir, "slice.full.json")
+    cmd = [sys.executable, tool, "slice", "--repo", cwd, "--replay-cmd", a.replay_cmd, "--json", out, "--md", os.path.join(a.workdir, "slice.md")]
+    cmd += ["--passing-cmd", a.passing_cmd] if a.passing_cmd else []
+    for f in a.code:
+        cmd += ["--file", os.path.abspath(f)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out):
+        print("diag-localize slice failed; continuing without suspects: " + (r.stderr or r.stdout)[-300:], file=sys.stderr)
+        return []
+    res = json.load(open(out))
+    safe = {k: v for k, v in res.items() if k not in ("replay_cmd", "passing_cmd", "replay_tail", "repo")}
+    with open(os.path.join(a.workdir, "slice.json"), "w") as fh:
+        json.dump(safe, fh, indent=1)
+    parts = [open(os.path.join(a.workdir, "slice.md")).read()]
+    names = []
+    for x in res["ranked"][:3]:
+        if x["name"].split(".")[-1] not in names:
+            names.append(x["name"].split(".")[-1])
+    if names and a.code:
+        parts += symbol_excerpts(a.code, names)
+    return parts
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--workdir", required=True)
+    ap.add_argument("--symptoms", required=True)
+    ap.add_argument("--evidence", action="append", default=[])
+    ap.add_argument("--code", action="append", default=[])
+    ap.add_argument("--pointers", default="Read the code files listed below.")
+    ap.add_argument("--test-hint", default="")
+    ap.add_argument("--model", default="qwen3.6-35b-a3b-vl-mtp-mxfp8")
+    ap.add_argument("--num-ctx", default="131072")
+    ap.add_argument("--extract", action="append", default=[], help="FILE:START-END line range copied into EXCERPTS.md (repeatable)")
+    ap.add_argument("--symbols", default="", help="comma-separated function names: body + callers (AST) from --code files go into EXCERPTS.md")
+    ap.add_argument("--harness", default="", help="Claude-written python helper (load module, fake I/O from evidence) copied in; the test must import and use it")
+    ap.add_argument("--retry-reason", default="")
+    ap.add_argument("--localize", action="store_true", help="run diag-localize slice first (needs --replay-cmd) and put the ranked suspects in EXCERPTS.md")
+    ap.add_argument("--replay-cmd", default="", help="failing reproduction for --localize, RUN AS A SHELL COMMAND in the repo (never pass untrusted text)")
+    ap.add_argument("--passing-cmd", default="", help="passing tests for per-test Ochiai with --localize, RUN AS A SHELL COMMAND in the repo")
+    ap.add_argument("--replay-cwd", default="", help="repo the replay runs in (default: the git root above the first --code file; error/skip if none). "
+                    "NOTE: --replay-cmd and --passing-cmd are executed as shell commands there, with your privileges")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    os.makedirs(a.workdir, exist_ok=True)
+    for f in a.evidence + a.code:
+        if os.path.abspath(os.path.dirname(f)) != os.path.abspath(a.workdir):
+            shutil.copy(f, a.workdir)
+    excerpts = ""
+    parts = []
+    if a.localize:
+        if not a.replay_cmd:
+            print("--localize needs --replay-cmd; skipping the slice", file=sys.stderr)
+        else:
+            parts += localize_parts(a)
+    if a.symbols:
+        parts += symbol_excerpts(a.code, [x.strip() for x in a.symbols.split(",") if x.strip()])
+    if a.extract or parts:
+        for spec in a.extract:
+            f, rng = spec.rsplit(":", 1)
+            lo, hi = (int(x) for x in rng.split("-"))
+            lines = open(f).read().splitlines()[lo - 1:hi]
+            parts.append(f"## {os.path.basename(f)}:{lo}-{hi}\n```python\n" + "\n".join(f"{lo + i}: {l}" for i, l in enumerate(lines)) + "\n```\n")
+        open(os.path.join(a.workdir, "EXCERPTS.md"), "w").write("\n".join(parts))
+        excerpts = "Relevant code excerpts with line numbers are in EXCERPTS.md -- read that first.\n"
+    harness = ""
+    if a.harness:
+        if os.path.abspath(os.path.dirname(a.harness)) != os.path.abspath(a.workdir):
+            shutil.copy(a.harness, a.workdir)
+        hn = os.path.splitext(os.path.basename(a.harness))[0]
+        harness = f"Harness `{os.path.basename(a.harness)}` is provided: `import {hn}` in test_repro.py and use it to load the code and fake I/O. Do not rewrite it; read it once.\n"
+    task = TEMPLATE.format(excerpts=excerpts, harness=harness, 
+        name=a.name, symptoms=open(a.symptoms).read().strip(), pointers=a.pointers,
+        evidence=", ".join(os.path.basename(f) for f in a.evidence) or "(none)",
+        code=", ".join(os.path.basename(f) for f in a.code) or "(none)",
+        test_hint=a.test_hint, retry=("\nPrevious attempt rejected: " + a.retry_reason) if a.retry_reason else "")
+    tf = os.path.join(a.workdir, "TASK.md")
+    open(tf, "w").write(task)
+    cmd = [os.path.expanduser("~/bin/queue-submit"), "--model", a.model, "--host", "auto",
+           "--task-kind", "coding", "--cwd", a.workdir, "--allow-unisolated",
+           "--task-file", tf, "--capture-final-as", "DIAGNOSIS.md",
+           "--num-ctx", a.num_ctx, "--label", f"diagnose-{a.name}"]
+    if a.dry_run:
+        print(" ".join(cmd))
+        return 0
+    return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

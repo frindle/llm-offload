@@ -1,0 +1,2396 @@
+#!/usr/bin/env python3
+"""mini-spec WORKTREE TASK [--name N] [options]   -- draft a two-phase run dir for ~/bin/mini-swe-runner.py
+
+TASK is a task paragraph or a file holding it. Writes ~/.ollama-dispatch/mini-runs/<name>/{spec.json, TASK.md,
+TASK-sN.md, work/} and runs ~/bin/mini-precheck on it. No model, no network, nothing enqueued.
+
+Inferred mechanically (each with its evidence printed): baseline_from (the worktree, must be a git worktree),
+mode two-phase, allowed files (source paths named in TASK, else the single file defining each backticked/called
+identifier), target_fn (functions named in TASK that are defined in the allowed files; one step per function),
+test runner (node:test or pytest), test_file name/location (the nearest existing convention), test_cmd, suite_cmd
+(existing tests that import the allowed files, else the package's own `npm test`), typecheck_cmd (TS + tsconfig +
+local tsc), drop list, timeout.
+Drafted only (needs a human/Opus): the TASK.md contract. Every unconfirmed line carries `TODO(mini-spec)`;
+`mini-spec --lint RUN_DIR` fails until none is left. Ambiguity (several test runners, an identifier defined in
+several files, mixed languages, nothing to target) is an error with the candidates listed: pass the matching flag.
+
+Intake (fit_check): every build classifies the task for the local model and writes INTAKE.md + spec["intake"]:
+local-ready (exit 0), needs-stubs (3: run --seed-stubs), needs-split (4: add a reach_anchor or a prep step), not-local
+(5: browser-only target). `--override "<reason>"` accepts a non-ready class and records the reason in the spec.
+
+  mini-spec --lint RUN_DIR      fail while TODO(mini-spec) markers remain or a `## Rule coverage` line names no frozen test;
+                                then run mini-precheck
+  mini-spec --intake RUN_DIR    classify an existing run dir (legacy single-phase specs are needs-split)
+  mini-spec --seed-stubs WORKTREE TASK.md [--file F] [--name N] [--apply]
+                                throwing stubs from the task's `Signature:` lines (refuses when there are none). Prints a plan + diff;
+                                writes only with --apply or into a scratch copy (a path under the system temp dir). Commit the result
+                                on the worktree branch, then rerun mini-spec: stubs become the step's reach_anchor + stub_error.
+  mini-spec --impact RUN_DIR    rescan for existing tests that assert the old behaviour (also runs on every build; --no-impact skips,
+                                --impact-ignore FILE drops a test, --impact-max N raises the 6-test limit when the suite runs them
+                                all). Writes IMPACT.md, never TASK.md; STRONG/MEDIUM tests get a TODO bullet
+                                in TASK.md and join suite_cmd. Exit 1 while a STRONG test is in neither spec update_tests nor decided in TASK.md
+                                (update_tests is a runner spec key the human fills; mini-spec never does)
+  mini-spec --freeze RUN_DIR [--force]
+                                commit the filled-in frozen test(s) RUN_DIR/frozen/<test_file> into baseline_from (one commit, git hooks
+                                skipped so the auto-push post-commit template never publishes a dispatch branch). Refuses while a
+                                TODO(frozen-test) is left or the runner's static test rules fail; --force replaces a different file there
+  mini-spec --self-test         temp git repos (node + python), generated specs must pass mini-precheck + --check-only
+
+Frozen test (workflow v2, design (a)): every build also writes RUN_DIR/frozen/<test_file> per step, the runner's template with
+the module loads, placeholder tests (real assertions on a TODO(frozen-test) string, so the shape is already V1-V3 clean and nothing
+passes by accident) and, for python, the explicit TESTS list + RESULT block (python test_cmd runs the file as a plain script). A
+filled-in file is kept on --force. The spec gets red_ok [], baseline_green [] and fn_scope "enforce" up front (per step); mini-validate
+fills fix_steps/fix_wall and a missing target_fn from the reference fix. Flow: fill frozen/ -> --freeze -> ref/ -> mini-validate ->
+mini-submit.
+"""
+import argparse
+import ast
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+RUNNER = Path(os.environ.get("MINI_RUNNER") or HERE / "mini-swe-runner.py")
+PRECHECK = HERE / "mini-precheck"
+RUNS = Path(os.environ.get("MINI_RUNS") or Path.home() / ".ollama-dispatch/mini-runs")
+QUEUE_PATH = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+MARK = "TODO(mini-spec)"
+SRC_EXT = (".py", ".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx")
+DROP_KNOWN = ["verify.sh", "verify.test.ts", "verify_impl.mts", "check_literals.py", "test_fixture.py", "refimpl.py",
+              "draft-check.py", "DRAFT-TASK.md", "auto-harness-check.py", "AUTO-TASK.md", "dispatch-env.ts"]
+DROP_DEFAULT = ["verify.sh", "verify.test.ts", "check_literals.py"]
+WORDS_SKIP = {"true", "false", "null", "None", "True", "False", "undefined", "this", "self", "return", "async", "await",
+              "const", "let", "var", "def", "function", "class", "import", "from", "require", "module", "exports", "assert"}
+MAX_ALLOWED, MAX_STEPS, MAX_SUITE = 3, 5, 12
+BODY_OK, BODY_MAX, MAX_INTAKE_FNS = 80, 150, 2  # fn body lines: <=BODY_OK fine, >BODY_MAX never local without a reach_anchor
+INTAKE_CODES = {"local-ready": 0, "needs-stubs": 3, "needs-split": 4, "not-local": 5}
+
+
+class Ambiguous(Exception):
+    pass
+
+
+def die(msg):
+    raise Ambiguous(msg)
+
+
+def load_runner():
+    sp = importlib.util.spec_from_file_location("mini_swe_runner", RUNNER)
+    r = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(r)
+    return r
+
+
+R = load_runner()
+
+
+def load_coverage():
+    sp = importlib.util.spec_from_file_location("mini_rule_coverage", HERE / "mini_rule_coverage.py")
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    return m
+
+
+def load_graph_mod():
+    sp = importlib.util.spec_from_file_location("mini_graph", os.environ.get("MINI_GRAPH") or HERE / "mini_graph.py")
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    return m
+
+
+MG = load_graph_mod()
+
+
+def graph_for(wt, override=None):
+    """(G, path) of the worktree's graphify graph, (None, None) when absent or unreadable. Read-only."""
+    try:
+        gp = MG.locate_graph(wt, override)
+        return (MG.load(gp), gp) if gp else (None, None)
+    except Exception:
+        return None, None
+
+
+def graph_fns(G, allowed, fns):
+    """Graph node ids of the target functions in the allowed files."""
+    return [i for f in allowed for fn in fns for i in [MG.node_for(G, f, fn)] if i]
+
+
+def git(wt, *a):
+    return subprocess.run(["git", *a], cwd=wt, capture_output=True, text=True).stdout
+
+
+def is_test_path(p):
+    b = Path(p).name
+    return bool(re.match(r"test[_-]", b) or re.search(r"(_test\.py|\.(test|spec)\.[cm]?[jt]sx?)$", b)
+                or any(part in ("test", "tests", "__tests__") for part in Path(p).parts[:-1]))
+
+
+def lang(p):
+    return R.lang_of(p)
+
+
+# ---- source facts -------------------------------------------------------------------------------------------------
+
+def exports(path, text):
+    if lang(path) == "py":
+        m = re.search(r"^__all__\s*=\s*[\[(]([^\])]*)", text, re.M)
+        if m:
+            return re.findall(r"['\"](\w+)['\"]", m.group(1))
+        try:
+            return [n.name for n in ast.parse(text).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not n.name.startswith("_")]
+        except SyntaxError:
+            return []
+    names = []
+    for m in re.finditer(r"module\.exports\s*=\s*\{([^}]*)\}", text):
+        names += [re.split(r"\s*:\s*", x.strip())[0] for x in m.group(1).split(",") if x.strip()]
+    names += re.findall(r"(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=", text)
+    names += re.findall(r"^export\s+(?:default\s+)?(?:async\s+)?(?:function\s*\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)", text, re.M)
+    for m in re.finditer(r"^export\s*\{([^}]*)\}", text, re.M):
+        names += [x.strip().split(" as ")[-1].strip() for x in m.group(1).split(",") if x.strip()]
+    return list(dict.fromkeys(n for n in names if re.fullmatch(r"[A-Za-z_$][\w$]*", n)))
+
+
+def env_reads(text):
+    return sorted(set(re.findall(r"process\.env\.([A-Z][A-Z0-9_]*)", text)
+                      + re.findall(r"process\.env\[['\"]([A-Z][A-Z0-9_]*)['\"]\]", text)
+                      + re.findall(r"os\.environ(?:\.get\(|\[)\s*['\"]([A-Z][A-Z0-9_]*)['\"]", text)
+                      + re.findall(r"os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]", text)))
+
+
+def imports_stem(text, stem, language):
+    s = re.escape(stem)
+    if language == "py" and "." in stem:  # a dotted tail from load_stems: that path, its parent importing the last part, or a bare import
+        h, last = (re.escape(x) for x in stem.rsplit(".", 1))
+        return bool(re.search(rf"^\s*(?:from\s+(?:[\w.]*\.)?{s}\s+import\b|import\s+(?:[\w.]+\.)?{s}\b|from\s+(?:[\w.]*\.)?{h}\s+import\s+[^\n]*\b{last}\b"
+                              rf"|from\s+{last}\s+import\b|import\s+{last}\b(?![\w.]))", text, re.M))
+    if language == "py":
+        return bool(re.search(rf"^\s*(?:from\s+[\w.]*\b{s}\s+import\b|import\s+(?:[\w.]+\.)?{s}\b|from\s+[\w.]+\s+import\s+[^\n]*\b{s}\b)", text, re.M))
+    return bool(re.search(rf"(?:require\(\s*|from\s+|import\(\s*|import\s+)['\"](?:[^'\"]*/)?{s}(?:\.[cm]?[jt]sx?)?['\"]", text))
+
+
+def _stem(f):
+    return Path(f).stem if Path(f).stem not in ("index", "__init__") else Path(f).parent.name
+
+
+def _mod_parts(f):
+    """A python file's dotted module path as parts: a/db/models/__init__.py -> (a, db, models); a/db/x.py -> (a, db, x)."""
+    p = Path(f)
+    return tuple(p.parent.parts) + (() if p.stem == "__init__" else (p.stem,))
+
+
+def load_stems(files, allowed, language):
+    """The names imports_stem looks for, one per allowed file: its stem (for a package's __init__/index file, the directory name).
+    Python, when another tracked module or package has the same stem (moto: each of its 100+ services has a models.py or models/):
+    the shortest dotted tail of the module path that no other one ends with (`db.models`), so `from pkg.acm.models import` and
+    `from pkg.core.models import` no longer count as loading pkg/db/models/__init__.py (motor: 428 callers, 167 impact tests)."""
+    if language != "py":
+        return {_stem(f) for f in allowed}
+    out, pys = set(), [f for f in files if f.endswith(".py")]
+    for f in allowed:
+        me = _mod_parts(f)
+        others = {_mod_parts(g) for g in pys if g != f and _stem(g) == _stem(f)} - {me}
+        if not others or len(me) < 2:
+            out.add(_stem(f))
+            continue
+        k = next((k for k in range(2, len(me) + 1) if all(o[-k:] != me[-k:] for o in others)), len(me))
+        out.add(".".join(me[-k:]))
+    return out
+
+
+# ---- task text ----------------------------------------------------------------------------------------------------
+
+def read_task(arg):
+    p = Path(os.path.expanduser(arg))
+    if not re.search(r"\s", arg) and p.is_file():
+        return p.read_text().strip(), str(p)
+    if not re.search(r"\s", arg):
+        die(f"task {arg!r} is neither an existing file nor a paragraph (no whitespace)")
+    return arg.strip(), None
+
+
+def task_paths(task, files):
+    """Tracked source files the task names (full relative path, or a basename/suffix unique in the repo)."""
+    out = []
+    for tok in re.findall(r"[\w./-]+\.(?:py|js|ts|mjs|cjs|mts|cts|jsx|tsx)\b", task):
+        tok = tok.lstrip("./")
+        hits = [f for f in files if f == tok] or [f for f in files if f.endswith("/" + tok)]
+        if len(hits) > 1:
+            die(f"task names `{tok}`, which matches several files: {hits}. Use the full path in the task or pass --allowed")
+        if hits and hits[0] not in out:
+            out.append(hits[0])
+    return out
+
+
+def task_idents(task):
+    """Identifiers the task names, in order: inside backticks, `name(` calls, camelCase and snake_case words."""
+    found = []
+    for m in re.finditer(r"`([^`\n]+)`|\b([A-Za-z_$][\w$]*)\s*\(|\b([a-z]+[A-Z][\w$]*|[a-z][a-z0-9]*_[a-z0-9_]+)\b", task):
+        if m.group(1):
+            toks = re.findall(r"[A-Za-z_$][\w$]*", m.group(1))
+        else:
+            toks = [m.group(2) or m.group(3)]
+        for t in toks:
+            if t not in WORDS_SKIP and len(t) > 1 and t not in found:
+                found.append(t)
+    return found
+
+
+def backtick_literals(task):
+    return list(dict.fromkeys(x.strip() for x in re.findall(r"`([^`\n]{2,120})`", task) if x.strip()))
+
+
+# ---- inference ----------------------------------------------------------------------------------------------------
+
+class Facts:
+    def __init__(self):
+        self.evidence = []
+
+    def note(self, key, why):
+        self.evidence.append((key, why))
+
+
+def infer_allowed(wt, task, files, src_files, a, F):
+    if a.allowed:
+        bad = [f for f in a.allowed if not Path(wt, f).is_file() and not (Path(wt, f).parent.is_dir() and f.endswith(SRC_EXT))]
+        if bad:
+            die(f"--allowed files not found in {wt} (and their directory does not exist either): {bad}")
+        F.note("allowed", "--allowed" + (" (missing file(s) are needs-stubs)" if any(not Path(wt, f).is_file() for f in a.allowed) else ""))
+        return list(a.allowed)
+    named = [f for f in task_paths(task, files) if f in src_files]
+    if named:
+        F.note("allowed", "source paths named in the task")
+        return named
+    owners = {}
+    for ident in task_idents(task):
+        hits = [f for f in git(wt, "grep", "-l", "-w", "-e", ident, "--", *src_files).split() if f in src_files] if src_files else []
+        defs = [f for f in hits if ident in R.functions(f, Path(wt, f).read_text(errors="replace"))]
+        if defs:
+            owners[ident] = defs
+    if not owners:
+        die("cannot infer the files to edit: the task names no source path and no function defined in a tracked "
+            "non-test file. Name the file in the task or pass --allowed FILE")
+    amb = {k: v for k, v in owners.items() if len(v) > 1}
+    if amb:
+        die("several files define functions the task names: " + "; ".join(f"`{k}` in {v}" for k, v in amb.items())
+            + ". Pass --allowed FILE (or name the path in the task)")
+    F.note("allowed", "files defining " + ", ".join(f"`{k}`" for k in owners))
+    return list(dict.fromkeys(v[0] for v in owners.values()))
+
+
+def infer_fns(wt, task, allowed, texts, a, F):
+    defined = {}
+    for f in allowed:
+        for name, span in R.functions(f, texts[f]).items():
+            defined.setdefault(name, (f, span))
+    if a.no_fn:
+        F.note("target_fn", "--no-fn (none)")
+        return [], defined
+    if a.fn:
+        bad = [x for x in a.fn if x not in defined and not any(R._defines(t, x) for t in texts.values())]
+        F.note("target_fn", "--fn" + (f" ({bad} not defined at baseline: needs-stubs)" if bad else ""))
+        return list(a.fn), defined
+    fns = [i for i in task_idents(task) if i in defined]
+    sigs = [n for n, _ in parse_signatures(task)]
+    if not fns and sigs and not defined:
+        F.note("target_fn", "`Signature:` lines in the task (nothing defined in the allowed files yet: needs-stubs)")
+        return sigs, defined
+    if not fns:
+        die(f"no function in {allowed} is named in the task. Defined there: {list(defined)[:30]}. "
+            "Pass --fn NAME (repeatable) or --no-fn (new code that does not exist yet)")
+    if len(fns) > MAX_STEPS:
+        die(f"{len(fns)} target candidates {fns}: too many for one run. Pass --fn for the ones this run changes")
+    F.note("target_fn", "functions named in the task and defined in the allowed files: " + ", ".join(fns))
+    return fns, defined
+
+
+# ---- intake: is this task fit for the local model? -----------------------------------------------------------------
+
+SIG_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?Signature:[ \t]*`?(?:export[ \t]+)?(?:async[ \t]+)?(?:function[ \t]*\*?[ \t]*|def[ \t]+)?"
+                    r"([A-Za-z_$][\w$]*)[ \t]*\(([^)\n]*)\)[^\n]*", re.M | re.I)
+
+
+def parse_signatures(task):
+    """[(name, params_text)] from `Signature: name(a, b)` lines of a task text (also `Signature: function name(a)` / `def name(a):`)."""
+    out = []
+    for m in SIG_RE.finditer(task):
+        if m.group(1) not in [n for n, _ in out]:
+            out.append((m.group(1), m.group(2).strip()))
+    return out
+
+
+def stub_marker(fn):
+    """The literal a seeded stub throws; unique per function (closing quote included so `foo` is not a prefix of `fooBar`)."""
+    return f"not implemented: {fn}'"
+
+
+def is_stub(text, fn, span):
+    if not span or not span[0]:
+        return False
+    rows = text.splitlines()[span[0] - 1:(span[1] or span[0] + 5)]
+    return stub_marker(fn) in "\n".join(rows)
+
+
+def _if_block(rows, i, py):
+    """(first_idx, last_idx) of the body of the `if`/`elif` on rows[i]: brace depth for JS/TS, indentation for Python.
+    A braceless JS `if` owns the next code line."""
+    if py:
+        ind = len(rows[i]) - len(rows[i].lstrip())
+        j, last = i + 1, None
+        while j < len(rows):
+            if rows[j].strip():
+                if len(rows[j]) - len(rows[j].lstrip()) <= ind:
+                    break
+                last = j
+            j += 1
+        return (i + 1, last) if last is not None else None
+    depth, seen = 0, False
+    for j in range(i, len(rows)):
+        line = re.sub(r"(['\"`])(?:\\.|(?!\1).)*\1", "", rows[j])  # string literals out: braces in them do not count
+        line = re.sub(r"//.*", "", line)
+        if j == i:
+            line = line.lstrip().lstrip("}")  # `} else if (...) {` opens its own block
+        for c in line:
+            if c == "{":
+                depth, seen = depth + 1, True
+            elif c == "}":
+                depth -= 1
+        if seen and depth <= 0:
+            return (i, j)
+        if not seen and j > i and rows[j].strip() and not rows[j].strip().startswith("//"):
+            return (j, j)
+    return None
+
+
+def guard_lines(path, text, span, stop=None):
+    """[(line, stripped)] of early exits in a function body before line `stop` (default: the whole body): an `if`/`elif`
+    whose own line or WHOLE block (brace depth for JS, indentation for Python) contains a return/throw/raise."""
+    first, last = span
+    rows = text.splitlines()
+    end = min((stop - 1) if stop else (last or len(rows)), len(rows))
+    py = lang(path) == "py"
+    exit_rx = r"\b(?:return|raise)\b" if py else r"\b(?:return|throw)\b"
+    out, skip_to = [], -1
+    for i in range(first, end):  # rows[first] is the line after the signature line
+        if i <= skip_to:
+            continue
+        s = rows[i].strip()
+        if not re.match(r"(?:\}\s*)?(?:else\s+)?(?:if|elif)\b", s):
+            continue
+        if re.search(exit_rx, s):
+            out.append((i + 1, s[:100]))
+            continue
+        blk = _if_block(rows, i, py)
+        body = [r.strip() for r in rows[blk[0]:blk[1] + 1]] if blk else []
+        body = [r for r in body if r and not r.startswith(("//", "#"))]
+        if any(re.search(exit_rx, r) for r in body):
+            out.append((i + 1, s[:100]))
+            skip_to = blk[1]
+    return out
+
+
+def fit_check(wt, allowed, fns, texts, defined, anchors, legacy=False, tried=(), override=None):
+    """Mechanical fit for a local qwen run. Returns {class, reasons, metrics, next, tried, override}. class is one of
+    INTAKE_CODES: local-ready, needs-stubs (file/function missing or nothing exported), needs-split (several files or
+    functions, a big body without a reach_anchor, >=2 early exits before the anchor, legacy single-phase), not-local
+    (target only runs inside page.evaluate)."""
+    anchors = anchors or {}
+    reasons, why = {"needs-stubs": [], "not-local": [], "needs-split": []}, {}
+    m = {"files": len(allowed), "target_fns": len(fns), "mode": "single-phase" if legacy else "two-phase", "body_lines": {},
+         "guards": {}, "anchors": {k: v for k, v in anchors.items() if v}}
+    for f in allowed:
+        if not Path(wt, f).is_file():
+            reasons["needs-stubs"].append(f"`{f}` does not exist at baseline")
+        elif lang(f) == "node" and not exports(f, texts.get(f, "")) and not R.functions(f, texts.get(f, "")):
+            reasons["needs-stubs"].append(f"`{f}` has no functions and no exports (a placeholder)")
+    for fn in fns:
+        if fn not in defined and not any(R._defines(t, fn) for t in texts.values()):
+            reasons["needs-stubs"].append(f"`{fn}` is not defined in {allowed} at baseline")
+    bo = R.in_browser_only(wt, allowed, [f for f in fns if f in defined])
+    if bo:
+        reasons["not-local"].append(f"{bo} only run inside page.evaluate(); node coverage cannot reach them")
+    for fn, lits in anchors.items():
+        if any(re.search(r"\bevaluate(?:All|Handle)?\(|\$\$?eval\(", x) for x in lits):
+            reasons["not-local"].append(f"reach_anchor for `{fn}` is a page.evaluate call: the logic under change runs in the browser")
+    if legacy:
+        reasons["needs-split"].append("legacy single-phase spec (verify.sh oracle): its full test output piles into the model's context")
+    if len(allowed) > 1:
+        reasons["needs-split"].append(f"{len(allowed)} files to edit ({', '.join(allowed)}); one file per run")
+    if len(fns) > MAX_INTAKE_FNS:
+        reasons["needs-split"].append(f"{len(fns)} target functions (max {MAX_INTAKE_FNS})")
+    for fn in fns:
+        hit = next(((f, defined[fn][1]) for f in allowed if fn in R.functions(f, texts.get(f, ""))), None) if fn in defined else None
+        if not hit:
+            continue
+        f, (a, b) = hit
+        text, lits = texts[f], anchors.get(fn) or []
+        n = (b or len(text.splitlines())) - a + 1
+        m["body_lines"][fn] = n
+        stops = [anchor_n for anchor_n in (R.anchor_line(text, x) for x in lits) if anchor_n]
+        gl = guard_lines(f, text, (a, b), max(stops) if stops else None)
+        m["guards"][fn] = [f"{f}:{ln} {s}" for ln, s in gl]
+        if n > BODY_MAX and not lits:
+            reasons["needs-split"].append(f"`{fn}` body is {n} lines (> {BODY_MAX}) with no reach_anchor")
+        elif n > BODY_OK and not lits:
+            reasons["needs-split"].append(f"`{fn}` body is {n} lines (> {BODY_OK}) with no reach_anchor")
+        absent = bool(lits) and not stops
+        if absent:
+            m.setdefault("anchor_absent", []).append(fn)
+        if lits and len(gl) >= 2:
+            # Out-of-scope guards: NOT a split reason. In v2 the frozen test is Claude's and mini-validate V3 (the runner's
+            # reach gate) rejects any test that never executes the anchor line, so early exits before a one-block fix are
+            # the test author's setup problem, not a reason to split. They do predict a weak LOCAL test draft (the 25%/18%
+            # reach of sync-queue / amz-2p), hence test_draft_ok=False: write the frozen test yourself.
+            m.setdefault("guard_notes", []).append(
+                f"`{fn}` has {len(gl)} early return/throw guards "
+                + ("(counted over the WHOLE body: reach_anchor text " + ", ".join(f'"{x}"' for x in lits)
+                   + " is absent at baseline, the fix will add it; so whether the guards precede the anchor is unknown): "
+                   if absent else "before its anchor: ")
+                + "; ".join(f"{f}:{ln} `{s}`" for ln, s in gl[:4])
+                + ". The frozen test must set up state that passes them (mini-validate V3 rejects a test that never runs the anchor "
+                  "line); don't hand this test to mini-testdraft.")
+            m["test_draft_ok"] = False
+    cls = next((c for c in ("needs-stubs", "not-local", "needs-split") if reasons[c]), "local-ready")
+    nxt = {"local-ready": "lint the TASK.md drafts (`mini-spec --lint RUN_DIR`), then enqueue.",
+           "needs-stubs": "run `mini-spec --seed-stubs WORKTREE TASK.md` (prints the plan; `--apply` writes it), commit the stubs on the "
+                          "worktree branch, then rerun mini-spec.",
+           "needs-split": "add a reach_anchor (`--reach-anchor LITERAL`: the TASK's entry-point line, which also lifts the whole-body coverage "
+                          "rule) or add a prep step that extracts a helper from the guarded region; split multi-file/multi-function work into one run each.",
+           "not-local": "split: extract the page.evaluate body into a pure helper first (a node-testable function), then target that."}[cls]
+    info = {"class": cls, "reasons": reasons[cls] if cls != "local-ready" else [], "all_reasons": {k: v for k, v in reasons.items() if v},
+            "metrics": m, "next": nxt, "tried": list(tried)}
+    if cls != "local-ready" and tried:
+        info["handoff"] = "HANDOFF-CLAUDE (last resort)"
+    if override:
+        info["override"] = override
+    return info
+
+
+def intake_text(name, info):
+    m = info["metrics"]
+    lines = [f"# INTAKE: {name}", "", f"class: **{info['class']}**" + (f" (overridden: {info['override']})" if info.get("override") else ""), ""]
+    lines += [f"- {r}" for r in info["reasons"]] or ["- one file, <=2 target functions, defined at baseline, two-phase, node-testable, body bounded"]
+    lines += [f"- note: {x}" for x in m.get("guard_notes", [])]
+    lines += ["", "metrics: " + json.dumps({k: v for k, v in m.items() if v not in ({}, [])}), "", f"next action: {info['next']}"]
+    if info.get("tried"):
+        lines.append("tried: " + "; ".join(info["tried"]))
+    if info.get("handoff"):
+        lines.append(info["handoff"])
+    return "\n".join(lines) + "\n"
+
+
+def print_intake(info):
+    print(f"INTAKE {info['class']}" + (f" (override: {info['override']})" if info.get("override") else ""))
+    for r in info["reasons"]:
+        print(f"  - {r}")
+    for g, gl in info["metrics"]["guards"].items():
+        if gl and info["class"] == "needs-split":
+            print(f"  guard lines in `{g}`: " + "; ".join(gl[:6]))
+    for x in info["metrics"].get("guard_notes", []):
+        print(f"  note: {x}")
+    print(f"  next: {info['next']}")
+    if info.get("handoff"):
+        print(f"  {info['handoff']}: a split/seed was tried ({'; '.join(info['tried'])}) and the task is still not local")
+
+
+def nearest_pkg(wt, f):
+    d = Path(wt, f).parent
+    root = Path(wt).resolve()
+    while True:
+        if (d / "package.json").is_file():
+            return d.resolve()
+        if d.resolve() == root:
+            return None
+        d = d.parent
+
+
+def rel(p, base):
+    r = os.path.relpath(p, base)
+    return "." if r == "." else r
+
+
+def detect_node_runner(wt, pkg, files, F, forced):
+    sig = {}
+    pj = {}
+    if pkg is not None:
+        try:
+            pj = json.loads((pkg / "package.json").read_text())
+        except ValueError:
+            die(f"{pkg}/package.json is not valid JSON")
+    deps = {**(pj.get("dependencies") or {}), **(pj.get("devDependencies") or {})}
+    for fw in ("vitest", "jest", "mocha", "ava", "tap"):
+        if fw in deps:
+            sig.setdefault(fw, []).append(f"{fw} in package.json dependencies")
+    for k, v in (pj.get("scripts") or {}).items():
+        for fw in ("vitest", "jest", "mocha", "ava"):
+            if re.search(rf"\b{fw}\b", v):
+                sig.setdefault(fw, []).append(f"scripts.{k} runs {fw}")
+        if re.search(r"\bnode\b[^&|;]*\s--test\b", v):
+            sig.setdefault("node-test", []).append(f"scripts.{k} runs node --test")
+    base = pkg or Path(wt).resolve()
+    for pat, fw in (("vitest.config.*", "vitest"), ("jest.config.*", "jest"), (".mocharc*", "mocha")):
+        for c in base.glob(pat):
+            sig.setdefault(fw, []).append(rel(c, Path(wt).resolve()))
+    prefix = rel(base, Path(wt).resolve())
+    tests = [f for f in files if is_test_path(f) and lang(f) == "node" and (prefix == "." or f.startswith(prefix + "/"))]
+    for f in tests[:200]:
+        try:
+            t = Path(wt, f).read_text(errors="replace")
+        except OSError:      # tracked but deleted in the working tree
+            continue
+        if re.search(r"['\"]vitest['\"]", t):
+            sig.setdefault("vitest", []).append(f"{f} imports vitest")
+        elif re.search(r"['\"]@jest/globals['\"]", t):
+            sig.setdefault("jest", []).append(f"{f} imports @jest/globals")
+        elif re.search(r"['\"]node:test['\"]", t):
+            sig.setdefault("node-test", []).append(f"{f} uses node:test")
+    if forced:
+        F.note("runner", f"--runner {forced}")
+        return forced, pj
+    fws = sorted(k for k in sig if k != "node-test")
+    if fws and "node-test" in sig or len(fws) > 1:
+        die("several test runners in " + rel(base, Path(wt).resolve()) + ": " + "; ".join(f"{k}: {v[:3]}" for k, v in sorted(sig.items()))
+            + ". Pass --runner node-test (the runner's skeleton and coverage gates assume node:test)")
+    if fws:
+        die(f"{fws[0]} detected ({sig[fws[0]][:3]}); mini-swe-runner's skeleton and coverage gates assume node:test. "
+            "Pass --runner node-test to write the new test with node:test anyway")
+    F.note("runner", "node:test (" + ("; ".join(sig["node-test"][:2]) if "node-test" in sig else "no framework found; node:test default") + ")")
+    return "node-test", pj
+
+
+def detect_python(wt, F, forced):
+    root = Path(wt)
+    sig = []
+    for c in ("pytest.ini", "conftest.py"):
+        if (root / c).is_file():
+            sig.append(c)
+    for c, sect in (("pyproject.toml", "[tool.pytest"), ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+        if (root / c).is_file() and sect in (root / c).read_text(errors="replace"):
+            sig.append(f"{c} {sect}")
+    py = ".venv/bin/python" if os.access(root / ".venv/bin/python", os.X_OK) else "python3"
+    exe = str(root / py) if "/" in py else shutil.which("python3", path=QUEUE_PATH)
+    if not exe or subprocess.run([exe, "-c", "import pytest"], capture_output=True, env={**os.environ, "PATH": QUEUE_PATH}).returncode != 0:
+        die(f"pytest is not importable with {py} on the queue PATH; install it there (the skeleton and gates need pytest)")
+    if forced and forced != "pytest":
+        die(f"--runner {forced} is not supported for python (pytest only)")
+    F.note("runner", f"pytest via {py} ({', '.join(sig) or 'no pytest config; pytest runs plain test_*.py and unittest'})")
+    return "pytest", py
+
+
+def test_style(wt, files, f, pkg, language, F, forced):
+    """Where the repo keeps tests for this file: sibling (x.test.ts / test_x.py next to it), prefix (test-*.js in
+    the package dir), or testdir (tests/ or test/ under the package dir)."""
+    d = str(Path(f).parent)
+    base = rel(pkg, Path(wt).resolve()) if pkg else "."
+    under = lambda p, root: root == "." or p.startswith(root + "/")
+    tests = [t for t in files if is_test_path(t) and lang(t) == language]
+    count = {
+        "sibling": [t for t in tests if str(Path(t).parent) == d and not Path(t).name.startswith("test-")],
+        "prefix": [t for t in tests if str(Path(t).parent) == base and Path(t).name.startswith("test-")] if language == "node" else [],
+        "testdir": [t for t in tests if under(t, base) and Path(t).parts[len(Path(base).parts) if base != "." else 0:][:1] in (("test",), ("tests",))],
+    }
+    if forced:
+        F.note("test_file", f"--test-style {forced}")
+        return forced, count[forced]
+    ranked = sorted(count.items(), key=lambda kv: -len(kv[1]))
+    if not ranked[0][1]:
+        F.note("test_file", "no existing tests near the file; sibling default")
+        return "sibling", []
+    if len(ranked[1][1]) == len(ranked[0][1]):
+        die(f"test location is ambiguous: {ranked[0][0]} ({len(ranked[0][1])} files) vs {ranked[1][0]} ({len(ranked[1][1])}). "
+            "Pass --test-style sibling|prefix|testdir")
+    F.note("test_file", f"{ranked[0][0]} convention ({len(ranked[0][1])} existing, e.g. {ranked[0][1][0]})")
+    return ranked[0][0], ranked[0][1]
+
+
+def kebab(s):
+    return re.sub(r"[^a-z0-9]+", "-", re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", s).lower()).strip("-") or "x"
+
+
+def snake(s):
+    return kebab(s).replace("-", "_")
+
+
+def _mirror_part(x):
+    """A path part as a test tree mirrors it: test_s3, s3_tests and _s3 all read as s3."""
+    return re.sub(r"^tests?_|_tests?$", "", x.lstrip("_")) or x
+
+
+def mirror_dir(src, examples):
+    """The directory of a tests/ tree that a new python test for src goes in: the examples' directory whose path mirrors src's
+    directory best, i.e. the longest shared tail of path parts with test_/_tests and a leading _ ignored. For example
+    src/mcp/server/fastmcp/resources -> tests/server/fastmcp/resources, moto/s3 -> tests/test_s3, and
+    optuna/samplers/_tpe -> tests/samplers_tests/tpe_tests. Ties go to more tests there, then to the shallower path.
+    With no shared tail, the shallowest directory wins, then the one with the most tests. None without examples. Before
+    2026-11-05 this was the first example's directory, which is arbitrary in a tree with many test directories (mcp-sdk's
+    lane test went to tests/ instead of tests/server/fastmcp/resources)."""
+    n = {}
+    for e in examples:
+        d = str(Path(e).parent)
+        n[d] = n.get(d, 0) + 1
+    if not n:
+        return None
+    sp = [_mirror_part(x) for x in Path(src).parent.parts]
+
+    def key(d):
+        dp = [_mirror_part(x) for x in Path(d).parts]
+        k = 0
+        while k < min(len(sp), len(dp)) and sp[-1 - k] == dp[-1 - k]:
+            k += 1
+        return (k, n[d], -len(dp)) if k else (0, -len(dp), n[d])
+    return max(sorted(n), key=key)
+
+
+def test_name(wt, f, fn, style, examples, pkg, language, taken, multi):
+    p = Path(f)
+    stem, ext = p.stem, p.suffix
+    tag = fn or stem
+    used = set()
+    if language == "py":
+        d = {"sibling": str(p.parent), "testdir": mirror_dir(f, examples) or "tests"}.get(style, str(p.parent))
+        cands = [f"test_{snake(tag)}.py", f"test_{snake(stem)}_{snake(tag)}.py"]
+        if style == "testdir":   # pytest's default import mode takes one module per basename in a tree without __init__.py files
+            used = {Path(e).name for e in examples}
+    else:
+        base = rel(pkg, Path(wt).resolve()) if pkg else "."
+        if style == "sibling":
+            d = str(p.parent)
+            cands = ([f"{stem}.test{ext}"] if not multi else []) + [f"{stem}.{kebab(tag)}.test{ext}"]
+        elif style == "prefix":
+            d = base
+            ex = Path(examples[0]).suffix if examples else ".js"
+            cands = [f"test-{kebab(tag)}{ex}", f"test-{kebab(stem)}-{kebab(tag)}{ex}"]
+        else:
+            d = next((str(Path(e).parent) for e in examples), os.path.join(base, "test"))
+            ex = Path(examples[0]).suffix if examples else ext
+            cands = [f"{kebab(tag)}.test{ex}", f"{kebab(stem)}-{kebab(tag)}.test{ex}"]
+    d = "." if d in ("", ".") else os.path.normpath(d)
+    for c in cands + [f"{Path(cands[-1]).stem}-{i}{Path(cands[-1]).suffix}" for i in range(2, 9)]:
+        tf = os.path.normpath(os.path.join(d, c))
+        if not Path(wt, tf).exists() and tf not in taken and Path(tf).name not in used:
+            return tf
+    die(f"no free test file name in {d} for {tag}")
+
+
+def cmd_in(d, cmd):
+    return cmd if d in (".", "") else f"cd {shlex.quote(d)} && {cmd}"
+
+
+def node_flags(pj, any_ts):
+    """Leading VAR=val assignments and --experimental-strip-types from the package's own node --test script."""
+    scripts = pj.get("scripts") or {}
+    s = scripts.get("test", "")
+    if not re.search(r"\bnode\b[^&|;]*\s--test\b", s):
+        s = next((v for v in scripts.values() if re.search(r"\bnode\b[^&|;]*\s--test\b", v)), "")
+    env = " ".join(re.findall(r"^((?:[A-Z_][A-Z0-9_]*=\S+\s+)+)", s)[:1]).strip()
+    flags = "--experimental-strip-types " if any_ts and "--experimental-strip-types" in s else ""
+    return (env + " " if env else ""), flags
+
+
+# ---- TASK.md draft ------------------------------------------------------------------------------------------------
+
+def draft_task(name, task, i, n, fn, allowed, texts, defined, fns, tf, tcmd, callers, runner_desc, impact=None):
+    hdr = (f"<!-- {MARK}: DRAFT written by mini-spec from the task paragraph plus mechanical facts. A human or Opus must "
+           "confirm or rewrite every line carrying the marker, then delete this comment. `mini-spec --lint <run dir>` "
+           "fails while any marker remains. -->")
+    title = f"# TASK: {name}" + (f" step {i}/{n}: `{fn}`" if n > 1 else "")
+    f_of = defined.get(fn, (allowed[0], None))[0] if fn else allowed[0]
+    span = defined.get(fn, (None, (None, None)))[1] if fn else (None, None)
+    where = (f" (about lines {span[0]}-{span[1]})" if span and span[0] and span[1] else f" (line {span[0]})" if span and span[0] else "")
+    entry = (f"`{f_of}` `{fn}`{where}." if fn else "`" + "`, `".join(allowed) + "`.")
+    lines = [hdr, "", title, "", "## Confirmed defect (observed, not suspected)", "", task, "",
+             f"{MARK}: confirm the defect was observed (repro and output, not a suspicion) and state the exact wrong vs wanted "
+             f"result" + (f" for `{fn}`" if fn else "") + ".", "", "## Entry point", "", entry, "", "## Required change", ""]
+    if n > 1:
+        others = [x for x in fns if x != fn]
+        lines += [f"This step only: `{fn}`. " + (f"{', '.join(f'`{x}`' for x in others)} are separate steps; do not change them here." if others else ""), ""]
+    lines += [f"{MARK}: the exact contract" + (f" of `{fn}`" if fn else "") + " (inputs -> outputs, edge cases, error handling).", "",
+              "Behaviour that must NOT change:"]
+    for f in allowed:
+        other = [x for x in R.functions(f, texts[f]) if x not in (fns or [])]
+        if other:
+            lines.append(f"- Other functions in `{f}` keep their behaviour: " + ", ".join(f"`{x}`" for x in other[:15])
+                         + (" ..." if len(other) > 15 else "") + f". {MARK}: confirm; drop any this change must touch.")
+        ex = exports(f, texts[f])
+        if ex:
+            lines.append(f"- The public names of `{f}` stay as they are: " + ", ".join(f"`{x}`" for x in ex[:15]) + f". {MARK}: confirm.")
+    if callers:
+        lines.append("- Callers are not edited: " + ", ".join(f"`{c}`" for c in callers[:8]) + ".")
+    lines += [f"- {MARK}: concrete input -> output pairs that must stay the same.", "", "## Must contain", ""]
+    base = "\n".join(texts.values())
+    new_lits = [x for x in backtick_literals(task) if x not in base and not re.fullmatch(r"[\w./-]+\.\w+", x)][:8]
+    lines += [f"- `{x}` {MARK}: confirm (named in the task, absent at baseline)" for x in new_lits]
+    lines += [f"- {MARK}: literals the fix must add (each must be absent at baseline).", ""]
+    if fn:
+        m = re.search(rf"(?:\bdef\s+|\bfunction\s*\*?\s*){re.escape(fn)}\s*\(", texts[f_of])
+        if m:
+            lines += ["## Must keep", "", f"- `{m.group(0)}` {MARK}: confirm (drop if the change renames it).", ""]
+    envs = sorted(set(sum((env_reads(texts[f]) for f in allowed), [])))
+    lines += ["## Test notes", "", f"New test file `{tf}` (a new file; the runner writes a skeleton with the module loads). "
+              f"Run with `{tcmd}`. {runner_desc}"]
+    if envs:
+        lines.append(f"The code reads env vars {', '.join(f'`{e}`' for e in envs)}: set what it needs inside the test before "
+                     "loading the module, or in the spec's `env`.")
+    lines += [f"{MARK}: fixtures or fakes the test needs, and what it must assert (it must FAIL on the current code"
+              + (f" and call `{fn}`" if fn else "") + ").",
+              f"{MARK}: frozen test (Opus writes it): fill `frozen/{tf}` in the run dir, then `mini-spec --freeze <run dir>` commits it "
+              "to baseline_from and the local model only writes the fix. Delete this line either way.", ""]
+    eg = "test_skips_undated_rows" if tf.endswith(".py") else "skips undated rows"
+    lines += ["## Rule coverage", "",
+              f"- {MARK}: one line per rule of Required change, bad and missing input included (None, empty, a wrong type, "
+              "malformed, an absent key or file), each ending with the frozen test that asserts it in backticks, e.g. "
+              f"\"a row without a date is skipped -> `{eg}`\". A test may pin several rules, one assert each. mini-validate V8 "
+              f"fails a line that names no test of `frozen/{tf}`: 27 of the first 35 sampled-review rejects were a rule no frozen "
+              "assertion checked.", ""]
+    lines += impact_section(impact)
+    lines += ["## Scope", "",
+              "Only edit " + ", ".join(f"`{f}`" for f in allowed) + " (plus the new test file in the test phase).", ""]
+    return "\n".join(lines)
+
+
+# ---- impact: existing tests that assert the behaviour this change replaces ----------------------------------------
+
+IMPACT_SKIP = re.compile(r"(^|/)(node_modules|\.next|generated|dist|build|vendor)/")
+IMPACT_SEC = "## Tests that assert current behaviour"
+IMPACT_MAX = 6  # STRONG+MEDIUM tests that become TODO entries / suite members
+STOP_EN = {"the", "and", "for", "with", "that", "this", "from", "not", "but", "are", "was", "were", "will", "when", "then",
+           "than", "its", "has", "have", "had", "can", "should", "must", "may", "all", "any", "each", "only", "also", "into",
+           "out", "off", "one", "two", "new", "old", "now", "get", "set", "use", "uses", "used", "via", "per", "yet", "who",
+           "which", "what", "where", "why", "how", "wanted", "instead", "returns", "return", "includes", "include", "filtered"}
+
+
+def resolve_loads(wt, test, text, language):
+    """[(repo-relative file, spec as written)] the test really loads: relative require/import/import() specs for node
+    (tried with .js/.ts/.mjs/.cjs and /index.js), `from X import` / `import X` for python (repo-relative or relative to the test's dir)."""
+    wt, tdir, out = Path(wt), os.path.dirname(test), []
+
+    def add(c, spec):
+        c = os.path.normpath(c)
+        if not c.startswith("..") and Path(wt, c).is_file() and all(c != o[0] for o in out):
+            out.append((c, spec))
+    if language == "py":
+        for m in re.finditer(r"^[ \t]*from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+([^\n#]+)", text, re.M):
+            dots, mod, names = m.groups()
+            bases = [os.path.join(tdir, *([".."] * (len(dots) - 1)))] if dots else ["", tdir]
+            for b in bases:
+                mp = os.path.join(b, *mod.split(".")) if mod else b
+                add(mp + ".py", mod or dots)
+                add(os.path.join(mp, "__init__.py"), mod or dots)
+                for n in re.findall(r"\b([A-Za-z_]\w*)\b(?!\s+as\b)", names):
+                    add(os.path.join(mp, n + ".py"), f"{mod or dots}.{n}")
+                    add(os.path.join(mp, n, "__init__.py"), f"{mod or dots}.{n}")  # `from pkg.db import models`, models/ a package
+        for m in re.finditer(r"^[ \t]*import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*)", text, re.M):
+            for mod in re.split(r"\s*,\s*", m.group(1)):
+                for b in ("", tdir):
+                    mp = os.path.join(b, *mod.split("."))
+                    add(mp + ".py", mod)
+                    add(os.path.join(mp, "__init__.py"), mod)
+        return out
+    specs = re.findall(r"""(?:require\(\s*|import\(\s*|from\s+|import\s+)['"]([^'"]+)['"]""", text)
+    for spec in dict.fromkeys(specs):
+        if not spec.startswith("."):
+            continue
+        p = os.path.normpath(os.path.join(tdir, spec))
+        alts = [p + e for e in ("", ".js", ".ts", ".mjs", ".cjs", ".mts", ".tsx", "/index.js", "/index.ts")]
+        if re.search(r"\.[cm]?js$", p):  # ESM TypeScript imports its sources as .js
+            alts.append(re.sub(r"\.([cm]?)js$", r".\1ts", p))
+        for c in alts:
+            add(c, spec)
+    return out
+
+
+def derive_literals(task, texts, fns=()):
+    """[(literal, kind, why)] the task's wording that the old behaviour would also contain in a test: bare task words that
+    appear as a quoted string in an allowed file ('costco'), CONST_NAMES / env vars the task names, and backtick literals
+    already present at baseline."""
+    base, out = "\n".join(texts.values()), {}
+    home = lambda s, rx=None: next((f for f, t in texts.items() if (re.search(rx, t, re.I) if rx else s in t)), None)
+    for x in re.findall(r"`([^`\n]{3,120})`", task):
+        x = x.strip()
+        if x in base and x not in fns and not re.fullmatch(r"[\w./-]+\.\w+", x) and not re.fullmatch(r"[A-Za-z_$][\w$]*", x):
+            out.setdefault(x.lower(), (x, "text", f"backtick literal present at baseline in {home(x)}"))
+    for w in re.findall(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9]\b", task):
+        if len(w) >= 4:
+            out.setdefault(w.lower(), (w, "env", "env var/constant named in the task" + (" (read by the allowed file)" if w in env_reads(base) else "")))
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", task):
+        lw = w.lower()
+        if lw in WORDS_SKIP or lw in STOP_EN or w in fns or lw in out:
+            continue
+        rx = r"""['"`]%s['"`]""" % re.escape(w)
+        if re.search(rx, base, re.I):
+            out[lw] = (lw, "word", f"quoted string in {home(None, rx)}")
+    return list(out.values())
+
+
+def _lit_pat(lit, kind):
+    if kind == "word":
+        return re.compile(r"""['"`]%s['"`]""" % re.escape(lit), re.I)
+    return re.compile(r"\b%s\b" % re.escape(lit) if kind == "env" else re.escape(lit))
+
+
+def impact_scan(wt, files, allowed, texts, fns, task, language, callers, ignore=(), G=None, limit=None):
+    """Existing tests that probably assert the behaviour the task replaces. Load edge: A = really loads an allowed file,
+    A' = loads one of `callers`, stem-only = only a name match on the file stem. Content: S = names a target fn or an export
+    the task mentions, L = a derived literal. STRONG = A and (S or L); MEDIUM = A' and (S or L), or stem-only and L;
+    WEAK = L with no load edge. Raises Ambiguous when more than `limit` (default IMPACT_MAX) STRONG/MEDIUM tests (split, or
+    --impact-ignore). The auto lane passes a higher limit (bench-cfgkeys2 found 9 that a whole-run suite covers); build() then
+    requires a suite that runs every one of them.
+    With a fresh graph G (graphify), the load edge is first asked of the graph (`graph: imports_from <file>`); anything it does not
+    answer falls through to resolve_loads and the stem rules unchanged."""
+    wt = Path(wt)
+    gstat = MG.status(G, wt, allowed) if G else "graph: absent"
+    gA, gA2 = {}, {}
+    if G and gstat.startswith("graph: fresh"):
+        ids = graph_fns(G, allowed, fns)
+        for f in allowed:
+            for sf, _sid, rel in MG.importers(G, f, ids):
+                gA.setdefault(sf, f"graph: {rel} {f}")
+        for c in callers:
+            if c in allowed or not MG.fresh(G, wt, c):
+                continue
+            for sf, _sid, rel in MG.importers(G, c, []):
+                gA2.setdefault(sf, f"graph: {rel} {c} (loads the allowed file)")
+    names = list(dict.fromkeys(list(fns) + [n for f in allowed for n in exports(f, texts.get(f, ""))
+                                            if len(n) >= 3 and re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", task)]))
+    lits = derive_literals(task, texts, fns)
+    pats, label = [], {}
+    for n in names:
+        pats.append(re.compile(rf"(?<![\w$]){re.escape(n)}(?![\w$])"))
+        label[pats[-1].pattern] = ("S", n)
+    for lit, kind, _why in lits:
+        pats.append(_lit_pat(lit, kind))
+        label[pats[-1].pattern] = ("L" + kind, f"'{lit}'" if kind == "word" else lit)
+    cands = [t for t in files if t and is_test_path(t) and lang(t) == language and t not in allowed and t not in ignore
+             and not IMPACT_SKIP.search(t) and Path(wt, t).is_file()]
+    hits = grep_hits(wt, cands, pats)
+    stems = load_stems(files, allowed, language)
+    envs = [lit for lit, kind, _w in lits if kind == "env"]
+    rows = []
+    for t in cands:
+        h = hits.get(t) or []
+        text = Path(wt, t).read_text(errors="replace")
+        loads = resolve_loads(wt, t, text, language)
+        edge, via = None, ""
+        if t in gA:
+            edge, via = "A", gA[t]
+        elif t in gA2 and not any(p in allowed for p, _s in loads):
+            edge, via = "A'", gA2[t]
+        elif any(p in allowed for p, _s in loads):
+            edge, via = "A", "requires " + next(s for p, s in loads if p in allowed)
+        elif any(p in callers for p, _s in loads):
+            edge, via = "A'", "requires " + next(s for p, s in loads if p in callers) + " (loads the allowed file)"
+        elif any(imports_stem(text, s, language) for s in stems):
+            edge, via = "stem-only", "imports " + "/".join(sorted(stems)) + " (stem-only)"
+        kinds = {label[x[3]][0] for x in h}
+        S, L = "S" in kinds, any(k.startswith("L") for k in kinds)
+        tier = ("STRONG" if edge == "A" and (S or L) else "MEDIUM" if (edge == "A'" and (S or L)) or (edge == "stem-only" and L)
+                else "WEAK" if L and edge is None else None)
+        if not tier:
+            continue
+        byline = {}
+        for i, fn, ln, pat in h:
+            byline.setdefault(i, [fn, ln, []])[2].append(label[pat])
+        for v in byline.values():
+            v[2] = [lb for _k, lb in sorted(v[2], key=lambda x: x[0] == "S")]  # literals first: they say why the old behaviour is asserted
+        notes = [f"already sets {e}" for e in envs if re.search(rf"\b{re.escape(e)}\b", text)]
+        rows.append(dict(test=t, tier=tier, edge=edge or "none", via=via or "no load edge (dynamic require? literal match only)",
+                         hits=[(i, v[0], v[1], v[2]) for i, v in sorted(byline.items())], notes=notes))
+    order = {"STRONG": 0, "MEDIUM": 1, "WEAK": 2}
+    rows.sort(key=lambda r: (order[r["tier"]], r["test"]))
+    todo = [r["test"] for r in rows if r["tier"] != "WEAK"]
+    cap = IMPACT_MAX if limit is None else limit
+    if len(todo) > cap:
+        raise Ambiguous(f"impact scan: {len(todo)} existing tests (> {cap}) assert the old behaviour: {todo}. Split the task "
+                        "or pass --impact-ignore FILE (repeatable) for the ones that do not matter")
+    return dict(literals=lits, symbols=names, rows=rows, scanned=len(cands), graph=gstat)
+
+
+def impact_md(imp):
+    rows, out = imp["rows"], ["# Impact scan: existing tests that may assert the behaviour this change replaces", "",
+                              f"{imp['scanned']} candidate test file(s) scanned. Symbols: " + (", ".join(f"`{n}`" for n in imp["symbols"]) or "-"),
+                              imp.get("graph", "graph: absent"), "",
+                              "## Derived literals", ""]
+    out += [f"- `{lit}` ({kind}): {why}" for lit, kind, why in imp["literals"]] or ["- none"]
+    for tier in ("STRONG", "MEDIUM", "WEAK"):
+        sel = [r for r in rows if r["tier"] == tier]
+        out += ["", f"## {tier} ({len(sel)})", ""]
+        if tier == "WEAK":
+            out += ["Literal match with no load edge: informational only, never a TODO.", ""]
+        if not sel:
+            out.append("none")
+            continue
+        out += ["| test | edge | hits |", "|---|---|---|"]
+        for r in sel:
+            cell = "<br>".join(f"L{i} [{fn or '-'}] {tx} ({', '.join(lb)})".replace("|", "\\|") for i, fn, tx, lb in r["hits"][:4])
+            out.append(f"| `{r['test']}` | {r['via']}" + (f" ({'; '.join(r['notes'])})" if r["notes"] else "") + f" | {cell} |")
+    return "\n".join(out) + "\n"
+
+
+def impact_section(imp):
+    """TASK.md lines (before `## Scope`): one TODO bullet per STRONG/MEDIUM test, [] when there are none."""
+    rows = [r for r in (imp or {}).get("rows", []) if r["tier"] != "WEAK"]
+    if not rows:
+        return []
+    lines = [IMPACT_SEC, "", "These existing tests load the code this change replaces and mention the old behaviour (see IMPACT.md). "
+             "Each is decided, then its bullet deleted.", ""]
+    for r in rows:
+        i, _fn, _tx, lb = next((h for h in r["hits"] if not re.search(r"\b(?:require|import|from)\b", h[2])), r["hits"][0])
+        lines.append(f"- `{r['test']}` ({r['via']}; L{i} {lb[0]}" + (f"; {'; '.join(r['notes'])}" if r["notes"] else "")
+                     + f") {MARK}: decide: update to the new behaviour (add to spec update_tests), set env/fixture so it keeps testing "
+                     "the old path, or state why it is unaffected.")
+    return lines + [""]
+
+
+def callers_of(wt, files, allowed, language, G=None, fns=()):
+    src = [f for f in files if f.endswith(SRC_EXT) and not is_test_path(f) and Path(wt, f).is_file()]
+    stems, out = load_stems(files, allowed, language), []
+    for f in src:
+        if f in allowed:
+            continue
+        text = Path(wt, f).read_text(errors="replace")
+        # python also resolves the file's own imports: `from .models import x` names no package, so a dotted stem misses it
+        if any(imports_stem(text, s, language) for s in stems) or (
+                language == "py" and any(p in allowed for p, _s in resolve_loads(wt, f, text, "py"))):
+            out.append(f)
+    if G and MG.status(G, wt, allowed).startswith("graph: fresh"):  # union only: the stem result is never reduced
+        ids = graph_fns(G, allowed, fns)
+        for f in allowed:
+            for sf, _sid, _rel in MG.importers(G, f, ids):
+                if sf in src and sf not in allowed and sf not in out:
+                    out.append(sf)
+    return out
+
+
+def impact_summary(imp):
+    c = {t: sum(1 for r in imp["rows"] if r["tier"] == t) for t in ("STRONG", "MEDIUM", "WEAK")}
+    return f"{c['STRONG']} STRONG, {c['MEDIUM']} MEDIUM, {c['WEAK']} WEAK of {imp['scanned']} test file(s); literals: " + \
+        (", ".join(l for l, _k, _w in imp["literals"]) or "none")
+
+
+def impact_cmd(run_dir, ignore=()):
+    """mini-spec --impact RUN_DIR: rescan an existing run dir, rewrite IMPACT.md, print the result; never edits TASK.md.
+    Exit 1 when a STRONG test is neither in the spec's update_tests nor decided (a bullet without a marker) in TASK*.md."""
+    rd = Path(run_dir)
+    spec = json.loads((rd / "spec.json").read_text())
+    wt = os.path.expanduser(spec["baseline_from"])
+    steps = spec.get("steps") or [{}]
+    allowed = list(dict.fromkeys(f for st in steps for f in R.as_list(st.get("allowed") or spec.get("allowed"))))
+    fns = list(dict.fromkeys(x for st in steps for x in R.as_list(st.get("target_fn") or spec.get("target_fn"))))
+    updates = set(R.as_list(spec.get("update_tests")) + [x for st in steps for x in R.as_list(st.get("update_tests"))])
+    md = (rd / "TASK.md").read_text() if (rd / "TASK.md").is_file() else ""
+    m = re.search(r"^## Confirmed defect[^\n]*\n(.*?)(?=^## |\Z)", md, re.M | re.S)
+    task = "\n".join(ln for ln in (m.group(1) if m else md).splitlines() if MARK not in ln).strip()
+    files = [f for f in git(wt, "ls-files").split("\n") if f]
+    language = lang(allowed[0]) if allowed else None
+    texts = {f: Path(wt, f).read_text(errors="replace") if Path(wt, f).is_file() else "" for f in allowed}
+    G = None
+    try:
+        G, _gp = graph_for(wt, spec.get("graph"))
+        imp = impact_scan(wt, files, allowed, texts, fns, task, language, callers_of(wt, files, allowed, language, G, fns), ignore, G)
+    except Ambiguous as e:
+        print(f"mini-spec --impact: FAIL: {e}")
+        print("  " + (MG.status(G, wt, allowed) if G else "graph: absent"))
+        return 1
+    (rd / "IMPACT.md").write_text(impact_md(imp))
+    decided = set()
+    for t in rd.glob("TASK*.md"):
+        for ln in t.read_text().splitlines():
+            if ln.startswith("- `") and MARK not in ln:
+                decided.add(ln.split("`")[1])
+    print(f"mini-spec --impact: {impact_summary(imp)}; wrote {rd}/IMPACT.md")
+    print("  " + imp["graph"])
+    missing = [r["test"] for r in imp["rows"] if r["tier"] == "STRONG" and r["test"] not in updates and r["test"] not in decided]
+    for r in imp["rows"]:
+        if r["tier"] != "WEAK":
+            print(f"  {r['tier']:6} {r['test']}  ({r['via']}; L{r['hits'][0][0]})" + ("  [spec update_tests]" if r["test"] in updates else ""))
+    if missing:
+        print(f"  UNDECIDED STRONG: {missing}: add to spec update_tests, or state in TASK.md why it is unaffected (a bullet without {MARK})")
+        return 1
+    return 0
+
+
+# ---- main build ---------------------------------------------------------------------------------------------------
+
+WT_ROOT = Path(os.environ.get("MINI_WT_ROOT") or Path.home() / "dispatch-worktrees")
+NAME_RE = r"[A-Za-z0-9][\w.-]{0,80}"
+
+
+def make_worktree(repo, base, name, root=None):
+    """--repo/--base: a fresh worktree of REPO at BASE for this run -> its path. When BASE is <remote>/<branch> of a
+    configured remote it is fetched first (a failed fetch only warns), so the run starts from the remote tip instead of
+    a stale local HEAD. New branch dispatch/<name> (the prefix worktree_cleanup deletes after landing) at <root>/<name>.
+    An existing path is reused only when it is a clean worktree of the same repo: at BASE as is, behind BASE by a
+    fast-forward. Anything else is refused (Ambiguous), never reset."""
+    repo = os.path.abspath(os.path.expanduser(repo))
+    if git(repo, "rev-parse", "--is-inside-work-tree").strip() != "true":
+        die(f"--repo {repo} is not a git repository")
+    common = os.path.realpath(os.path.join(repo, git(repo, "rev-parse", "--git-common-dir").strip()))
+    remote, _, branch = base.partition("/")
+    if branch and remote in git(repo, "remote").split():
+        try:
+            f = subprocess.run(["git", "fetch", "-q", remote, branch], cwd=repo, capture_output=True, text=True, timeout=90)
+            ok, err = f.returncode == 0, f.stderr.strip()
+        except subprocess.TimeoutExpired:
+            ok, err = False, "timed out after 90s"
+        if not ok:
+            print(f"mini-spec: WARN: git fetch {remote} {branch} failed ({err[-200:]}); using the local {base}", file=sys.stderr)
+    sha = git(repo, "rev-parse", "-q", "--verify", f"{base}^{{commit}}").strip()
+    if not sha:
+        die(f"--base {base} is not a commit in {repo}")
+    path, br = Path(root or WT_ROOT) / name, f"dispatch/{name}"
+    if path.exists():
+        same = (git(path, "rev-parse", "--is-inside-work-tree").strip() == "true"
+                and os.path.realpath(os.path.join(path, git(path, "rev-parse", "--git-common-dir").strip())) == common)
+        head = git(path, "rev-parse", "HEAD").strip() if same else ""
+        if same and not git(path, "status", "--porcelain").strip():
+            if head == sha:
+                print(f"mini-spec: reusing clean worktree {path} at {base} {sha[:9]}")
+                return str(path)
+            if subprocess.run(["git", "merge-base", "--is-ancestor", head, sha], cwd=path, capture_output=True).returncode == 0:
+                ff = subprocess.run(["git", "merge", "-q", "--ff-only", sha], cwd=path, capture_output=True, text=True)
+                if ff.returncode == 0:
+                    print(f"mini-spec: fast-forwarded clean worktree {path} {head[:9]} -> {base} {sha[:9]}")
+                    return str(path)
+        die(f"{path} already exists ({'HEAD ' + head[:9] if same else 'not a worktree of ' + repo}"
+            f"{', uncommitted changes' if same and git(path, 'status', '--porcelain').strip() else ''}; {base} is {sha[:9]}): "
+            "pick another --name, or land/remove that worktree first")
+    if git(repo, "rev-parse", "-q", "--verify", f"refs/heads/{br}").strip():
+        die(f"branch {br} already exists in {repo}; pick another --name or delete that branch")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "worktree", "add", "-q", "-b", br, str(path), sha], cwd=repo, capture_output=True, text=True)
+    if r.returncode:
+        die(f"git worktree add failed: {r.stderr.strip()[-300:]}")
+    print(f"mini-spec: new worktree {path} (branch {br}) at {base} {sha[:9]}")
+    return str(path)
+
+
+def build(a):
+    wt = os.path.abspath(os.path.expanduser(a.worktree)).rstrip("/")  # keep the caller's path (worktrees may be symlinked)
+    if git(wt, "rev-parse", "--is-inside-work-tree").strip() != "true":
+        die(f"{wt} is not a git worktree")
+    top = os.path.realpath(git(wt, "rev-parse", "--show-toplevel").strip())
+    if top != os.path.realpath(wt):
+        die(f"{wt} is inside the worktree {top}; pass the worktree root")
+    task, task_src = read_task(a.task)
+    name = a.name or re.sub(r"^wt-", "", Path(wt).name)
+    if not re.fullmatch(r"[A-Za-z0-9][\w.-]{0,80}", name):
+        die(f"bad run name {name!r}")
+    F = Facts()
+    F.note("baseline_from", wt)
+    files = git(wt, "ls-files").split("\n")
+    files = [f for f in files if f]
+    src_files = [f for f in files if f.endswith(SRC_EXT) and not is_test_path(f) and Path(wt, f).is_file()]
+    allowed = infer_allowed(wt, task, files, src_files, a, F)
+    if len(allowed) > MAX_ALLOWED:
+        die(f"{len(allowed)} files inferred {allowed}: too many for one run. Pass --allowed for the ones this run edits")
+    langs = {lang(f) for f in allowed}
+    if None in langs or len(langs) != 1:
+        die(f"allowed files {allowed} must all be python or all JS/TS (got {sorted(map(str, langs))})")
+    language = langs.pop()
+    texts = {f: Path(wt, f).read_text(errors="replace") if Path(wt, f).is_file() else "" for f in allowed}
+    fns, defined = infer_fns(wt, task, allowed, texts, a, F)
+    anchors = {fn: [] for fn in fns}  # reach_anchor literals per function: --reach-anchor, plus the literal of any seeded stub
+    for x in a.reach_anchor or []:
+        k, _, lit = x.partition("=")
+        if lit and k in fns:
+            anchors[k].append(lit)
+        else:
+            for fn in fns:
+                anchors[fn].append(x)
+    stubs = {}
+    for fn in fns:
+        if fn in defined:
+            f, span = defined[fn]
+            if is_stub(texts[f], fn, span):
+                stubs[fn] = stub_marker(fn)
+                anchors[fn] = list(dict.fromkeys(anchors[fn] + [stub_marker(fn)]))
+    prev = {}
+    pj = Path(a.runs_dir) / name / "spec.json"
+    if pj.is_file():
+        try:
+            prev = json.loads(pj.read_text()).get("intake") or {}
+        except ValueError:
+            prev = {}
+    tried = list(dict.fromkeys(list(prev.get("tried") or []) + list(a.tried or [])))
+    intake = fit_check(wt, allowed, fns, texts, defined, anchors, tried=tried, override=a.override)
+    if stubs:
+        F.note("stubs", "seeded stubs found for " + ", ".join(f"`{x}`" for x in stubs) + ": reach_anchor + stub_error set")
+    pkg = nearest_pkg(wt, allowed[0]) if language == "node" else None
+    if language == "node":
+        if len({nearest_pkg(wt, f) for f in allowed}) > 1:
+            die(f"allowed files {allowed} sit in different packages; split the run")
+        runner, pj = detect_node_runner(wt, pkg, files, F, a.runner)
+        envp, flags = node_flags(pj, any(f.endswith((".ts", ".mts", ".cts", ".tsx")) for f in allowed))
+        run_tpl = lambda paths: f"{envp}node {flags}--test " + " ".join(shlex.quote(p) for p in paths)
+        runner_desc = "Use `node:test` + `assert` (the skeleton already loads the module by its real path)."
+    else:
+        runner, py = detect_python(wt, F, a.runner)
+        run_tpl = None
+        runner_desc = ("Plain test functions with `assert`, listed in the file's `TESTS` list and run by the `RESULT` block at its "
+                       "bottom (no pytest fixtures; files the code writes go under a temp dir). The skeleton already loads the module.")
+    style, examples = test_style(wt, files, allowed[0], pkg, language, F, a.test_style)
+    steps_fns = fns if (len(fns) > 1 and not a.single) else [None]
+    taken, tests = [], []
+    for fn in steps_fns:
+        f_of = defined.get(fn, (allowed[0], None))[0] if fn else allowed[0]
+        tf = test_name(wt, f_of, fn or (fns[0] if len(fns) == 1 else None), style, examples, pkg, language, taken, len(steps_fns) > 1)
+        taken.append(tf)
+        d = str(Path(tf).parent)
+        if language == "py":
+            pyx = py if "/" not in py else os.path.relpath(Path(wt, py), Path(wt, d))
+            tcmd = cmd_in(d, f"{pyx} {shlex.quote(Path(tf).name)}")  # a plain script: the frozen template's RESULT block runs TESTS
+        else:
+            tcmd = cmd_in(d, run_tpl([Path(tf).name]))
+        tests.append((fn, tf, tcmd))
+    # suite: existing tests that load an allowed file, else the package's own test script
+    stems = load_stems(files, allowed, language)
+    related = []
+    for t in files:
+        if is_test_path(t) and lang(t) == language and Path(wt, t).is_file():
+            tt = Path(wt, t).read_text(errors="replace")
+            if any(imports_stem(tt, s, language) for s in stems):
+                related.append(t)
+
+    def mk_suite(related):
+        """(suite_cmd or None, evidence, "list" when it names the tests / "all" when it runs everything / None, the tests it names)"""
+        if language == "node":
+            base = rel(pkg, Path(wt).resolve()) if pkg else "."
+            related = [t for t in related if base == "." or t.startswith(base + "/")]
+            if related and len(related) <= MAX_SUITE:
+                return (cmd_in(base, run_tpl([rel(Path(wt, t), Path(wt, base)) for t in related])),
+                        f"{len(related)} existing test(s) loading the allowed files", "list", related)
+            if (pj.get("scripts") or {}).get("test") and "no test specified" not in pj["scripts"]["test"]:
+                return (cmd_in(base, "npm test"),
+                        f"package test script ({len(related)} related tests: " + ("too many to list" if related else "none") + ")", "all", [])
+        elif related:
+            if len(related) <= MAX_SUITE:
+                return (f"{py} -m pytest -q -p no:cacheprovider " + " ".join(shlex.quote(t) for t in related),
+                        f"{len(related)} existing test(s) importing the allowed files", "list", related)
+            return f"{py} -m pytest -q -p no:cacheprovider", f"whole pytest run ({len(related)} related tests)", "all", []
+        return None, "none: no related tests and no package test script", None, []
+    suite, why, kind, listed = mk_suite(related)
+    G, _gp = graph_for(wt, getattr(a, "graph", None))
+    callers = callers_of(wt, files, allowed, language, G, fns)
+    impact = None
+    if not getattr(a, "no_impact", False):
+        lim = getattr(a, "impact_max", None)  # the auto lane's limit (above IMPACT_MAX): every impact test must then run in the suite
+        impact = impact_scan(wt, files, allowed, texts, fns, task, language, callers, tuple(getattr(a, "impact_ignore", None) or ()), G,
+                             limit=lim)
+        F.note("impact", impact_summary(impact))
+        todo = [r["test"] for r in impact["rows"] if r["tier"] != "WEAK"]
+        over = len(todo) > IMPACT_MAX
+        extra = [t for t in todo if t not in related]
+        if extra and kind == "all":
+            why += f"; impact tests {extra} not listed (the suite already runs everything)"
+        elif extra:
+            s2, w2, k2, l2 = mk_suite(related + extra)
+            if k2 == "list":
+                suite, why, kind, listed = s2, w2 + f", {len(extra)} of them added by the impact scan", k2, l2
+            elif over and k2 == "all":
+                suite, why, kind, listed = s2, w2 + f"; the impact scan found {len(todo)} tests (> IMPACT_MAX={IMPACT_MAX}): the suite runs everything", k2, []
+            else:
+                why += f"; NOT widened with impact tests {extra} (over MAX_SUITE={MAX_SUITE})"
+        missed = [t for t in todo if kind != "all" and t not in listed]
+        if over and missed:  # past IMPACT_MAX (only with a raised limit) every one of them must run in the suite gate
+            raise Ambiguous(f"impact scan: {len(todo)} existing tests (> {IMPACT_MAX}) assert the old behaviour and the suite does not run "
+                            f"{missed} (over MAX_SUITE={MAX_SUITE}, no package test script). Split the task or pass --impact-ignore FILE "
+                            "(repeatable) for the ones that do not matter")
+    F.note("suite_cmd", why)
+    typecheck = None
+    if language == "node" and any(f.endswith((".ts", ".tsx", ".mts", ".cts")) for f in allowed):
+        b = pkg or Path(wt).resolve()
+        if (b / "tsconfig.json").is_file() and os.access(b / "node_modules/.bin/tsc", os.X_OK):
+            typecheck = cmd_in(rel(b, Path(wt).resolve()), "./node_modules/.bin/tsc --noEmit -p tsconfig.json")
+            F.note("typecheck_cmd", "TS file + tsconfig.json + local tsc")
+    drop = list(dict.fromkeys(DROP_DEFAULT + [x for x in DROP_KNOWN if Path(wt, x).exists()]))
+    timeout = 3600 if (typecheck or (suite or "").endswith("npm test")) else 2400
+    return dict(wt=wt, name=name, task=task, task_src=task_src, allowed=allowed, fns=fns, defined=defined, texts=texts,
+                anchors=anchors, stubs=stubs, intake=intake,
+                tests=tests, suite=suite, typecheck=typecheck, drop=drop, timeout=timeout, callers=callers, impact=impact,
+                runner_desc=runner_desc, facts=F)
+
+
+# spec fields mini-submit's C4 demands that need no reference fix, per test (each step has its own frozen test): a red other than
+# AssertionError needs a red_ok {type, match} entry, a test that must pass at baseline a baseline_green entry; fn_scope is the
+# runner's default made explicit. mini-validate fills fix_steps/fix_wall (V6 formula) and a missing target_fn from the ref.
+NEED_FIELDS = {"red_ok": [], "baseline_green": [], "fn_scope": "enforce"}
+
+
+def write_run(b, runs, force):
+    rd = Path(runs) / b["name"]
+    if rd.exists() and not force:
+        die(f"{rd} already exists; pass --force to rewrite its spec.json/TASK*.md (other files are kept)")
+    rd.mkdir(parents=True, exist_ok=True)
+    for old in rd.glob("TASK-s*.md"):
+        old.unlink()
+    (rd / "work").mkdir(exist_ok=True)
+    n = len(b["tests"])
+    spec = {"mode": "two-phase", "baseline_from": b["wt"], "task": str(rd / "TASK.md"), "allowed": b["allowed"], "drop": b["drop"]}
+    if b["suite"]:
+        spec["suite_cmd"] = b["suite"]
+    if b["typecheck"]:
+        spec["typecheck_cmd"] = b["typecheck"]
+    spec["timeout"] = b["timeout"]
+    if b.get("fix_mode"):
+        spec["fix_mode"] = b["fix_mode"]  # Phase B: one-request whole-function repair, the mini loop as fallback (runner: single_shot_fix)
+    for i, (fn, tf, tcmd) in enumerate(b["tests"], 1):
+        md = draft_task(b["name"], b["task"], i, n, fn or (b["fns"][0] if len(b["fns"]) == 1 else None), b["allowed"], b["texts"],
+                        b["defined"], b["fns"], tf, tcmd, b["callers"], b["runner_desc"], b.get("impact"))
+        (rd / ("TASK.md" if i == 1 else f"TASK-s{i}.md")).write_text(md)
+    if n == 1:
+        fn, tf, tcmd = b["tests"][0]
+        spec.update(test_file=tf, test_cmd=tcmd, **NEED_FIELDS)
+        if b["fns"]:
+            spec["target_fn"] = b["fns"][0] if len(b["fns"]) == 1 else list(b["fns"])
+        lits = list(dict.fromkeys(x for v in b["anchors"].values() for x in v))
+        if lits:
+            spec["reach_anchor"] = lits[0] if len(lits) == 1 else lits
+        if b["stubs"]:
+            spec["stub_error"] = [v[:-1] for v in b["stubs"].values()] if len(b["stubs"]) > 1 else list(b["stubs"].values())[0][:-1]  # message as printed (no closing quote)
+    else:
+        spec["steps"] = [{**({"task": str(rd / f"TASK-s{i}.md")} if i > 1 else {}), "test_file": tf, "test_cmd": tcmd, "target_fn": fn, **NEED_FIELDS,
+                          **({"reach_anchor": b["anchors"][fn][0] if len(b["anchors"][fn]) == 1 else b["anchors"][fn]} if fn and b["anchors"].get(fn) else {}),
+                          **({"stub_error": b["stubs"][fn][:-1]} if fn in b["stubs"] else {})}
+                         for i, (fn, tf, tcmd) in enumerate(b["tests"], 1)]
+    spec["intake"] = b["intake"]
+    (rd / "INTAKE.md").write_text(intake_text(b["name"], b["intake"]))
+    if b.get("impact"):
+        (rd / "IMPACT.md").write_text(impact_md(b["impact"]))
+    (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    return rd, spec
+
+
+def spec_steps(spec):
+    return R.merged_steps(spec) if spec.get("steps") else [spec]
+
+
+def write_frozen(rd, spec, wt, allowed):
+    """RUN_DIR/frozen/<test_file> per step: the runner's frozen-test template (module loads, placeholder tests that are real
+    assertions on a TODO(frozen-test) string, the TESTS list + RESULT block). A file without the marker is a filled-in test: kept.
+    Returns [(test_file, what happened)]."""
+    out = []
+    for sp in spec_steps(spec):
+        tf = sp["test_file"]
+        dst = Path(rd) / "frozen" / tf
+        if dst.is_file() and R.FROZEN_MARK not in dst.read_text(errors="replace"):
+            out.append((tf, "kept: already filled in"))
+            continue
+        txt = R.frozen_template(wt, sp, allowed)
+        if txt is None:
+            out.append((tf, "no template for this language"))
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(txt)
+        out.append((tf, "template"))
+    return out
+
+
+def freeze_cmd(rd, force=False):
+    """--freeze RUN_DIR: commit the filled-in RUN_DIR/frozen/<test_file> of every step into baseline_from (design (a) step 4), so
+    the runner treats the test as supplied and the local model only writes the fix. Refuses while a TODO(frozen-test) is left,
+    when the runner's static test rules fail, or when baseline_from holds a different file at that path (--force replaces it).
+    The commit skips git hooks: the global post-commit template auto-pushes, and a dispatch worktree branch stays local."""
+    rd = Path(os.path.expanduser(str(rd)))
+    try:
+        spec = json.loads((rd / "spec.json").read_text())
+    except (OSError, ValueError) as e:
+        print(f"mini-spec: FAIL: cannot read {rd / 'spec.json'}: {e}", file=sys.stderr)
+        return 2
+    wt = os.path.expanduser(spec.get("baseline_from") or "")
+    if not wt or not Path(wt).is_dir() or git(wt, "rev-parse", "--is-inside-work-tree").strip() != "true":
+        print(f"mini-spec: FAIL: baseline_from {wt or '(missing)'} is not a git worktree", file=sys.stderr)
+        return 2
+    steps, bad, copy = spec_steps(spec), [], []
+    for n, sp in enumerate(steps, 1):
+        tf = sp["test_file"]
+        src, dst = rd / "frozen" / tf, Path(wt, tf)
+        if not src.is_file():
+            bad.append(f"s{n} {tf}: no {src} (mini-spec writes the template there; rerun it with --force to get one)")
+            continue
+        text = src.read_text(errors="replace")
+        left = [i for i, ln in enumerate(text.splitlines(), 1) if R.FROZEN_MARK in ln]
+        if left:
+            bad.append(f"s{n} {tf}: {len(left)} {R.FROZEN_MARK} placeholder(s) left, first at line {left[0]}")
+            continue
+        probs = R.test_static(text, list(sp.get("allowed") or []), int(sp.get("min_asserts", 2)), tf, wt,
+                              test_rules=sp.get("test_rules") != "off", source_checks=sp.get("source_checks") != "allow")
+        if probs:
+            bad.append(f"s{n} {tf}: " + "; ".join(probs)[:500])
+            continue
+        if dst.is_file() and dst.read_bytes() == src.read_bytes():
+            continue
+        if dst.exists() and not force:
+            bad.append(f"s{n} {tf}: {dst} already exists with other content (--force replaces it)")
+            continue
+        copy.append((src, dst))
+    for x in bad:
+        print(f"FAIL: {x}")
+    if bad:
+        print("freeze refused: nothing was copied or committed")
+        return 1
+    for src, dst in copy:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    tfs = list(dict.fromkeys(sp["test_file"] for sp in steps))
+    g = lambda *a: subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, timeout=120)
+    r = g("add", "--", *tfs)
+    if r.returncode:
+        print(f"FAIL: git add: {(r.stdout + r.stderr).strip()[-300:]}")
+        return 1
+    if g("diff", "--cached", "--quiet", "--", *tfs).returncode == 0:
+        print(f"nothing to commit: {', '.join(tfs)} already frozen in {wt}")
+        return 0
+    r = g("-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", f"frozen test for {rd.name}", "--", *tfs)
+    if r.returncode:
+        print(f"FAIL: git commit: {(r.stdout + r.stderr).strip()[-300:]}")
+        return 1
+    head = g("rev-parse", "--short=12", "HEAD").stdout.strip()
+    print(f"frozen: committed {', '.join(tfs)} to {wt} at {head} (git hooks skipped: no auto-push)")
+    print(f"next: write the reference fix in {rd}/ref/<allowed file>" + (" (steps: ref/s<N>/<file>, each cumulative)" if spec.get("steps") else "")
+          + f", then `mini-validate {rd}/spec.json` (it fills fix_steps/fix_wall/target_fn from the ref, then runs V1-V8), "
+          f"then `mini-submit {rd}/spec.json --label <area-change> --model <model> --bundle <bundle>`")
+    return 0
+
+
+def run_precheck(spec_path):
+    r = subprocess.run([sys.executable, str(PRECHECK), str(spec_path)], capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def check_only(rd):
+    r = subprocess.run([sys.executable, str(RUNNER), "--check-only", "--cwd", str(rd / "work"), "--task-file", str(rd / "spec.json")],
+                       capture_output=True, text=True, timeout=1800)
+    return r.returncode, (r.stdout + r.stderr)
+
+
+def probe(rd):
+    """Runner --check-only --probe on the scratch copy: (rc, [PROBE lines]). One line per step."""
+    r = subprocess.run([sys.executable, str(RUNNER), "--check-only", "--probe", "--cwd", str(rd / "work"), "--task-file", str(rd / "spec.json")],
+                       capture_output=True, text=True, timeout=1800)
+    lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith("PROBE ")]
+    if not lines:
+        lines = ["PROBE FAIL no PROBE line from the runner: " + (r.stdout + r.stderr).strip()[-300:]]
+    try:
+        (Path(rd) / "PROBE.txt").write_text("\n".join(lines) + "\n")  # lint warns when this is missing
+    except OSError:
+        pass
+    try:  # the probe's throwaway test sits at work/<test_file>: put the baseline's file back (or drop it) so nobody reads it as the test
+        for sp in spec_steps(json.loads((Path(rd) / "spec.json").read_text())):
+            w = Path(rd) / "work" / sp["test_file"]
+            if w.is_file() and "PROBE-EXPORTS" in w.read_text(errors="replace"):
+                base = Path(os.path.expanduser(sp.get("baseline_from") or "")) / sp["test_file"]
+                shutil.copyfile(base, w) if base.is_file() else w.unlink()
+    except (OSError, ValueError, KeyError):
+        pass
+    return (1 if r.returncode or any(ln.startswith("PROBE FAIL") for ln in lines) else 0), lines
+
+
+def probe_not_local(rd):
+    """Fold a probe's browser-only verdict (PROBE-CALL ReferenceError on document/window/chrome/navigator) into the run dir's
+    intake: class not-local (unless an earlier class outranks it), reason added, spec.json + INTAKE.md rewritten.
+    Returns the intake exit code (0 when nothing changed or an override is recorded)."""
+    rd = Path(rd)
+    try:
+        lines = (rd / "PROBE.txt").read_text().splitlines()
+        spec = json.loads((rd / "spec.json").read_text())
+    except (OSError, ValueError):
+        return 0
+    hit = [ln for ln in lines if "browser-only (not-local)" in ln]
+    ik = spec.get("intake")
+    if not hit or not ik:
+        return 0
+    reason = "probe: " + hit[0].replace("PROBE FAIL ", "", 1)[:240]
+    allr = ik.setdefault("all_reasons", {})
+    if reason not in allr.setdefault("not-local", []):
+        allr["not-local"].append(reason)
+    cls = ik["class"] if ik["class"] == "needs-stubs" else "not-local"
+    if cls != ik["class"]:
+        ik["class"], ik["reasons"] = cls, allr["not-local"]
+        ik["next"] = ("split: extract the page.evaluate / DOM body into a pure helper first (a node-testable function), then target that.")
+    spec["intake"] = ik
+    (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    (rd / "INTAKE.md").write_text(intake_text(rd.name, ik))
+    return 0 if ik.get("override") else INTAKE_CODES[ik["class"]]
+
+
+def lint_coverage(rd, t, txt, spec, cov):
+    """(errors, warnings) of t's `## Rule coverage` against its step's frozen test: RUN_DIR/frozen/<test_file>, else the copy
+    already in baseline_from. Skipped while the section still holds the draft's marker (the marker check fails it)."""
+    rs = cov.rules(txt)
+    if rs is None:
+        return [], [f"{t.name}: {cov.NO_SECTION}"]
+    if any(MARK in r for r in rs):
+        return [], []
+    m = re.fullmatch(r"TASK(?:-s(\d+))?\.md", t.name)
+    n = int(m.group(1) or 1) if m else 1
+    steps = R.merged_steps(spec) if spec.get("steps") else [spec]
+    sp = steps[n - 1] if n <= len(steps) else {}
+    tf = sp.get("test_file")
+    if not tf:
+        return [], [f"{t.name}: spec.json names no test_file for step {n}, so `## Rule coverage` was not checked"]
+    for src in (rd / "frozen" / tf, Path(os.path.expanduser(sp.get("baseline_from") or "/nonexistent"), tf)):
+        if src.is_file():
+            errs, warns = cov.check(txt, src.read_text(errors="replace"), tf)
+            return [f"{t.name}: {e}" for e in errs], [f"{t.name}: {w}" for w in warns]
+    return [], [f"{t.name}: no frozen test {tf} yet to check `## Rule coverage` against"]
+
+
+STALE_DOC_RE = re.compile(r"\b(?:update|reword|rewrite|fix|correct|revise)\w*\b[^.;!?\n]{0,80}\b(?:comment|doc(?:string|s)?|header|"
+                          r"jsdoc|paragraph|message|readme|wording)s?\b", re.I)
+
+
+def stale_doc_hint(txt):
+    """The phrase of a TASK.md that asks to change existing prose (a doc comment, a message) when it has no `## Must not contain`
+    list, else None. Without the list nothing checks the old text is gone (bfmr-split-tiebreak 2026-11-03: the header comment kept
+    the old rule and every gate passed). The draft's marker lines and HTML comments are not the task."""
+    body = "\n".join(ln for ln in re.sub(r"<!--.*?-->", "", txt, flags=re.S).splitlines() if MARK not in ln)
+    m = STALE_DOC_RE.search(body)
+    return m.group(0) if m and not R.parse_must_not_contain(txt) else None
+
+
+def lint(rd):
+    rd = Path(rd)
+    bad, warn = [], []
+    try:
+        spec = json.loads((rd / "spec.json").read_text())
+        spec = spec if isinstance(spec, dict) else {}
+    except (OSError, ValueError):
+        spec = {}
+    cov = load_coverage()
+    for t in sorted(rd.glob("TASK*.md")):
+        txt = t.read_text()
+        left = [i for i, ln in enumerate(txt.splitlines(), 1) if MARK in ln]
+        if left:
+            bad.append(f"{t.name}: {len(left)} unconfirmed {MARK} line(s), first at line {left[0]}")
+        if not R.parse_must_contain(txt):
+            warn.append(f"{t.name}: no `## Must contain` literals (the literal gate proves nothing)")
+        hint = stale_doc_hint(txt)
+        if hint:
+            warn.append(f"{t.name}: asks to change existing text (\"{hint[:70]}\") but has no `## Must not contain` list: name the "
+                        "old phrase(s) the fix must remove, or a fix that leaves the stale text passes every gate")
+        errs, warns = lint_coverage(rd, t, txt, spec, cov)
+        bad += errs
+        warn += warns
+    pf = rd / "PROBE.txt"
+    if not pf.is_file():
+        warn.append("no probe has been run for this run dir (no PROBE.txt): run `mini-spec ... --check` (or the runner with "
+                    "--check-only --probe) so the fixture is judged before enqueueing")
+    elif "PROBE FAIL" in pf.read_text():
+        warn.append("PROBE.txt records a PROBE FAIL: " + next(l for l in pf.read_text().splitlines() if "PROBE FAIL" in l)[:200])
+    ik = spec.get("intake") or {}
+    if ik and ik.get("class") != "local-ready" and not ik.get("override"):
+        bad.append(f"spec.json intake class is {ik.get('class')} ({'; '.join(ik.get('reasons') or [])}); {ik.get('next')}")
+    for w in warn:
+        print(f"WARN: {w}")
+    for x in bad:
+        print(f"FAIL: {x}")
+    rc, out = run_precheck(rd / "spec.json")
+    print(out)
+    ok = not bad and rc == 0
+    print("lint " + ("ok" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+# ---- seed stubs -----------------------------------------------------------------------------------------------------
+
+def _js_params(params, typed):
+    """Parameter list for a stub: kept verbatim in TS, in JS without type annotations (`a: string, b?: number` -> `a, b`)."""
+    if typed:
+        return params
+    out = []
+    for p in re.split(r",(?![^<(\[{]*[>)\]}])", params):
+        p = re.sub(r"\s*:\s*[^=]+", "", p.strip()).replace("?", "").strip()
+        if p:
+            out.append(p)
+    return ", ".join(out)
+
+
+def stub_source(path, existing, sigs, esm):
+    """New text of `path`: `existing` plus a throwing stub for each (name, params) not already defined in it. Returns
+    (text, [names added])."""
+    have = R.functions(path, existing)
+    add = [(n, p) for n, p in sigs if n not in have]
+    if not add:
+        return existing, []
+    if lang(path) == "py":
+        body = "".join(f"\n\ndef {n}({p}):\n    raise NotImplementedError('{stub_marker(n)[:-1]}')\n" for n, p in add)
+        return existing.rstrip("\n") + ("\n" if existing.strip() else "") + body, [n for n, _ in add]
+    typed = path.endswith((".ts", ".mts", ".cts", ".tsx"))
+    text = re.sub(r"^[ \t]*export\s*\{\s*\}\s*;?[ \t]*\n?", "", existing, flags=re.M)  # the `export {}` placeholder
+    text = re.sub(r"^[ \t]*module\.exports\s*=\s*\{\s*\}\s*;?[ \t]*\n?", "", text, flags=re.M)
+    head = text.rstrip("\n") + "\n\n" if text.strip() else ""
+    if esm:
+        body = "\n".join(f"export function {n}({_js_params(p, typed)}) {{\n  throw new Error('{stub_marker(n)[:-1]}');\n}}\n" for n, p in add)
+        return head + body, [n for n, _ in add]
+    body = "\n".join(f"function {n}({_js_params(p, typed)}) {{\n  throw new Error('{stub_marker(n)[:-1]}');\n}}\n" for n, p in add)
+    names = ", ".join(n for n, _ in add)
+    tail = f"Object.assign(module.exports, {{ {names} }});\n" if "module.exports" in text else f"module.exports = {{ {names} }};\n"
+    return head + body + "\n" + tail, [n for n, _ in add]
+
+
+def seed_stubs_cmd(a):
+    wt = os.path.abspath(os.path.expanduser(a.worktree or "")).rstrip("/")
+    if not a.worktree or not a.task or not Path(wt).is_dir():
+        print("mini-spec: --seed-stubs needs WORKTREE and TASK.md", file=sys.stderr)
+        return 2
+    try:
+        task, _ = read_task(a.task)
+    except Ambiguous as e:
+        print(f"mini-spec: FAIL: {e}", file=sys.stderr)
+        return 2
+    sigs = parse_signatures(task)
+    if not sigs:
+        print("mini-spec: FAIL: no `Signature: name(params)` line in the task; nothing mechanical to seed. Add the signature(s) to TASK.md",
+              file=sys.stderr)
+        return 2
+    f = a.file
+    if not f:
+        named = list(dict.fromkeys(t.lstrip("./") for t in re.findall(r"[\w./-]+\.(?:py|js|ts|mjs|cjs|mts|cts|jsx|tsx)\b", task)))
+        if len(named) != 1:
+            print(f"mini-spec: FAIL: the task names {len(named)} source paths {named}; pass --file", file=sys.stderr)
+            return 2
+        f = named[0]
+    p = Path(wt, f)
+    if not p.parent.is_dir() or not f.endswith(SRC_EXT):
+        print(f"mini-spec: FAIL: {f}: directory missing or not a source file", file=sys.stderr)
+        return 2
+    existing = p.read_text(errors="replace") if p.is_file() else ""
+    esm = f.endswith((".mjs", ".mts")) or (not f.endswith((".cjs", ".cts")) and R._pkg_is_esm(wt, f))
+    new, added = stub_source(f, existing, sigs, esm)
+    kind = "python" if lang(f) == "py" else ("ESM" if esm else "CommonJS")
+    print(f"seed-stubs: {f} ({kind}, {'exists' if p.is_file() else 'new file'}): " + (f"add {', '.join(added)}" if added else "nothing to add"))
+    for n, _ in sigs:
+        if n not in added:
+            print(f"  `{n}` is already defined; left alone")
+    if not added:
+        return 0
+    import difflib
+    print("".join(difflib.unified_diff(existing.splitlines(True), new.splitlines(True), f"a/{f}", f"b/{f}")), end="")
+    tmp = [os.path.realpath(x) for x in {tempfile.gettempdir(), "/tmp", "/private/tmp"}]
+    scratch = any(os.path.realpath(wt).startswith(t + os.sep) for t in tmp)
+    if not (a.apply or scratch):
+        print("\nPLAN ONLY (nothing written): rerun with --apply to write it into the worktree, then commit it on the worktree branch.")
+        return 0
+    p.write_text(new)
+    print(f"\nwrote {p}. Commit it on the worktree branch (`git -C {wt} add {f} && git -C {wt} commit -m 'stubs'`), then rerun mini-spec: "
+          "each stub becomes the step's reach_anchor and stub_error.")
+    if a.name:
+        sj = Path(a.runs_dir) / a.name / "spec.json"
+        if sj.is_file():
+            spec = json.loads(sj.read_text())
+            info = spec.setdefault("intake", {})
+            info["tried"] = list(dict.fromkeys(list(info.get("tried") or []) + [f"seed-stubs {f}: {', '.join(added)}"]))
+            sj.write_text(json.dumps(spec, indent=1) + "\n")
+            print(f"recorded the seed in {sj} (intake.tried)")
+    return 0
+
+
+def intake_cmd(run_dir):
+    """Classify an existing run dir (any spec, including legacy single-phase ones) and print the result."""
+    rd = Path(run_dir)
+    spec = json.loads((rd / "spec.json").read_text())
+    wt = os.path.expanduser(spec["baseline_from"])
+    steps = spec.get("steps") or [{}]
+    allowed = list(dict.fromkeys(f for st in steps for f in (st.get("allowed") or spec.get("allowed") or [])))
+    fns = list(dict.fromkeys(x for st in steps for x in R.as_list(st.get("target_fn") or spec.get("target_fn"))))
+    texts = {f: Path(wt, f).read_text(errors="replace") if Path(wt, f).is_file() else "" for f in allowed}
+    defined = {}
+    for f in allowed:
+        for name, span in R.functions(f, texts[f]).items():
+            defined.setdefault(name, (f, span))
+    anchors = {fn: [] for fn in fns}
+    for st in steps:
+        for fn in R.as_list(st.get("target_fn") or spec.get("target_fn")):
+            anchors[fn] += R.as_list(st.get("reach_anchor") or spec.get("reach_anchor"))
+    old = spec.get("intake") or {}
+    info = fit_check(wt, allowed, fns, texts, defined, anchors, legacy=spec.get("mode") != "two-phase",
+                     tried=old.get("tried") or [], override=old.get("override"))
+    try:  # a recorded browser-only probe verdict outranks a static local-ready / needs-split
+        hit = [ln for ln in (rd / "PROBE.txt").read_text().splitlines() if "browser-only (not-local)" in ln]
+    except OSError:
+        hit = []
+    if hit and info["class"] in ("local-ready", "needs-split"):
+        info["class"], info["reasons"] = "not-local", ["probe: " + hit[0].replace("PROBE FAIL ", "", 1)[:240]]
+        info["next"] = "split: extract the page.evaluate / DOM body into a pure helper first (a node-testable function), then target that."
+    print_intake(info)
+    return 0 if info.get("override") else INTAKE_CODES[info["class"]]
+
+
+def grep_hits(wt, files, pats):
+    """{file: [(line_no, enclosing_fn, text[:110], pattern)]} for every line of `files` (relative to wt) matching a compiled regex."""
+    wt, hits = Path(wt), {}
+    for f in files:
+        try:
+            text = (wt / f).read_text(errors="replace")
+        except OSError:
+            continue
+        spans = []
+        try:
+            spans = [(n, sp) for n, sp in R.functions(f, text).items()]
+        except Exception:
+            pass
+        for i, ln in enumerate(text.splitlines(), 1):
+            for pat in pats:
+                if pat.search(ln):
+                    fn = next((n for n, sp in spans if sp and sp[0] and sp[1] and sp[0] <= i <= sp[1]), None)
+                    hits.setdefault(f, []).append((i, fn, ln.strip()[:110], pat.pattern))
+    return hits
+
+
+def locate_cmd(a):
+    """mini-spec WORKTREE --locate PATTERN [--locate PATTERN ...]: mechanical symptom -> code lookup. Case-insensitive
+    regex search over the worktree's tracked source files (tests, generated and vendored code listed apart), with the
+    enclosing function of every hit. Prints candidates for --allowed / --fn; writes nothing."""
+    wt = Path(a.worktree).resolve()
+    if not (wt / ".git").exists():
+        die(f"{wt} is not a git worktree")
+    pats = [re.compile(p, re.I) for p in a.locate]
+    out = subprocess.run(["git", "-C", str(wt), "ls-files"], capture_output=True, text=True).stdout
+    files = [f for f in out.splitlines() if f.endswith(SRC_EXT) and not re.search(r"(^|/)(node_modules|\.next|generated|dist|build)/", f)]
+    hits = grep_hits(wt, files, pats)
+    if not hits:
+        print("mini-spec --locate: no hits for " + ", ".join(a.locate))
+        return 1
+    istest = lambda f: bool(re.search(r"(^|/)(test[-_./]|tests?/)|[-_.](test|spec)\.", f))
+    for label, sel in (("SOURCE", lambda f: not istest(f)), ("TESTS", istest)):
+        group = sorted((f for f in hits if sel(f)), key=lambda f: -len({h[3] for h in hits[f]}) * 1000 - len(hits[f]))
+        if not group:
+            continue
+        print(f"== {label} ==")
+        for f in group[:12]:
+            print(f"{f}  ({len(hits[f])} hit(s), {len({h[3] for h in hits[f]})}/{len(pats)} patterns)")
+            for i, fn, ln, _p in hits[f][:6]:
+                print(f"  L{i} [{fn or '-'}] {ln}")
+    istest_ = istest
+    graph_locate(wt, a, hits, pats, istest_)
+    print("\nnext: mini-spec WORKTREE TASK --allowed <SOURCE file> --fn <enclosing fn>  (or --no-fn for new code)")
+    return 0
+
+
+def graph_locate(wt, a, hits, pats, istest):
+    """Graph block of --locate (prints nothing without a graph): rank SOURCE hits by their enclosing graph node, patterns covered,
+    then hit count, then fewest callees, then path; PROPOSED line, callers, callees, tests importing the file, community peers."""
+    G, _gp = graph_for(wt, getattr(a, "graph", None))
+    if not G:
+        return
+    src = sorted(f for f in hits if not istest(f))
+    stat = MG.status(G, wt, src)
+    print("\n== GRAPH ==\n" + stat)
+    cands = {}
+    for f in src:
+        if not MG.fresh(G, wt, f):
+            continue
+        for _i, fn, _ln, pat in hits[f]:
+            nid = MG.node_for(G, f, fn) if fn else None
+            if nid:
+                c = cands.setdefault((f, fn, nid), [set(), 0])
+                c[0].add(pat)
+                c[1] += 1
+    if not cands:
+        print("no SOURCE hit maps to a graph function")
+        return
+    show = lambda i: f"{G['by_id'][i].get('source_file')}::{re.sub(r'[(][)]$', '', G['by_id'][i].get('label', ''))}"
+    ranked = sorted(cands, key=lambda k: (-len(cands[k][0]), -cands[k][1], len(MG.callees(G, [k[2]])), k[0], k[1]))
+    f, fn, nid = ranked[0]
+    print(f"PROPOSED: --allowed {f} --fn {fn}")
+    for k in ranked[1:6]:
+        print(f"  alt: {k[0]}::{k[1]} ({len(cands[k][0])}/{len(pats)} patterns, {cands[k][1]} hit(s), {len(MG.callees(G, [k[2]]))} callee(s))")
+    print("callers: " + (", ".join(show(i) for i in MG.callers(G, [nid])[:10]) or "none"))
+    print("callees: " + (", ".join(show(i) for i in MG.callees(G, [nid])[:12]) or "none"))
+    tests = sorted({sf for sf, _s, _r in MG.importers(G, f, [nid]) if istest(sf)})
+    print(f"test files importing {f}: " + (", ".join(tests) or "none"))
+    peers = MG.community_peers(G, [nid], 8)
+    print("community peers (related, not targets): " + (", ".join(f"{pf}::{pn}" for pf, pn, _i in peers) or "none"))
+    frm = getattr(a, "locate_from", None)
+    if frm:
+        ent = sorted(i for i, n in G["by_id"].items() if i == frm or re.sub(r"[(][)]$", "", n.get("label", "")) == frm)
+        pth = MG.shortest_path(G, ent[0], nid) if ent else None
+        print(f"path {frm} -> {fn}: " + (" -> ".join(show(i) for i in pth) if pth else "no calls path"))
+
+
+def log_intake_refusal(rd, intake, overridden):
+    """Opt-in (MINI_LOG_REFUSALS=1, default OFF): append one row to $MINI_REFUSAL_LOG (default ~/.ollama-dispatch/intake-refusals.jsonl) whenever
+    intake is not local-ready, so rejected shapes and overrides become measurable. Never raises."""
+    if os.environ.get("MINI_LOG_REFUSALS") != "1" or intake.get("class") in (None, "local-ready"):
+        return
+    try:
+        p = Path(os.environ.get("MINI_REFUSAL_LOG") or Path.home() / ".ollama-dispatch/intake-refusals.jsonl")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "run": Path(rd).name, "class": intake.get("class"),
+                                 "overridden": overridden, "reasons": [str(r)[:200] for r in (intake.get("reasons") or [])][:6]}) + "\n")
+    except OSError:
+        pass
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("worktree", nargs="?")
+    ap.add_argument("task", nargs="?", help="task paragraph, or a file holding it")
+    ap.add_argument("--name", help="run dir name (default: worktree name without wt-)")
+    ap.add_argument("--allowed", action="append", help="file the run may edit (repeatable); skips inference")
+    ap.add_argument("--fn", action="append", help="target function (repeatable); skips inference")
+    ap.add_argument("--no-fn", action="store_true", help="no target_fn (new code that does not exist at baseline)")
+    ap.add_argument("--single", action="store_true", help="several functions in ONE run (target_fn list) instead of one step each")
+    ap.add_argument("--runner", choices=["node-test", "pytest"], help="override test runner detection")
+    ap.add_argument("--test-style", choices=["sibling", "prefix", "testdir"], help="override test location detection")
+    ap.add_argument("--runs-dir", default=str(RUNS))
+    ap.add_argument("--force", action="store_true", help="rewrite spec.json/TASK*.md of an existing run dir")
+    ap.add_argument("--check", action="store_true", help="also run mini-swe-runner.py --check-only, then --check-only --probe (prints PROBE ok / PROBE FAIL <reason>)")
+    ap.add_argument("--lint", metavar="RUN_DIR")
+    ap.add_argument("--reach-anchor", action="append", metavar="[FN=]LITERAL", help="TASK entry-point literal the test must execute (repeatable)")
+    ap.add_argument("--override", metavar="REASON", help="accept a non-local-ready intake class; the reason is stored in the spec")
+    ap.add_argument("--tried", action="append", metavar="WHAT", help="record a split/seed already attempted (enables the HANDOFF-CLAUDE line)")
+    ap.add_argument("--intake", metavar="RUN_DIR", help="classify an existing run dir")
+    ap.add_argument("--seed-stubs", action="store_true", help="WORKTREE TASK.md: throwing stubs from `Signature:` lines (plan only without --apply)")
+    ap.add_argument("--file", help="with --seed-stubs: the file to stub (default: the one source path the task names)")
+    ap.add_argument("--apply", action="store_true", help="with --seed-stubs: write into WORKTREE (else only a scratch copy or a printed plan)")
+    ap.add_argument("--fix-mode", choices=["single_shot"], help="spec fix_mode: Phase B asks for the whole new target function in one request "
+                    "(mini loop is the fallback); needs exactly one target_fn per run/step")
+    ap.add_argument("--locate", action="append", metavar="REGEX", help="WORKTREE only: find where a symptom/string lives (regex, repeatable); prints files, enclosing functions, tests")
+    ap.add_argument("--impact", metavar="RUN_DIR", help="rescan an existing run dir for existing tests that assert the old behaviour; rewrites IMPACT.md, never TASK.md; "
+                    "exit 1 while a STRONG test is neither in spec update_tests nor decided in TASK.md")
+    ap.add_argument("--no-impact", action="store_true", help="build: skip the impact scan (no IMPACT.md, no TASK.md section, no suite widening)")
+    ap.add_argument("--impact-ignore", action="append", metavar="FILE", help="test file the impact scan skips (repeatable)")
+    ap.add_argument("--impact-max", type=int, metavar="N", help=f"build: allow up to N STRONG/MEDIUM impact tests (default {IMPACT_MAX}); past "
+                    f"{IMPACT_MAX} the suite must run every one of them (listed, or the whole run) or the build is ambiguous")
+    ap.add_argument("--graph", metavar="GRAPH_JSON", help="graphify graph.json to use (default: the main checkout's graphify-out/graph.json); read-only")
+    ap.add_argument("--locate-from", metavar="ENTRY", help="with --locate and a fresh graph: also print the shortest calls path ENTRY -> PROPOSED fn")
+    ap.add_argument("--repo", metavar="REPO", help="instead of WORKTREE: create a fresh worktree of REPO at --base under "
+                    "~/dispatch-worktrees/<--name> (branch dispatch/<name>); needs --name and the task only")
+    ap.add_argument("--base", metavar="REF", help="with --repo: start point (default origin/main; a <remote>/<branch> is fetched first)")
+    ap.add_argument("--wt-root", help=argparse.SUPPRESS)
+    ap.add_argument("--freeze", metavar="RUN_DIR", help="commit the filled-in RUN_DIR/frozen/<test_file>(s) into baseline_from "
+                    "(refuses while a TODO(frozen-test) is left; --force replaces a different file there); git hooks skipped")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args(argv)
+    if a.self_test:
+        return self_test()
+    if a.freeze:
+        return freeze_cmd(a.freeze, a.force)
+    if a.lint:
+        return lint(a.lint)
+    if a.intake:
+        return intake_cmd(a.intake)
+    if a.impact:
+        return impact_cmd(a.impact, tuple(a.impact_ignore or ()))
+    if a.seed_stubs:
+        return seed_stubs_cmd(a)
+    if a.locate:
+        if not a.worktree:
+            ap.error("--locate needs WORKTREE")
+        return locate_cmd(a)
+    if a.repo:
+        if a.worktree and not a.task:
+            a.task, a.worktree = a.worktree, None  # the one positional is the task
+        if a.worktree:
+            ap.error("--repo replaces WORKTREE: pass only the task")
+        if not (a.name and a.task):
+            ap.error("--repo needs --name <area-change> and the task")
+        if not re.fullmatch(NAME_RE, a.name):
+            ap.error(f"bad --name {a.name!r}")
+        if Path(a.runs_dir, a.name).exists() and not a.force:
+            print(f"mini-spec: FAIL: {Path(a.runs_dir, a.name)} already exists; pass --force to rewrite its spec.json/TASK*.md", file=sys.stderr)
+            return 2
+        try:
+            a.worktree = make_worktree(a.repo, a.base or "origin/main", a.name, a.wt_root)
+        except Ambiguous as e:
+            print(f"mini-spec: FAIL: {e}", file=sys.stderr)
+            return 2
+    elif a.base:
+        ap.error("--base needs --repo")
+    if not (a.worktree and a.task):
+        ap.error("WORKTREE and TASK are required (or --repo REPO --name NAME TASK)")
+    try:
+        b = build(a)
+        b["fix_mode"] = a.fix_mode
+        rd, spec = write_run(b, a.runs_dir, a.force)
+        frozen = write_frozen(rd, spec, b["wt"], b["allowed"])
+    except Ambiguous as e:
+        print(f"mini-spec: FAIL: {e}", file=sys.stderr)
+        return 2
+    print(f"run dir: {rd}")
+    print_intake(b["intake"])
+    code = 0 if b["intake"].get("override") else INTAKE_CODES[b["intake"]["class"]]
+    for k, why in b["facts"].evidence:
+        print(f"  {k:14} {why}")
+    for r in (b["impact"] or {}).get("rows", []):
+        if r["tier"] != "WEAK":
+            print(f"  impact {r['tier']:6} {r['test']}  ({r['via']}; L{r['hits'][0][0]})")
+    for fn, tf, tcmd in b["tests"]:
+        print(f"  step           {fn or '-'}: {tf}  ::  {tcmd}")
+    for tf, what in frozen:
+        print(f"  frozen         {rd / 'frozen' / tf} ({what})")
+    print(f"  suite_cmd      {b['suite'] or '-'}\n  typecheck_cmd  {b['typecheck'] or '-'}\n  timeout        {b['timeout']}s per step")
+    rc, out = run_precheck(rd / "spec.json")
+    print(out)
+    if rc == 0 and a.check:
+        crc, cout = check_only(rd)
+        print(f"check-only rc={crc}" + ("" if crc == 0 else "\n" + cout[-3000:]))
+        rc = rc or crc
+        if crc == 0:
+            prc, plines = probe(rd)
+            print("\n".join(plines))
+            rc = rc or prc
+            nl = probe_not_local(rd)
+            if nl and not code:
+                code = nl
+                b["intake"]["class"] = "not-local"
+    log_intake_refusal(rd, b["intake"], bool(b["intake"].get("override")))
+    if code:
+        print(f"\nNOT ENQUEUEABLE: intake class {b['intake']['class']} (exit {code}); see {rd}/INTAKE.md. "
+              "Fix it (or rerun with --override REASON) before enqueueing.")
+    print(f"\nREVIEW REQUIRED: TASK*.md in {rd} are drafts. Confirm every {MARK} line (contract, must-not-change, "
+          f"Must contain), then `mini-spec --lint {rd}` must pass before enqueueing. Also check `env` (none inferred).")
+    if frozen:
+        print(f"FROZEN TEST (Opus writes it): fill {rd}/frozen/ (every {R.FROZEN_MARK}), `mini-spec --freeze {rd}` commits it to "
+              f"baseline_from; write the reference fix in {rd}/ref/<file>" + (" (ref/s<N>/<file> per step)" if spec.get("steps") else "")
+              + f"; `mini-validate {rd}/spec.json` fills fix_steps/fix_wall/target_fn and validates; then mini-submit.")
+    return code or (1 if rc else 0)
+
+
+# ---- self-test ----------------------------------------------------------------------------------------------------
+
+def _repo(d, files):
+    d.mkdir(parents=True)
+    for k, v in files.items():
+        Path(d, k).parent.mkdir(parents=True, exist_ok=True)
+        Path(d, k).write_text(v)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for c in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "fixture"]):
+        subprocess.run(["git", *c], cwd=d, check=True, capture_output=True, env=env)
+    return d
+
+
+NODE_FX = {
+    "package.json": json.dumps({"name": "fx", "private": True, "scripts": {"test": "node --test test-calc-basic.js"}}),
+    "src/calc.js": "'use strict';\nfunction add(a, b) {\n  return a - b;\n}\nconst mul = (a, b) => {\n  return a + b;\n};\n"
+                   "function other() { return 1; }\nmodule.exports = { add, mul, other };\n",
+    "test-calc-basic.js": "const { test } = require('node:test');\nconst assert = require('assert');\nconst { other } = require('./src/calc');\n"
+                          "test('other', () => { assert.strictEqual(other(), 1); });\n",
+    "verify.sh": "exit 1\n",
+}
+PY_FX = {
+    "src/text.py": "def truncate_words(s, n):\n    words = s.split()\n    return \" \".join(words[:n-1])\n\n\ndef shout(s):\n    return s.upper()\n",
+    "src/test_text.py": "from text import shout\n\n\ndef test_shout():\n    assert shout('a') == 'A'\n",
+}
+
+
+GUARDED_JS = ("async function syncQueue(state, opts) {\n  if (!state) return null;\n  if (state.busy) {\n    return 'waiting';\n  }\n"
+              "  if (!opts) throw new Error('opts');\n  const x = 1;\n  log('proceed to dispatch');\n  return x;\n}\nmodule.exports = { syncQueue };\n")
+
+
+def _st_cover(rd):
+    """Self-test: a confirmed draft's emptied `## Rule coverage` gets one rule line naming its step's first frozen-template test."""
+    cov = load_coverage()
+    spec = json.loads((rd / "spec.json").read_text())
+    steps = R.merged_steps(spec) if spec.get("steps") else [spec]
+    for t in rd.glob("TASK*.md"):
+        tf = steps[int(re.fullmatch(r"TASK(?:-s(\d+))?\.md", t.name).group(1) or 1) - 1]["test_file"]
+        name = sorted(cov.test_names((rd / "frozen" / tf).read_text(), tf))[0]
+        t.write_text(t.read_text().replace("## Rule coverage\n\n", f"## Rule coverage\n\n- a missing value is rejected -> `{name}`\n", 1))
+
+
+def _self_test_stubs(td):
+    """seed-stubs: plan-only by default, refuses without Signature lines, a seeded CJS stub loads under require and an ESM stub under import."""
+    task = "Implement `parseCards` in `src/cards.js`.\nSignature: parseCards(text: string, opts)\nSignature: sumCards(list)\n"
+    (td / "t.md").write_text(task)
+    (td / "n.md").write_text("Edit src/cards.js to do things.\n")
+    for kind, pkg in (("cjs", {"name": "x"}), ("esm", {"name": "x", "type": "module"})):
+        wt = td / f"ss-{kind}"
+        (wt / "src").mkdir(parents=True)
+        (wt / "package.json").write_text(json.dumps(pkg))
+        (wt / "src/cards.js").write_text("export {}\n")
+        newer, added = stub_source("src/cards.js", "export {}\n", parse_signatures(task), kind == "esm")
+        assert added == ["parseCards", "sumCards"] and "export {}" not in newer and "text: string" not in newer, newer
+        assert seed_stubs_cmd(argparse.Namespace(worktree=str(wt), task=str(td / "t.md"), file=None, apply=False, name=None, runs_dir=str(td))) == 0
+        assert (wt / "src/cards.js").read_text() == newer  # a worktree under the temp dir counts as a scratch copy and is written
+        js = ("const m=require('./src/cards.js');try{m.parseCards('x')}catch(e){console.log(e.message)}" if kind == "cjs" else
+              "import('./src/cards.js').then(m=>{try{m.sumCards([])}catch(e){console.log(e.message)}})")
+        if shutil.which("node"):
+            out = subprocess.run(["node", "-e", js], cwd=wt, capture_output=True, text=True).stdout.strip()
+            assert out.startswith("not implemented: "), (kind, out)
+    assert seed_stubs_cmd(argparse.Namespace(worktree=str(td / "ss-cjs"), task=str(td / "n.md"), file=None, apply=False, name=None, runs_dir=str(td))) == 2
+    py, added = stub_source("m.py", "", [("f", "a, b=1")], False)
+    assert added == ["f"] and "raise NotImplementedError('not implemented: f')" in py, py
+
+
+def _self_test_intake(td, runs):
+    """fit_check classes: egift-like placeholder -> needs-stubs (3), sync-queue-like guards -> needs-split (4), amz-2p-like
+    page.evaluate target -> not-local (5), HANDOFF line only after a recorded attempt, --override accepts."""
+    cjs = json.dumps({"name": "fx", "private": True})
+    stub = _repo(td / "wt-egift", {"package.json": json.dumps({"name": "e", "type": "module"}), "src/redeem.js": "// Stub\nexport {};\n"})
+    task = "`parseCards` in `src/redeem.js` must return the card numbers. Signature: parseCards(raw)"
+    assert main([str(stub), task, "--runs-dir", str(runs), "--allowed", "src/redeem.js", "--fn", "parseCards"]) == 3
+    ik = json.loads((runs / "egift/spec.json").read_text())["intake"]
+    assert ik["class"] == "needs-stubs" and "seed-stubs" in ik["next"] and "handoff" not in ik, ik
+    assert "HANDOFF" not in (runs / "egift/INTAKE.md").read_text()
+    guard = _repo(td / "wt-guard", {"package.json": cjs, "src/q.js": GUARDED_JS})
+    gt = "`syncQueue` in `src/q.js` never dispatches when busy."
+    # early guards before the anchor of a one-block fix: local-ready with a note (V3's reach gate holds the frozen test to the anchor)
+    assert main([str(guard), gt, "--runs-dir", str(runs), "--reach-anchor", "log('proceed to dispatch')"]) == 0
+    ik = json.loads((runs / "guard/spec.json").read_text())["intake"]
+    assert ik["class"] == "local-ready" and not ik["reasons"], ik
+    assert "3 early return/throw guards" in ik["metrics"]["guard_notes"][0] and ik["metrics"]["test_draft_ok"] is False, ik["metrics"]
+    assert ik["metrics"]["guards"]["syncQueue"][0].startswith("src/q.js:2 "), ik["metrics"]
+    assert "- note: `syncQueue` has 3 early return/throw guards" in (runs / "guard/INTAKE.md").read_text()
+    assert lint(runs / "guard") == 1  # TODO markers still there, but not because of the intake class
+    assert intake_cmd(runs / "guard") == 0
+    # no anchor and a body over 80 lines is needs-split; with an anchor it would be ready
+    big = "function big(a) {\n" + "  a += 1;\n" * 90 + "  return a;\n}\nmodule.exports = { big };\n"
+    bigr = _repo(td / "wt-big", {"package.json": cjs, "src/b.js": big})
+    assert main([str(bigr), "`big` is wrong.", "--runs-dir", str(runs)]) == 4
+    ik = json.loads((runs / "big/spec.json").read_text())["intake"]
+    assert "body is 93 lines (> 80)" in ik["reasons"][0] and "reach_anchor" in ik["next"], ik
+    # a recorded attempt turns on the last-resort line (and survives a --force rerun)
+    assert main([str(bigr), "`big` is wrong.", "--runs-dir", str(runs), "--force", "--tried", "tried an anchor, none fits"]) == 4
+    assert "HANDOFF-CLAUDE (last resort)" in (runs / "big/INTAKE.md").read_text()
+    assert main([str(bigr), "`big` is wrong.", "--runs-dir", str(runs), "--force"]) == 4 and "tried an anchor" in (runs / "big/INTAKE.md").read_text()
+    assert main([str(bigr), "`big` is wrong.", "--runs-dir", str(runs), "--force", "--override", "operator accepts"]) == 0
+    assert json.loads((runs / "big/spec.json").read_text())["intake"]["override"] == "operator accepts"
+    assert lint(runs / "big") == 1  # TODO markers still there, but not because of the intake class
+    assert intake_cmd(runs / "big") == 0
+    br = _repo(td / "wt-amz", {"package.json": cjs, "src/a.js": "function inBrowser() { return document.title; }\nasync function scrape(page) {\n"
+                               "  return page.evaluate(inBrowser);\n}\nmodule.exports = { scrape };\n"})
+    assert main([str(br), "`inBrowser` returns the wrong title.", "--runs-dir", str(runs), "--allowed", "src/a.js", "--fn", "inBrowser"]) == 5
+    ik = json.loads((runs / "amz/spec.json").read_text())["intake"]
+    assert ik["class"] == "not-local" and "extract the page.evaluate body into a pure helper" in ik["next"], ik
+    # legacy single-phase spec is needs-split
+    leg = runs / "legacy"
+    leg.mkdir()
+    (leg / "spec.json").write_text(json.dumps({"allowed": ["src/q.js"], "baseline_from": str(guard)}))
+    assert intake_cmd(leg) == 4
+
+
+def _self_test_graph(td):
+    """graphify integration: impact (graph present -> edge A from the graph; graph absent -> exactly today's result; stale file -> fallback)
+    and locate (PROPOSED / callers / test importers; no graph -> today's output)."""
+    cjs = lambda body: "const { test } = require('node:test');\nconst assert = require('assert');\n" + body
+    fx = {
+        "package.json": json.dumps({"name": "fx", "private": True, "scripts": {"test": "node --test"}}),
+        "src/sites.js": "function activeSites() {\n  return ['amazon', 'costco'];\n}\nmodule.exports = { activeSites };\n",
+        "src/dyn.js": "const m = require(['.', 'sites'].join('/'));\nfunction viaDyn() {\n  return m.activeSites();\n}\nmodule.exports = { viaDyn };\n",
+        "test-dyn.js": cjs("const s = require(require('path').join(__dirname, 'src', 'sites'));\ntest('d', () => { assert.ok(s.activeSites().includes('costco')); });\n"),
+        "test-dyn2.js": cjs("const d = require('./src/dyn');\ntest('d2', () => { assert.ok(d.viaDyn().includes('costco')); });\n"),
+    }
+    wt = _repo(td / "wt-graph", fx)
+    sha = git(wt, "rev-parse", "HEAD").strip()
+    nd = lambda i, lab, f, loc, c=1, call=True: {"id": i, "label": lab, "source_file": f, "source_location": loc, "_callable": call, "community": c}
+    nodes = [nd("src_sites", "sites.js", "src/sites.js", "L1", call=False), nd("src_sites_activesites", "activeSites()", "src/sites.js", "L2"),
+             nd("src_dyn", "dyn.js", "src/dyn.js", "L1", call=False), nd("src_dyn_viadyn", "viaDyn()", "src/dyn.js", "L2"),
+             nd("test_dyn", "test-dyn.js", "test-dyn.js", "L1", call=False), nd("test_dyn2", "test-dyn2.js", "test-dyn2.js", "L1", call=False)]
+    lk = lambda s_, t, r: {"source": s_, "target": t, "relation": r}
+    links = [lk("src_sites", "src_sites_activesites", "contains"), lk("src_dyn_viadyn", "src_sites_activesites", "calls"),
+             lk("test_dyn", "src_sites", "imports_from"), lk("test_dyn2", "src_dyn", "imports_from")]
+    gdir = wt / "graphify-out"
+    gdir.mkdir()
+    (gdir / "graph.json").write_text(json.dumps(dict(directed=False, nodes=nodes, links=links, built_at_commit=sha)))
+    (gdir / "manifest.json").write_text(json.dumps({f: {} for f in ("src/sites.js", "src/dyn.js", "test-dyn.js", "test-dyn2.js")}))
+    files = [f for f in git(wt, "ls-files").split("\n") if f]
+    allowed, fns = ["src/sites.js"], ["activeSites"]
+    texts = {f: Path(wt, f).read_text() for f in allowed}
+    task = "`activeSites` in src/sites.js lists 'costco'. Wanted: SITES_COSTCO_OFF=1 drops it from the list."
+    G, gp = graph_for(wt)
+    assert G and Path(gp).resolve() == (wt / "graphify-out/graph.json").resolve(), gp
+
+    def scan(G_):
+        cs = callers_of(wt, files, allowed, "node", G_, fns)
+        return cs, impact_scan(wt, files, allowed, texts, fns, task, "node", cs, (), G_)
+    cs0, base = scan(None)
+    assert cs0 == [] and base["graph"] == "graph: absent" and {r["test"]: r["tier"] for r in base["rows"]} == {"test-dyn.js": "WEAK", "test-dyn2.js": "WEAK"}, base["rows"]
+    cs1, withg = scan(G)
+    row = {r["test"]: r for r in withg["rows"]}
+    assert cs1 == ["src/dyn.js"] and withg["graph"].startswith("graph: fresh@" + sha[:7]), (cs1, withg["graph"])
+    assert row["test-dyn.js"]["tier"] == "STRONG" and row["test-dyn.js"]["edge"] == "A" and row["test-dyn.js"]["via"] == "graph: imports_from src/sites.js", row
+    assert row["test-dyn2.js"]["tier"] == "MEDIUM" and row["test-dyn2.js"]["edge"] == "A'" and row["test-dyn2.js"]["via"].startswith("graph: imports_from src/dyn.js"), row
+    assert withg["graph"] in impact_md(withg)
+    # graph file removed -> nothing found, so callers/impact are today's result
+    gp.rename(gp.with_name("graph.json.off"))
+    assert graph_for(wt) == (None, None)
+    gp.with_name("graph.json.off").rename(gp)
+    # stale allowed file (dirty) -> fallback = no-graph result, status names the file
+    Path(wt, "src/sites.js").write_text(fx["src/sites.js"] + "// edit\n")
+    cs2, stale = scan(G)
+    assert stale["graph"] == "graph: stale ['src/sites.js']" and cs2 == cs0, stale["graph"]
+    assert [(r["test"], r["tier"], r["edge"]) for r in stale["rows"]] == [(r["test"], r["tier"], r["edge"]) for r in base["rows"]]
+    Path(wt, "src/sites.js").write_text(fx["src/sites.js"])
+    # locate with the graph; without it exactly today's output
+    import contextlib
+    import io
+
+    def loc(**kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = locate_cmd(argparse.Namespace(worktree=str(wt), locate=["costco"], locate_from=None, graph=None, **kw))
+        assert rc == 0
+        return buf.getvalue()
+    out = loc()
+    assert "PROPOSED: --allowed src/sites.js --fn activeSites" in out and "callers: src/dyn.js::viaDyn" in out \
+        and "test files importing src/sites.js: test-dyn.js" in out and "\ngraph: fresh@" in out, out
+    (gdir / "graph.json").rename(gdir / "graph.json.off")
+    plain = loc()
+    assert "PROPOSED" not in plain and "graph:" not in plain and plain.rstrip().endswith("(or --no-fn for new code)"), plain
+    (gdir / "graph.json.off").rename(gdir / "graph.json")
+    with_path = io.StringIO()
+    with contextlib.redirect_stdout(with_path):
+        locate_cmd(argparse.Namespace(worktree=str(wt), locate=["costco"], locate_from="viaDyn", graph=None))
+    assert "path viaDyn -> activeSites: src/dyn.js::viaDyn -> src/sites.js::activeSites" in with_path.getvalue(), with_path.getvalue()
+    assert loc() == out  # deterministic
+
+
+def _self_test_impact(td, runs):
+    """impact scan: resolve_loads / derive_literals units, then an incident-shaped node repo (tiers, TASK.md bullets, suite widening,
+    --impact exit codes, lint) and a python twin."""
+    r = _repo(td / "wt-resolve", {"src/x.js": "", "src/y/index.js": "", "src/z.ts": "", "test/a.js": "", "src/m.py": "", "pkg/__init__.py": "", "pkg/q.py": ""})
+    assert resolve_loads(r, "test-a.js", "const x = require('./src/x');", "node") == [("src/x.js", "./src/x")]
+    assert resolve_loads(r, "test/a.js", "import { f } from '../src/x.js'", "node") == [("src/x.js", "../src/x.js")]
+    assert resolve_loads(r, "test/a.js", "const y = await import('../src/y'); require('lodash')", "node") == [("src/y/index.js", "../src/y")]
+    assert resolve_loads(r, "test/a.js", "require('../src/z.js')", "node") == [("src/z.ts", "../src/z.js")]
+    assert resolve_loads(r, "test/a.js", "require('./nothing')", "node") == []
+    assert resolve_loads(r, "src/test_m.py", "from m import f\n", "py") == [("src/m.py", "m")]
+    assert [p for p, _s in resolve_loads(r, "t.py", "from pkg import q\nimport pkg.q\n", "py")] == ["pkg/__init__.py", "pkg/q.py"]
+    task = ("Costco login is stuck ('login in progress (costco)'). activeSites(statuses) in sidecar/src/loginQueue.js returns ALWAYS_SITES filtered ... "
+            "ALWAYS_SITES includes 'costco'. Wanted: kill switch ... SIDECAR_COSTCO_ENABLED ... disable unless")
+    lits = {x[0]: x[1] for x in derive_literals(task, {"q.js": "const ALWAYS_SITES = ['amazon', 'costco'];\nfunction activeSites(s) { return ALWAYS_SITES; }\n"}, ["activeSites"])}
+    assert "costco" in lits and "SIDECAR_COSTCO_ENABLED" in lits and "disable" not in lits and "unless" not in lits and "activeSites" not in lits, lits
+    # incident-shaped node repo
+    cjs = lambda body: "const { test } = require('node:test');\nconst assert = require('assert');\n" + body
+    fx = {
+        "package.json": json.dumps({"name": "fx", "private": True, "scripts": {"test": "node --test"}}),
+        "src/sites.js": "const ALL = ['amazon', 'costco'];\nfunction activeSites() {\n  return ALL.slice();\n}\nmodule.exports = { activeSites, ALL };\n",
+        "src/caller.js": "const { activeSites } = require('./sites');\nfunction run() {\n  return activeSites().length;\n}\nmodule.exports = { run };\n",
+        "test-sites-lock.js": cjs("const { activeSites } = require('./src/sites');\ntest('lock', () => { assert.ok(activeSites().includes('costco')); });\n"),
+        "test-other.js": cjs("const s = require('./src/sites');\ntest('other', () => { assert.ok(s.ALL.length > 0); });\n"),
+        "test-unrelated.js": cjs("test('u', () => { assert.strictEqual(['costco'].length, 1); });\n"),
+        "test-caller.js": cjs("const { run } = require('./src/caller');\ntest('caller', () => { assert.strictEqual(run() > 0, true); /* 'costco' */ });\n"),
+    }
+    wt = _repo(td / "wt-impact", fx)
+    para = "`activeSites` in src/sites.js lists 'costco' even while costco login is stuck. Wanted: SITES_COSTCO_OFF=1 drops it from the list."
+    assert main([str(wt), para, "--runs-dir", str(runs)]) == 0, "impact fixture"
+    rd = runs / "impact"
+    md = (rd / "IMPACT.md").read_text()
+    tier = lambda t: re.search(rf"^## {t} \((\d)\)\n(.*?)(?=^## |\Z)", md, re.M | re.S)
+    assert tier("STRONG").group(1) == "1" and "`test-sites-lock.js` | requires ./src/sites" in tier("STRONG").group(2), md
+    assert tier("MEDIUM").group(1) == "1" and "`test-caller.js`" in tier("MEDIUM").group(2), md
+    assert tier("WEAK").group(1) == "1" and "`test-unrelated.js`" in tier("WEAK").group(2) and "no load edge" in tier("WEAK").group(2), md
+    assert "test-other.js" not in md and "`costco` (word)" in md and "`SITES_COSTCO_OFF` (env)" in md, md
+    t1 = (rd / "TASK.md").read_text()
+    sec = t1[t1.index(IMPACT_SEC):t1.index("## Scope")]
+    bullets = [ln for ln in sec.splitlines() if ln.startswith("- `") and MARK in ln]
+    assert len(bullets) == 2 and "`test-sites-lock.js` (requires ./src/sites; L4 'costco')" in bullets[0], sec
+    assert t1.index("## Test notes") < t1.index(IMPACT_SEC) < t1.index("## Scope")
+    spec = json.loads((rd / "spec.json").read_text())
+    assert "update_tests" not in spec and "test-sites-lock.js" in spec["suite_cmd"] and "test-caller.js" in spec["suite_cmd"] \
+        and "test-unrelated.js" not in spec["suite_cmd"], spec["suite_cmd"]
+    assert impact_cmd(rd) == 1 and (rd / "TASK.md").read_text() == t1  # --impact never edits TASK.md
+    assert main(["--impact", str(rd)]) == 1
+    for t in rd.glob("TASK*.md"):  # confirm everything except the impact bullets
+        t.write_text("\n".join(ln for ln in t.read_text().splitlines() if MARK not in ln or ln.startswith("- `test-")) + "\n")
+    _st_cover(rd)
+    assert lint(rd) == 1  # the impact bullets alone block the lint
+    spec["update_tests"] = ["test-sites-lock.js"]
+    (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    (rd / "TASK.md").write_text("\n".join(ln for ln in (rd / "TASK.md").read_text().splitlines() if not ln.startswith("- `test-")) + "\n")
+    assert lint(rd) == 0 and impact_cmd(rd) == 0 and main(["--impact", str(rd)]) == 0
+    # a bullet rewritten into a decision (no marker) also counts as decided
+    spec.pop("update_tests")
+    (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    assert impact_cmd(rd) == 1
+    (rd / "TASK.md").write_text((rd / "TASK.md").read_text() + "- `test-sites-lock.js` is unaffected: it stubs the list.\n")
+    assert impact_cmd(rd) == 0
+    # --no-impact: no file, no section, suite untouched
+    assert main([str(wt), para, "--runs-dir", str(runs), "--name", "noimp", "--no-impact"]) == 0
+    assert not (runs / "noimp/IMPACT.md").exists() and IMPACT_SEC not in (runs / "noimp/TASK.md").read_text()
+    assert "test-caller.js" not in json.loads((runs / "noimp/spec.json").read_text())["suite_cmd"]
+    # --impact-ignore drops a test; more than IMPACT_MAX STRONG/MEDIUM tests is a FAIL naming the escape hatch
+    assert main([str(wt), para, "--runs-dir", str(runs), "--name", "ign", "--impact-ignore", "test-caller.js"]) == 0
+    assert "test-caller.js" not in (runs / "ign/IMPACT.md").read_text()
+    many = dict(fx, **{f"test-many{i}.js": cjs(f"const {{ activeSites }} = require('./src/sites');\ntest('m{i}', () => activeSites());\n") for i in range(6)})
+    wm = _repo(td / "wt-impact-many", many)
+    assert main([str(wm), para, "--runs-dir", str(runs), "--name", "many"]) == 2 and not (runs / "many").exists()
+    # --impact-max (the auto lane's limit): 8 tests, all listed in the suite (9 files <= MAX_SUITE)
+    assert main([str(wm), para, "--runs-dir", str(runs), "--name", "many-max", "--impact-max", "24"]) == 0
+    sc = json.loads((runs / "many-max/spec.json").read_text())["suite_cmd"]
+    assert all(t in sc for t in ["test-caller.js", "test-sites-lock.js"] + [f"test-many{i}.js" for i in range(6)]), sc
+    assert main([str(wm), para, "--runs-dir", str(runs), "--name", "many-low", "--impact-max", "7"]) == 2
+    # past MAX_SUITE: the package test script runs them all; with no test script nothing does, so the build is ambiguous
+    more = dict(fx, **{f"test-many{i}.js": cjs(f"const {{ activeSites }} = require('./src/sites');\ntest('m{i}', () => activeSites());\n") for i in range(12)})
+    wx = _repo(td / "wt-impact-more", more)
+    assert main([str(wx), para, "--runs-dir", str(runs), "--name", "more-max", "--impact-max", "24"]) == 0
+    assert json.loads((runs / "more-max/spec.json").read_text())["suite_cmd"].endswith("npm test")
+    wn = _repo(td / "wt-impact-noscript", dict(more, **{"package.json": json.dumps({"name": "fx", "private": True})}))
+    assert main([str(wn), para, "--runs-dir", str(runs), "--name", "noscript-max", "--impact-max", "24"]) == 2
+    assert not (runs / "noscript-max").exists()
+    # python twin: `from text import greet` resolves to the sibling src/text.py; literal match
+    pyfx = {
+        "src/text.py": "GREETING = 'hello'\n\n\ndef greet():\n    return GREETING\n",
+        "src/test_greet_old.py": "from text import greet\n\n\ndef test_old():\n    assert greet() == 'hello'\n",
+        "src/test_text_other.py": "from text import GREETING\n\n\ndef test_const():\n    assert len(GREETING) == 5\n",
+    }
+    pw = _repo(td / "wt-impact-py", pyfx)
+    assert main([str(pw), "`greet` in src/text.py must say 'hello' only on weekdays.", "--runs-dir", str(runs), "--name", "impact-py"]) == 0, "impact py"
+    pmd = (runs / "impact-py/IMPACT.md").read_text()
+    assert "## STRONG (1)" in pmd and "`src/test_greet_old.py` | requires text" in pmd and "test_text_other" not in pmd, pmd
+    ps = json.loads((runs / "impact-py/spec.json").read_text())
+    assert "src/test_greet_old.py" in ps["suite_cmd"], ps["suite_cmd"]
+    assert len([ln for ln in (runs / "impact-py/TASK.md").read_text().splitlines() if ln.startswith("- `src/test_greet_old.py`") and MARK in ln]) == 1
+    # python, a stem other packages share (motor: every moto service has models.py or models/, so the bare stem `models` made 428
+    # callers, among them moto/core, and 167 impact tests): only the target's own dotted tail counts, relative imports resolve
+    mfx = {
+        "pkg/__init__.py": "",
+        "pkg/core/__init__.py": "from pkg.core.models import Base\n",
+        "pkg/core/models.py": "class Base:\n    pass\n",
+        "pkg/db/__init__.py": "",
+        "pkg/db/models/__init__.py": "from pkg.core import Base\n\n\ndef backup(t):\n    return {'Status': 'ENABLED'}\n",
+        "pkg/db/responses.py": "from .models import backup\n",
+        "pkg/acm/models.py": "from pkg.core.models import Base\n",
+        "pkg/tag.py": "import pkg.db.models as dm\n",
+        "tests/test_db.py": "from pkg.db.models import backup\n\n\ndef test_b():\n    assert backup(1)['Status'] == 'ENABLED'\n",
+        "tests/test_db_resp.py": "from pkg.db import responses\n\n\ndef test_r():\n    assert responses.backup(1)['Status'] == 'ENABLED'\n",
+        "tests/test_db_pkg.py": "from pkg.db import models\n\n\ndef test_p():\n    assert models.backup(1) == {'Status': 'ENABLED'}\n",
+        "tests/test_db_tail.py": "from db.models import backup\n\n\ndef test_t():\n    assert backup(2)['Status'] == 'ENABLED'\n",
+        "tests/test_acm.py": "from pkg.acm.models import Base\nimport pkg.core\n\n\ndef test_a():\n    assert {'Status': 'ENABLED'}\n",
+    }
+    mw = _repo(td / "wt-impact-shared-stem", mfx)
+    mf, al = [f for f in git(mw, "ls-files").split("\n") if f], ["pkg/db/models/__init__.py"]
+    assert load_stems(mf, al, "py") == {"db.models"} and load_stems(mf, ["pkg/acm/models.py"], "py") == {"acm.models"}
+    assert load_stems(mf, ["pkg/db/responses.py"], "py") == {"responses"} and load_stems(mf, al, "node") == {"models"}  # unique: as before
+    yes = ("from pkg.db.models import backup\n", "from pkg.db import models\n", "import pkg.db.models as m\n", "from db.models import x\n",
+           "from models import backup\n", "    from pkg.db.models import (\n")
+    no = ("from pkg.acm.models import Base\n", "from pkg.xdb.models import B\n", "from pkg.db import models_v2\n", "import pkg.db.modelsx\n",
+          "from .models import backup\n", "import models.extra\n", "# from pkg.db.models import x\n")
+    assert all(imports_stem(t, "db.models", "py") for t in yes) and not any(imports_stem(t, "db.models", "py") for t in no), \
+        [(t, imports_stem(t, "db.models", "py")) for t in yes + no]
+    assert sorted(callers_of(mw, mf, al, "py")) == ["pkg/db/responses.py", "pkg/tag.py"], callers_of(mw, mf, al, "py")
+    imp = impact_scan(mw, mf, al, {f: Path(mw, f).read_text() for f in al}, ["backup"],
+                      "`backup` in pkg/db/models/__init__.py says 'ENABLED' for a table that has no backups.", "py", callers_of(mw, mf, al, "py"))
+    tiers = {r["test"]: (r["tier"], r["edge"]) for r in imp["rows"]}
+    assert tiers == {"tests/test_db.py": ("STRONG", "A"), "tests/test_db_pkg.py": ("STRONG", "A"), "tests/test_db_resp.py": ("MEDIUM", "A'"),
+                     "tests/test_db_tail.py": ("MEDIUM", "stem-only"), "tests/test_acm.py": ("WEAK", "none")}, tiers
+    assert [p for p, _s in resolve_loads(mw, "tests/test_db_pkg.py", mfx["tests/test_db_pkg.py"], "py")] == ["pkg/db/__init__.py", al[0]]
+
+
+def _self_test_repo_base(td):
+    """--repo/--base: fetches the remote tip (a stale clone still starts at it), new dispatch/<name> branch, reuse when
+    clean at base, fast-forward when clean and behind, refuse a dirty worktree, main() wiring sets baseline_from."""
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    up = _repo(td / "rb-upstream", PY_FX)
+    b = git(up, "branch", "--show-current").strip()
+    clone = td / "rb-clone"
+    subprocess.run(["git", "clone", "-q", str(up), str(clone)], check=True, capture_output=True)
+
+    def move(tag):
+        Path(up, "src/text.py").write_text(Path(up, "src/text.py").read_text() + f"\n# {tag}\n")
+        subprocess.run(["git", "commit", "-qam", tag], cwd=up, check=True, capture_output=True, env=env)
+        return git(up, "rev-parse", "HEAD").strip()
+
+    tip = move("ahead-1")  # the clone's origin/<b> is now stale
+    root = td / "rb-wts"
+    p = make_worktree(str(clone), f"origin/{b}", "rb-one", root)
+    assert git(p, "rev-parse", "HEAD").strip() == tip, "did not start at the fetched remote tip"
+    assert git(p, "branch", "--show-current").strip() == "dispatch/rb-one"
+    assert make_worktree(str(clone), f"origin/{b}", "rb-one", root) == p  # clean, at base: reused
+    tip2 = move("ahead-2")
+    assert make_worktree(str(clone), f"origin/{b}", "rb-one", root) == p and git(p, "rev-parse", "HEAD").strip() == tip2  # fast-forward
+    Path(p, "src/text.py").write_text("dirty\n")
+    try:
+        make_worktree(str(clone), f"origin/{b}", "rb-one", root)
+        raise AssertionError("dirty worktree reused")
+    except Ambiguous as e:
+        assert "uncommitted changes" in str(e), e
+    try:
+        make_worktree(str(clone), "origin/no-such-branch", "rb-two", root)
+        raise AssertionError("missing base accepted")
+    except Ambiguous as e:
+        assert "not a commit" in str(e), e
+    runs = td / "rb-runs"
+    rc = main(["--repo", str(clone), "--base", f"origin/{b}", "--name", "rb-main", "--runs-dir", str(runs), "--wt-root", str(root),
+               "`truncate_words(s, n)` in `src/text.py` keeps n-1 words; it must keep n."])
+    spec = json.loads((runs / "rb-main/spec.json").read_text())
+    assert rc in (0, 1) and spec["baseline_from"] == str(root / "rb-main"), (rc, spec.get("baseline_from"))
+    assert main(["--repo", str(clone), "--name", "rb-main", "--runs-dir", str(runs), "--wt-root", str(root), "x"]) == 2  # run dir exists
+
+
+def _self_test_freeze(td):
+    """frozen template per test file and the C4 fields up front; --freeze refuses while markers are left, commits with git hooks
+    skipped, makes no second commit for the same bytes, and replaces a different frozen file only with --force."""
+    wt, runs = _repo(td / "wt-py-freeze", PY_FX), td / "freeze-runs"
+    assert main([str(wt), "`truncate_words(\"a b c d\", 3)` returns one word too few.", "--runs-dir", str(runs), "--check"]) == 0
+    rd = runs / "py-freeze"
+    spec = json.loads((rd / "spec.json").read_text())
+    assert spec["test_cmd"] == "cd src && python3 test_truncate_words.py" and all(spec[k] == v for k, v in NEED_FIELDS.items()), spec
+    fz = rd / "frozen/src/test_truncate_words.py"
+    tpl = fz.read_text()
+    assert R.FROZEN_MARK in tpl and "TESTS = [test_case_1, test_case_2]" in tpl and "_load_text().truncate_words(" in tpl, tpl
+    assert not (rd / "work/src/test_truncate_words.py").exists(), "the probe's throwaway test was left in work/"
+    r = subprocess.run([sys.executable, fz.name], cwd=fz.parent, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and "RESULT test_case_1 FAIL AssertionError" in r.stdout, r.stdout + r.stderr  # red until filled in
+    hook = Path(wt, ".git/hooks/post-commit")
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text('#!/bin/sh\ntouch "$(git rev-parse --show-toplevel)/HOOK-RAN"\n')
+    hook.chmod(0o755)
+    assert freeze_cmd(rd) == 1 and not Path(wt, "src/test_truncate_words.py").exists()  # markers left: nothing copied
+    filled = "\n".join(["import os", "import sys", "", "", "def _load_text():", "    import text", "    return text", "", "",
+                        "def test_keeps_n_words():", '    assert _load_text().truncate_words("a b c d", 3) == "a b c"', "", "",
+                        "def test_keeps_all_when_short():", '    assert _load_text().truncate_words("a b c", 3) == "a b c"']
+                       + R.py_harness(["test_keeps_n_words", "test_keeps_all_when_short"])) + "\n"
+    fz.write_text(filled)
+    ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    saved = {k: os.environ.get(k) for k in ident}
+    os.environ.update(ident)
+    try:
+        assert freeze_cmd(rd) == 0
+        assert git(wt, "log", "-1", "--format=%s").strip() == "frozen test for py-freeze"
+        assert git(wt, "show", "HEAD:src/test_truncate_words.py") == filled
+        assert not Path(wt, "HOOK-RAN").exists(), "--freeze ran the post-commit hook (auto-push template)"
+        n0 = int(git(wt, "rev-list", "--count", "HEAD"))
+        assert freeze_cmd(rd) == 0 and int(git(wt, "rev-list", "--count", "HEAD")) == n0  # same bytes: no second commit
+        fz.write_text(filled.replace("def test_keeps_n_words", "def test_keeps_three_words").replace("[test_keeps_n_words,", "[test_keeps_three_words,"))
+        assert freeze_cmd(rd) == 1 and git(wt, "show", "HEAD:src/test_truncate_words.py") == filled  # a different file is frozen there
+        assert freeze_cmd(rd, force=True) == 0 and int(git(wt, "rev-list", "--count", "HEAD")) == n0 + 1
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def self_test():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        _self_test_repo_base(td)
+        runs = td / "runs"
+        node = _repo(td / "wt-node-calc", NODE_FX)
+        py = _repo(td / "wt-py-text", PY_FX)
+        # unit checks
+        assert task_idents("`add(a, b)` in `src/calc.js` and handleCommand( and truncate_words") [:2] == ["add", "src"]
+        assert set(R.functions("x.js", NODE_FX["src/calc.js"])) == {"add", "mul", "other"}, R.functions("x.js", NODE_FX["src/calc.js"])
+        assert R.functions("x.js", NODE_FX["src/calc.js"])["add"] == (2, 4)
+        assert exports("x.js", NODE_FX["src/calc.js"]) == ["add", "mul", "other"]
+        # guard scan covers whole if-blocks (brace depth / indentation), not just the first line after the `if`
+        gjs = ("async function h(cmd) {\n  if (cmd.kind === 'x') {\n    await o(cmd);\n    return;\n  }\n"
+               "  if (!hasSession(site)) {\n    console.error('no {session');\n    await o(cmd);\n    return;\n  }\n"
+               "  if (q) {\n    a();\n  } else if (z) {\n    b();\n  }\n  if (ok) {\n    log();\n  }\n  const best = 1;\n}\n")
+        gl = guard_lines("a.js", gjs, (1, 19), None)
+        assert [x[0] for x in gl] == [2, 6], gl
+        gpy = "def h(c):\n    if not c:\n        log()\n        return []\n    if c.ok:\n        log()\n    x = 1\n"
+        assert [x[0] for x in guard_lines("a.py", gpy, (1, 7), None)] == [2], guard_lines("a.py", gpy, (1, 7), None)
+        domwt = _repo(td / "wt-dom", {"package.json": "{}", "src/d.js": "function readPrice() {\n  return document.querySelector('.p').textContent;\n}\nmodule.exports = { readPrice };\n"})
+        dr = td / "dom-runs"
+        assert main([str(domwt), "`readPrice` in `src/d.js` returns the wrong price.", "--runs-dir", str(dr), "--check"]) == 5
+        dik = json.loads((dr / "dom/spec.json").read_text())["intake"]
+        assert dik["class"] == "not-local" and "browser-only" in dik["reasons"][0], dik
+        assert "class: **not-local**" in (dr / "dom/INTAKE.md").read_text() and intake_cmd(dr / "dom") == 5
+        gfx = {"package.json": "{}", "src/q.js": gjs.replace("const best = 1;", "const best = cmd.queues[0];") + "module.exports = { h };\n"}
+        gw = _repo(td / "wt-guard-anchor", gfx)
+        gt = {"src/q.js": gfx["src/q.js"]}
+        fi = fit_check(gw, ["src/q.js"], ["h"], gt, {"h": ("src/q.js", R.functions("src/q.js", gfx["src/q.js"])["h"])},
+                       {"h": ["const best = cmd.queues[0]"]})
+        assert fi["class"] == "local-ready" and len(fi["metrics"]["guards"]["h"]) == 2 and fi["metrics"]["test_draft_ok"] is False, fi
+        fi = fit_check(gw, ["src/q.js"], ["h"], gt, {"h": ("src/q.js", R.functions("src/q.js", gfx["src/q.js"])["h"])},
+                       {"h": ["text the fix will add"]})
+        assert "absent at baseline" in " ".join(fi["metrics"]["guard_notes"]) and fi["metrics"]["anchor_absent"] == ["h"], fi
+        assert is_test_path("sidecar/test-x.js") and is_test_path("lib/a.test.ts") and is_test_path("tests/x.py") and not is_test_path("src/calc.js")
+        # a tests/ tree: a new python test goes where the tree mirrors the source's directory, not into the first test dir found
+        ex = ["tests/client/test_auth.py", "tests/server/fastmcp/resources/test_resource_template.py", "tests/server/test_a.py",
+              "tests/test_examples.py", "tests/test_s3/test_s3.py", "tests/test_s3/test_s3_acl.py",
+              "tests/samplers_tests/tpe_tests/test_sampler.py", "tests/unit/utils/test_u.py", "tests/integration/utils/test_v.py",
+              "tests/integration/utils/test_w.py"]
+        assert mirror_dir("src/mcp/server/fastmcp/resources/templates.py", ex) == "tests/server/fastmcp/resources"
+        assert mirror_dir("moto/s3/models.py", ex) == "tests/test_s3"
+        assert mirror_dir("optuna/samplers/_tpe/sampler.py", ex) == "tests/samplers_tests/tpe_tests"
+        assert mirror_dir("pkg/utils/x.py", ex) == "tests/integration/utils"   # a tie on the tail: more tests there
+        assert mirror_dir("pkg/core.py", ex) == "tests" and mirror_dir("core.py", ex) == "tests"   # no shared tail: the shallowest
+        assert mirror_dir("pkg/core.py", ["t/a/test_a.py", "t/b/test_b.py", "t/b/test_c.py"]) == "t/b" and mirror_dir("x.py", []) is None
+        tmpl = "src/mcp/server/fastmcp/resources/templates.py"
+        assert test_name(td, tmpl, "matches", "testdir", ex, None, "py", [], False) == "tests/server/fastmcp/resources/test_matches.py"
+        assert test_name(td, tmpl, "matches", "testdir", ex + ["tests/other/test_matches.py"], None, "py", [], False) == \
+            "tests/server/fastmcp/resources/test_templates_matches.py"   # the basename is taken elsewhere in the tree
+        assert test_name(td, "moto/s3/models.py", None, "testdir", ex, None, "py", [], False) == "tests/test_s3/test_models.py"
+        assert test_name(td, "a/b.py", "f", "testdir", [], None, "py", [], False) == "tests/test_f.py"
+        assert test_name(td, "a/b.py", "f", "sibling", ["a/test_f2.py"], None, "py", [], False) == "a/test_f.py"
+        # node: two functions named -> two steps, prefix convention, related suite
+        para = "`add` in `src/calc.js` returns `a - b` instead of the sum, and `mul` adds instead of multiplying. Want `a * b`."
+        assert main([str(node), para, "--runs-dir", str(runs), "--check"]) == 0, "node fixture"
+        spec = json.loads((runs / "node-calc/spec.json").read_text())
+        assert spec["allowed"] == ["src/calc.js"] and [s["target_fn"] for s in spec["steps"]] == ["add", "mul"], spec
+        assert [s["test_file"] for s in spec["steps"]] == ["test-add.js", "test-mul.js"], spec["steps"]
+        assert spec["steps"][0]["test_cmd"] == "node --test test-add.js", spec["steps"][0]
+        assert all(all(s[k] == v for k, v in NEED_FIELDS.items()) for s in spec["steps"]), spec["steps"]  # per step, up front
+        assert all(R.FROZEN_MARK in (runs / "node-calc/frozen" / s["test_file"]).read_text() for s in spec["steps"])
+        assert spec["suite_cmd"] == "node --test test-calc-basic.js", spec.get("suite_cmd")
+        assert "verify.sh" in spec["drop"] and spec["mode"] == "two-phase" and spec["baseline_from"] == str(node)
+        t1 = (runs / "node-calc/TASK.md").read_text()
+        assert MARK in t1 and "`a * b`" in t1 and "## Must contain" in t1 and "`function add(`" in t1 and "step 1/2" in t1
+        assert (runs / "node-calc/TASK-s2.md").is_file() and spec["steps"][1]["task"].endswith("TASK-s2.md")
+        assert lint(runs / "node-calc") == 1  # drafts are not enqueueable
+        import contextlib, io
+        buf = io.StringIO()
+        (runs / "node-calc/PROBE.txt").unlink(missing_ok=True)
+        with contextlib.redirect_stdout(buf):
+            lint(runs / "node-calc")
+        assert "WARN: no probe has been run" in buf.getvalue(), buf.getvalue()
+        for t in (runs / "node-calc").glob("TASK*.md"):
+            t.write_text("\n".join(ln for ln in t.read_text().splitlines() if MARK not in ln) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert lint(runs / "node-calc") == 1  # the marker line went and no rule line replaced it
+        assert "TASK.md: `## Rule coverage` lists no rules" in buf.getvalue(), buf.getvalue()
+        _st_cover(runs / "node-calc")
+        assert lint(runs / "node-calc") == 0
+        tm = runs / "node-calc/TASK.md"  # a task that rewrites prose gets a nudge (not a block) to list the stale phrase
+        orig = tm.read_text()
+        tm.write_text(orig + "\nAlso update the doc comment above `add` to say it returns the sum.\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert lint(runs / "node-calc") == 0
+        assert "TASK.md: asks to change existing text (\"update the doc comment\")" in buf.getvalue(), buf.getvalue()
+        tm.write_text(orig + "\nAlso update the doc comment above `add`.\n\n## Must not contain\n\n- `returns the difference`\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert lint(runs / "node-calc") == 0
+        assert "asks to change existing text" not in buf.getvalue(), buf.getvalue()
+        tm.write_text(orig)
+        assert stale_doc_hint(f"<!-- {MARK}: confirm or rewrite every line, then delete this comment. -->\nFix parseHeader.\n") is None
+        assert stale_doc_hint("Reword the error message for a missing key.\n") == "Reword the error message"
+        # python: no path named -> allowed from the def; sibling convention; related pytest suite
+        assert main([str(py), "`truncate_words(\"a b c d\", 3)` returns one word too few.", "--runs-dir", str(runs), "--check"]) == 0, "py fixture"
+        spec = json.loads((runs / "py-text/spec.json").read_text())
+        assert spec["allowed"] == ["src/text.py"] and spec["target_fn"] == "truncate_words", spec
+        assert spec["test_file"] == "src/test_truncate_words.py", spec["test_file"]
+        assert spec["test_cmd"] == "cd src && python3 test_truncate_words.py", spec["test_cmd"]  # plain script: the RESULT block
+        assert spec["suite_cmd"] == "python3 -m pytest -q -p no:cacheprovider src/test_text.py", spec.get("suite_cmd")
+        assert "fix_mode" not in spec  # default stays the mini loop
+        assert main([str(py), "`truncate_words(\"a b c d\", 3)` returns one word too few.", "--runs-dir", str(runs), "--name", "py-ss", "--fix-mode", "single_shot"]) == 0
+        assert json.loads((runs / "py-ss/spec.json").read_text())["fix_mode"] == "single_shot"
+        # failures are loud, nothing written
+        assert main([str(py), "`truncate_words` is wrong.", "--runs-dir", str(runs)]) == 2  # run dir exists, no --force
+        amb = _repo(td / "wt-amb", {"a.py": "def fx():\n    pass\n", "b.py": "def fx():\n    pass\n"})
+        assert main([str(amb), "`fx` is broken somehow.", "--runs-dir", str(runs)]) == 2 and not (runs / "amb").exists()
+        two = _repo(td / "wt-two", {**NODE_FX, "package.json": json.dumps({"devDependencies": {"vitest": "1"}, "scripts": {"test": "node --test"}})})
+        assert main([str(two), para, "--runs-dir", str(runs)]) == 2 and not (runs / "two").exists()
+        assert main([str(two), para, "--runs-dir", str(runs), "--runner", "node-test", "--single"]) == 0
+        spec = json.loads((runs / "two/spec.json").read_text())
+        assert spec["target_fn"] == ["add", "mul"] and "steps" not in spec, spec
+        assert main([str(node), "nothing here names code at all", "--runs-dir", str(runs), "--name", "x"]) == 2
+        assert json.loads((runs / "py-text/spec.json").read_text())["intake"]["class"] == "local-ready"  # text-truncate-like
+        assert "class: **local-ready**" in (runs / "py-text/INTAKE.md").read_text()
+        _self_test_intake(td, runs)
+        _self_test_stubs(td)
+        _self_test_impact(td, runs)
+        _self_test_graph(td)
+        _self_test_freeze(td)
+    print("mini-spec self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

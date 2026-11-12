@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""vault-log-append [--base-note Claude/Agent-Dispatch-Log-YYYY-MM] [--part N] TEXT | -   (stdin)
+
+--base-note defaults to this month's dispatch log (local time). Appends TEXT to a dispatch-log note through the vault-shim REST (POST appends; the vault MCP is never used). If the shim answers
+413 (note full), moves to the next part (-part2, -part3, ...) and retries, never trimming. Replaces the per-job vault_logN.py scratch
+scripts. URL and token via vault_conf.py (env VAULT_URL / VAULT_TOKEN_FILE -> ~/.config/vault/env -> its defaults). The token is
+never printed. Kill switch: VAULT_LOG_APPEND=off exits 0 without writing. Prints the note path written.
+"""
+import argparse
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def note_path(base, part):
+    return base if part <= 1 else f"{base}-part{part}"
+
+
+def post(url, token, text):
+    req = urllib.request.Request(url, data=text.encode(), method="POST", headers={"Authorization": f"Bearer {token}", "Content-Type": "text/markdown"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.status
+
+
+def append(base, part, text, url, token, max_part=9):
+    while part <= max_part:
+        p = note_path(base, part) + ".md"
+        try:
+            post(f"{url}/vault/{urllib.parse.quote(p)}", token, text)
+            return p
+        except urllib.error.HTTPError as e:
+            if e.code != 413:
+                raise
+            part += 1
+    raise RuntimeError("all parts full")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base-note", default=time.strftime("Claude/Agent-Dispatch-Log-%Y-%m"))
+    ap.add_argument("--part", type=int, default=1)
+    ap.add_argument("text")
+    a = ap.parse_args(argv)
+    if os.environ.get("VAULT_LOG_APPEND") == "off":
+        print("disabled (VAULT_LOG_APPEND=off)")
+        return 0
+    text = sys.stdin.read() if a.text == "-" else a.text
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import vault_conf
+    token = vault_conf.vault_token()
+    if not token:
+        sys.exit("vault-log-append: no vault token (VAULT_TOKEN_FILE / ~/.config/vault/env)")
+    url = vault_conf.vault_url()
+    print(append(a.base_note, a.part, text if text.endswith("\n") else text + "\n", url, token))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

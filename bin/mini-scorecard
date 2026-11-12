@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+"""mini-scorecard: quality scorecard, job->commit ledger, 20% pass sampling and auto-throttle for local-LLM offload.
+
+Nothing here changes how jobs run; the one thing it steers is how many passes get the sampled review (below).
+See docs/offload-increase-plan.md section 5.
+
+Sampled pass review (the only check on false PASSes, since Opus reviews only failures): about 1 in 5 passed mini-swe FIX jobs is
+picked by a hash of the job id (test drafts and diagnoses are excluded: Claude reads every one of those before use). The queue
+event of a picked pass carries `review=~/bin/mini-scorecard review brief <id>` (queue-events-deliver.py), so the session that
+launched the job reviews it before landing, on the subscription (in that session or a Sonnet subagent of it; never the API or
+`claude -p`), and records the verdict with `review add`. `sample list` shows picked passes that still have no verdict.
+
+Needs-review passes (runner verdict `NEEDS-REVIEW (soft: <gates>)`: the hard gates held, a soft gate such as fix_hunks or
+must_not_contain did not) count as passes and are ALWAYS picked (100%, never sampled). Their verdicts are kept out of the
+sampled-pass reject rate, the per-family rates and the review-all switch (they would push the sampling of plain passes up for
+defects a gate already flagged) and are reported on their own line; `review add` stamps them `nr: true`.
+
+Auto passes (spec mode "auto": the model diagnosed the bug and wrote the test and the fix) are ALWAYS picked too; `review brief`
+prints their REVIEW-AUTO.md packet inline, and their verdicts (kind auto) have their own reject-rate line.
+
+  mini-scorecard ledger add --job ID --commit SHA [--repo PATH] [--family F] [--note TXT]
+  mini-scorecard ledger list [--n 20]
+  mini-scorecard sample list [--days 14]               passed jobs picked for review (hash(job id) < pct) and not yet reviewed
+  mini-scorecard review brief ID                       what to read for one sampled pass, the checklist, and how to record the verdict
+  mini-scorecard review add --job ID --verdict ok|reject [--kind fix|auto|test_draft|research] [--note TXT]   (family and kind from the job's record)
+  mini-scorecard report [--days 14] [--json]           the scorecard, per metric, with threshold and PASS/BREACH/n-a
+  mini-scorecard throttle [--days 14] [--write-state]  per-family sampling and proposed mode (`review add` also writes the state)
+  mini-scorecard exclude add --job ID [ID ...] --reason TXT   keep jobs that do not test the model (synthetic/infra test jobs) out of
+                                                       every count, rate and sample; `exclude remove --job ID ...` undoes it
+  mini-scorecard exclude list                          the excluded jobs and why
+  mini-scorecard caps [--days 14] [--mult 2.0]         lever 4a dry run: fail-fast cap = mult x PASS p90 per fix_steps bucket, and the GPU-h it would have saved
+
+Data (all outside any repo; override the root with OFFLOAD_HOME for tests):
+  $OFFLOAD_HOME/landed.jsonl     {ts, job, commit, repo, family, note}      one row per landed job (the job->commit ledger; no commit trailers)
+  $OFFLOAD_HOME/reviews.jsonl    {ts, job, verdict, kind, family, note, nr}  review outcomes (nr: the job was a needs-review pass)
+  $OFFLOAD_HOME/excluded.jsonl   {ts, job, op, reason}                      append-only; the latest add/remove row per job decides
+  $OFFLOAD_HOME/offload-throttle.json   per-family sample_pct and proposed mode, plus the global review-all switch; written by
+                                        `review add` and `throttle --write-state`. Only sample_pct is read (by review_pick); mode is a proposal.
+  queue logs: $OFFLOAD_QUEUE_LOGS (default ~/bin/ollama-queue-logs/*.done.json); run dirs: $OFFLOAD_RUNS (default $OFFLOAD_HOME/mini-runs)
+
+Kill switch: MINI_SCORECARD=off makes `throttle` and `sample` print "disabled" and exit 0 (ledger/review/report still work; `review add` then only appends, it does not refresh the state).
+Sampling rate: MINI_SAMPLE_PCT (default 20) is the floor. A family with a review reject (or another breach) is sampled at 100%
+until enough clean reviews bring its reject rate back to 10% or less, and while more than 10% of the last 30 sampled reviews
+are rejects (at least 20 of them) every pass that finishes after that switch turns on is reviewed (2026-11-03: the first 53
+reviews rejected 16, 30%). Both come from the state file.
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("OFFLOAD_HOME") or os.path.expanduser("~/.ollama-dispatch"))
+QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or os.path.expanduser("~/bin/ollama-queue-logs"))
+RUNS = Path(os.environ.get("OFFLOAD_RUNS") or HOME / "mini-runs")
+LEDGER, REVIEWS, STATE = HOME / "landed.jsonl", HOME / "reviews.jsonl", HOME / "offload-throttle.json"
+EXCLUDED = HOME / "excluded.jsonl"
+SENSITIVE = re.compile(r"resell|bfmr|tax|money|pnl|auth|secret|keychain|token|migrat|payment|ledger-money", re.I)
+FIXMSG = re.compile(r"\b(fix|revert|bug|hotfix|regress)", re.I)
+MODES = ["test_draft", "v2", "claude_direct"]   # most to least offload
+TH = {"escaped_defect": 0.03, "review_reject": 0.10, "draft_reject": 0.15, "fail_gpu_share": 0.35, "min_review_n": 5,
+      "global_last": 30, "global_min_n": 20}
+GLOBAL_WINDOW_KEEP_S = 30 * 86400   # closed review-all on-periods kept in the state (`sample list` looks back 14 days by default)
+
+
+def now():
+    return time.time()
+
+
+def iso(t=None):
+    return datetime.fromtimestamp(t or now(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def read_jsonl(p):
+    out = []
+    if Path(p).is_file():
+        for ln in Path(p).read_text().splitlines():
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    return out
+
+
+def append(p, row):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def exclusions():
+    """{job: latest add row} for the jobs kept out of the scorecard. The file is an append-only log: the latest add/remove row
+    per job decides, so an exclusion can be undone without losing who excluded what and why."""
+    out = {}
+    for r in read_jsonl(EXCLUDED):
+        if r.get("op", "add") == "remove":
+            out.pop(r.get("job"), None)
+        elif r.get("job"):
+            out[r.get("job")] = r
+    return out
+
+
+def kept(rows, ex=None):
+    """rows (reviews or ledger entries) whose job is not excluded"""
+    ex = exclusions() if ex is None else ex
+    return [r for r in rows if r.get("job") not in ex] if ex else rows
+
+
+def family_of(d):
+    """bundle if set, else the first two dash-separated words of the label."""
+    b = d.get("bundle")
+    if b:
+        return str(b)
+    return "-".join(str(d.get("label") or d.get("id") or "?").split("-")[:2])
+
+
+def is_nr(d):
+    """True for a needs-review pass: the runner's `RESULT PASS needs-review soft=<gates>`, which the queue records as
+    runner_verdict `NEEDS-REVIEW (soft: <gates>)` and needs_review. Its hard gates held and a soft one did not."""
+    return d.get("status") == "done" and (bool(d.get("needs_review")) or str(d.get("runner_verdict") or "").startswith("NEEDS-REVIEW"))
+
+
+def is_pass(d):
+    """A finished mini-swe pass: a plain PASS or a needs-review pass (which is always reviewed before it lands)."""
+    return d.get("status") == "done" and (d.get("runner_verdict") == "PASS" or is_nr(d))
+
+
+SOFT_HINT = {"fix_hunks": "a code hunk no test needs (dead or unrelated code, or a behaviour change no test checks), or a TypeScript "
+                          "cast the type check passes without: drop it unless it is needed",
+             "must_not_contain": "text TASK.md says must go is still in the file: reword or remove it",
+             "fn_scope": "edits outside the target function: keep them only if the fix needs them",
+             "literals": "a literal the task requires is missing", "lint": "new lint findings in the changed files"}
+
+
+def load_jobs(days):
+    """mini-swe jobs finished in the window: [{id,label,family,ok,nr,active_s,t}] (ok includes needs-review passes)"""
+    cut, out, ex = now() - days * 86400, [], exclusions()
+    for f in glob.glob(str(QLOGS / "*.done.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if "mini-swe-runner" not in str(d.get("runner") or ""):
+            continue
+        t = parse_ts(d.get("persisted_at")) or os.path.getmtime(f)
+        if t < cut:
+            continue
+        if d.get("needs_info_parked"):
+            continue    # cancelled while parked on a question: not a worker failure
+        if d.get("id") in ex:
+            continue    # excluded: a synthetic/infra test job, not a test of the model (`exclude list`)
+        ok, nr = is_pass(d), is_nr(d)
+        out.append({"asks": int(d.get("needs_info_asks") or 0), "id": d.get("id"), "label": d.get("label"), "family": family_of(d), "ok": ok, "nr": nr, "active_s": float(d.get("active_s") or 0), "t": t,
+                    "task_file": d.get("task_file"),
+                    "failed": d.get("status") == "failed" or (d.get("runner_verdict") not in (None, "PASS") and not nr)})
+    return sorted(out, key=lambda j: j["t"])
+
+
+def sample_pct(family, state=None, t=None):
+    """MINI_SAMPLE_PCT is the floor; the state can only raise it (a throttled family, or the global review-all switch).
+    t = when the pass finished, if known: the review-all switch covers passes from when it turned on, not the backlog, and
+    passes that finished inside one of its earlier on-periods (its windows)."""
+    st = state if state is not None else load_state()
+    pct = int(os.environ.get("MINI_SAMPLE_PCT", "20"))
+    fam = (st.get("families", {}).get(family) or {}).get("sample_pct")
+    g = st.get("global") or {}
+    glob_pct = g.get("sample_pct")
+    if glob_pct and t is not None and parse_ts(g.get("since")) > t:
+        glob_pct = None
+    if not glob_pct and t is not None and any(a <= t <= b for a, b in global_windows(g)):
+        glob_pct = 100
+    return max(pct, int(fam or 0), int(glob_pct or 0))
+
+
+def global_windows(g):
+    """[(start, end)] epoch seconds of the review-all switch's closed on-periods in a state's global entry; malformed ones skipped."""
+    out = []
+    for w in (g or {}).get("windows") or []:
+        if isinstance(w, (list, tuple)) and len(w) == 2:
+            a, b = parse_ts(w[0]), parse_ts(w[1])
+            if a and b >= a:
+                out.append((a, b))
+    return out
+
+
+def picked(job_id, pct):
+    return int(hashlib.sha256(str(job_id).encode()).hexdigest(), 16) % 100 < pct
+
+
+def job_record(job_id):
+    """The queue's finished-job record (<queue logs>/<id>.done.json, else archive/); {} when there is none."""
+    for p in (QLOGS / f"{job_id}.done.json", QLOGS / "archive" / f"{job_id}.done.json"):
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            return d
+    return {}
+
+
+def job_kind(d):
+    """fix | auto | test_draft | diagnose, from the job's spec. Only fix jobs are in the pass sample: Claude reads every test draft and
+    diagnosis before using it, and reviews every auto pass (the model wrote both the test and the fix). An unreadable spec counts as
+    fix (sampled rather than skipped)."""
+    try:
+        sp = json.loads(Path(os.path.expanduser(str(d.get("task_file") or ""))).read_text())
+    except (OSError, ValueError):
+        return "fix"
+    if not isinstance(sp, dict):
+        return "fix"
+    if sp.get("mode") == "diagnose":
+        return "diagnose"
+    if sp.get("mode") == "auto":
+        return "auto"
+    if sp.get("phase_a_only") or any(isinstance(x, dict) and x.get("phase_a_only") for x in (sp.get("steps") or [])):
+        return "test_draft"
+    return "fix"
+
+
+def job_verdicts(reviews, kinds=("fix",)):
+    """[(job, latest review, rejected)] for the reviews of `kinds` (None = all), one entry per job, ordered by each job's latest
+    review. rejected is True when ANY of the job's reviews rejected it: a re-review after Claude fixed the defect must not erase the
+    local model's miss (the latest record is kept for its family and note only)."""
+    out = {}
+    for r in reviews:
+        if kinds is not None and r.get("kind", "fix") not in kinds:
+            continue
+        prev = out.pop(r.get("job"), None)   # re-insert: a job reviewed again moves to the end
+        out[r.get("job")] = (r, bool(prev and prev[1]) or r.get("verdict") == "reject")
+    return [(job, r, bad) for job, (r, bad) in out.items()]
+
+
+def review_pick(d, state=None):
+    """(picked, family, pct) for a finished-job record: picked is True for a passed mini-swe fix job the hash sample selects,
+    and for every needs-review pass and every auto pass (pct 100). The queue-events deliverer calls this for every passed and needs-review event
+    (so it must stay cheap: one spec read, one state read)."""
+    if os.environ.get("MINI_SCORECARD", "on") == "off":
+        return False, None, 0
+    if "mini-swe-runner" not in str(d.get("runner") or "") or not is_pass(d):
+        return False, None, 0
+    kind = job_kind(d)
+    if kind not in ("fix", "auto"):
+        return False, None, 0
+    if EXCLUDED.is_file() and d.get("id") in exclusions():
+        return False, None, 0
+    fam = family_of(d)
+    if kind == "auto" or is_nr(d):
+        return True, fam, 100      # auto (the model wrote the test too) or a soft gate failed: always reviewed, never sampled
+    pct = sample_pct(fam, state, parse_ts(d.get("persisted_at")) or None)   # unknown finish time: the review-all switch applies
+    return picked(d.get("id"), pct), fam, pct
+
+
+BRIEF = """Review it as if you had written the change yourself, in THIS session or a Sonnet subagent of it (subscription only: never the
+API or `claude -p`). The gates passed; look for what they cannot see:
+  1. The diff does what the spec/TASK asks, completely, and nothing else (no unrelated edits, dead code or debug output).
+  2. The test checks behaviour: a wrong fix would fail it (real assertions; no text matching, no mocking of the target).
+  3. Edge cases, error handling, naming and structure fit the repo; no security, data-loss or concurrency risk.
+  4. You would land this diff unchanged.
+Record the verdict BEFORE landing:
+  ~/bin/mini-scorecard review add --job {job} --verdict ok --note "<one line>"
+  ~/bin/mini-scorecard review add --job {job} --verdict reject --note "<what is wrong; which gate should have caught it>"
+A reject is a false PASS: fix the change in place before landing it, then record the reject. The scorecard's review-reject
+rate (target <= 10%) is computed from these rows."""
+
+AUTO_BRIEF = """AUTO job: the local model diagnosed the bug, wrote the test AND the fix; the gates only prove the test was red before the fix
+and green after it (plus the repo suite). The test is the only oracle, so review it first (in THIS session or a Sonnet subagent of
+it; subscription only, never the API or `claude -p`):
+  1. Each test case asserts what the Problem asks, with the exact values (a wrong reading of the problem fails here, not in the gates).
+  2. The diff fixes the root cause, minimally, and changes nothing the Problem did not ask for (no unrelated edits, dead code, debug output).
+  3. Behaviour the Problem did not mention is unchanged; edge cases and error handling fit the repo; no security or data-loss risk.
+  4. You would land the test and the diff unchanged.
+One step records the verdict and, on ok, lands (copies the test + the fixed file into the repo the job came from; nothing is committed):
+  ~/bin/mini-auto review {job} ok --note "<one line>"
+  ~/bin/mini-auto review {job} reject --note "<what is wrong>"   (lands nothing: fix it yourself; never land it as is)"""
+
+
+def cmd_brief(a):
+    d = job_record(a.job)
+    if not d:
+        print(f"no finished-job record for {a.job} in {QLOGS} (or its archive/)")
+        return 1
+    pick, fam, pct = review_pick(d, load_state())
+    print(f"REVIEW SAMPLE {a.job}  {d.get('label')}  family {fam or family_of(d)}  "
+          f"({'picked' if pick else 'NOT picked'}{f' at {pct}%' if pct else ''}; kind {job_kind(d)}; runner verdict {d.get('runner_verdict')})")
+    if is_nr(d):
+        gates = d.get("needs_review_gates") or [g for g in re.split(r"[\s,]+", str(d.get("runner_verdict") or "").partition("soft:")[2].rstrip(")")) if g]
+        print(f"  NEEDS REVIEW: soft gate(s) failed: {', '.join(gates) or '?'}. Every such pass is reviewed; start with those gates' rows in REVIEW.md:")
+        for g in gates:
+            print(f"    {g}: {SOFT_HINT.get(g, 'see its REVIEW.md row')}")
+    print(f"  spec:   {d.get('task_file')}")
+    work = os.path.expanduser(str(d.get("cwd") or ""))
+    packet = Path(work).parent / ("REVIEW-AUTO.md" if job_kind(d) == "auto" else "REVIEW.md") if work else None   # next to the work dir
+    if packet and packet.is_file():
+        head = (packet.read_text(errors="replace").splitlines() or [""])[0]
+        print(f"  packet: {packet}  ({max(1, packet.stat().st_size // 1024)} KB)  {head[:200]}")
+    else:
+        print(f"  packet: none{f' at {packet}' if packet else ''}: read the diff in the work dir (git -C <work> diff)")
+    print(f"  work:   {work or '?'}")
+    auto_pkt = Path(work).parent / "REVIEW-AUTO.md" if work else None
+    if job_kind(d) == "auto" and auto_pkt and auto_pkt.is_file():
+        print(f"----- {auto_pkt} -----")
+        print(auto_pkt.read_text(errors="replace").rstrip())
+        print("----- end of packet -----")
+    prior = [r for r in read_jsonl(REVIEWS) if r.get("job") == a.job]
+    if prior:
+        r = prior[-1]
+        rej = [x for x in prior if x.get("verdict") == "reject"]
+        print(f"  ALREADY REVIEWED: {r.get('verdict')} at {r.get('ts')} {r.get('note') or ''}".rstrip()
+              + (f" (still counted as a reject: rejected at {rej[-1].get('ts')})" if rej and r.get("verdict") != "reject" else ""))
+    print((AUTO_BRIEF if job_kind(d) == "auto" else BRIEF).format(job=a.job))
+    return 0
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def git_escaped(entry, window_days=14):
+    """Approximate escaped defect: a later commit within window_days touching a file this commit touched, with a fix/revert-like subject.
+    Returns (escaped: bool, why)."""
+    repo, sha = entry.get("repo"), entry.get("commit")
+    if not repo or not sha or not Path(repo).is_dir():
+        return None, "no repo/commit"
+
+    def g(*a):
+        return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
+    r = g("show", "-s", "--format=%ct", sha)
+    if r.returncode:
+        return None, "commit not found"
+    t0 = int(r.stdout.strip())
+    files = [x for x in g("show", "--name-only", "--format=", sha).stdout.split("\n") if x]
+    if not files:
+        return False, "no files"
+    r = g("log", "--format=%H%x09%ct%x09%s", f"{sha}..HEAD", "--", *files)
+    for ln in r.stdout.splitlines():
+        h, ct, subj = (ln.split("\t", 2) + ["", ""])[:3]
+        if h != sha and 0 <= int(ct) - t0 <= window_days * 86400 and FIXMSG.search(subj):
+            return True, f"{h[:9]} {subj[:60]}"
+    return False, ""
+
+
+def v5_from_runs(label):
+    """(caught, total) from RUNS/<label>/VALIDATION.md, or None."""
+    p = RUNS / str(label) / "VALIDATION.md"
+    if not p.is_file():
+        return None
+    m = re.search(r"V5 hunks covered: (?:ok|FAIL) (\d+)/(\d+) ref hunks", p.read_text())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def metric(name, value, th, kind, n=None, extra=""):
+    """kind: 'max' (value must be <= th) or 'min' (>= th). value None -> n/a."""
+    if value is None:
+        status = "n/a"
+    else:
+        status = "PASS" if (value <= th if kind == "max" else value >= th) else "BREACH"
+    return {"metric": name, "value": value, "threshold": th, "kind": kind, "n": n, "status": status, "note": extra}
+
+
+def needs_info_stats(jobs, shadow_path=None):
+    """Report-only needs_info numbers: ask rate, answered-then-PASS rate, and the shadow
+    accept/reject counts (the go/no-go evidence for flipping MINI_NEEDS_INFO to on)."""
+    asked = [j for j in jobs if j.get("asks")]
+    sp = shadow_path or os.environ.get("MINI_NEEDS_INFO_SHADOW_LOG") or os.path.expanduser("~/.ollama-queue/logs/needs-info-shadow.jsonl")
+    rows = read_jsonl(sp)
+    return {"jobs": len(jobs), "asked": len(asked), "ask_rate": (len(asked) / len(jobs)) if jobs else None,
+            "asked_pass": sum(1 for j in asked if j["ok"]),
+            "answered_pass_rate": (sum(1 for j in asked if j["ok"]) / len(asked)) if asked else None,
+            "shadow_accept": sum(1 for r in rows if r.get("accepted")), "shadow_reject": sum(1 for r in rows if not r.get("accepted"))}
+
+
+def compute(days=14):
+    jobs = load_jobs(days)
+    ex = exclusions()
+    ledger = kept(read_jsonl(LEDGER), ex)
+    reviews = kept(read_jsonl(REVIEWS), ex)
+    fams = {}
+
+    def fam(f):
+        return fams.setdefault(f, {"jobs": 0, "passed": 0, "failed_gpu": 0.0, "total_gpu": 0.0, "landed": 0, "escaped": 0, "escaped_sensitive": 0,
+                                   "rev_n": 0, "rev_bad": 0, "draft_n": 0, "draft_bad": 0, "v5_caught": 0, "v5_total": 0, "escaped_why": [],
+                                   "nr": 0, "nr_rev_n": 0, "nr_rev_bad": 0, "auto_n": 0, "auto_bad": 0})
+    for j in jobs:
+        f = fam(j["family"])
+        f["jobs"] += 1
+        f["passed"] += j["ok"]
+        f["nr"] += j["nr"]
+        f["total_gpu"] += j["active_s"]
+        if not j["ok"]:
+            f["failed_gpu"] += j["active_s"]
+        if j["ok"]:
+            v = v5_from_runs(j["label"])
+            if v:
+                f["v5_caught"] += v[0]
+                f["v5_total"] += v[1]
+    fam_of_job = {j["id"]: j["family"] for j in jobs}
+    for e in ledger:
+        fname = e.get("family") or fam_of_job.get(e.get("job")) or "?"
+        f = fam(fname)
+        f["landed"] += 1
+        esc, why = git_escaped(e)
+        if esc:
+            f["escaped"] += 1
+            f["escaped_why"].append(f"{e.get('job')}: {why}")
+            if SENSITIVE.search(f"{fname} {e.get('repo', '')} {e.get('note', '')}"):
+                f["escaped_sensitive"] += 1
+    for kind, n_key, bad_key in (("fix", "rev_n", "rev_bad"), ("test_draft", "draft_n", "draft_bad"), ("auto", "auto_n", "auto_bad")):  # research feeds none
+        for job, r, bad in job_verdicts(reviews, (kind,)):
+            f = fam(fam_of_job.get(job) or r.get("family") or "?")
+            if kind == "fix" and r.get("nr"):    # always reviewed: kept out of the sampled-pass rates (module docstring)
+                f["nr_rev_n"] += 1
+                f["nr_rev_bad"] += bad
+                continue
+            f[n_key] += 1
+            f[bad_key] += bad
+    tot = {k: sum(f[k] for f in fams.values()) for k in ("jobs", "passed", "failed_gpu", "total_gpu", "landed", "escaped", "rev_n", "rev_bad", "draft_n", "draft_bad", "v5_caught", "v5_total",
+                                                          "nr", "nr_rev_n", "nr_rev_bad", "auto_n", "auto_bad")}
+    rate = lambda a, b: (a / b) if b else None
+    bin_dirty = None
+    try:
+        r = subprocess.run(["git", "-C", os.path.expanduser("~/bin"), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True)
+        bin_dirty = len([x for x in r.stdout.splitlines() if x.strip()])
+    except OSError:
+        pass
+    ms = [
+        metric("escaped defect rate (14d fix/revert on same files)", rate(tot["escaped"], tot["landed"]), TH["escaped_defect"], "max", tot["landed"], "approximate: file-level, subject match"),
+        metric("review-reject rate of sampled passes", rate(tot["rev_bad"], tot["rev_n"]), TH["review_reject"], "max", tot["rev_n"]),
+        metric("V5 kill rate on passed jobs' tests", rate(tot["v5_caught"], tot["v5_total"]), 1.0, "min", tot["v5_total"], "from VALIDATION.md; mutation score n/a until a spec enables mutation_gate"),
+        metric("local-drafted test reject rate", rate(tot["draft_bad"], tot["draft_n"]), TH["draft_reject"], "max", tot["draft_n"]),
+        metric("auto-lane review-reject rate (every pass reviewed)", rate(tot["auto_bad"], tot["auto_n"]), TH["review_reject"], "max", tot["auto_n"],
+               "the model wrote the test and the fix"),
+        metric("GPU-h on failures / total", rate(tot["failed_gpu"], tot["total_gpu"]), TH["fail_gpu_share"], "max", tot["jobs"], f"{tot['failed_gpu'] / 3600:.1f}h of {tot['total_gpu'] / 3600:.1f}h"),
+        metric("~/bin tracked files modified-uncommitted", float(bin_dirty) if bin_dirty is not None else None, 0.0, "max", None, "0 required"),
+        metric("research/review finding precision", None, 0.8, "min", None, "needs verifier notes (lever 2 not live)"),
+        metric("Claude weighted tokens per landed job", None, 0, "max", None, "needs session jsonl parse; baseline ~0.5M (EST)"),
+        metric("wasted delegation", None, 0.10, "max", None, "needs token + queue join"),
+        metric("scope-creep fails on landed jobs", None, 0, "max", None, "no runner verdict join yet"),
+    ]
+    return {"days": days, "families": fams, "totals": tot, "metrics": ms, "window_end": iso(), "needs_info": needs_info_stats(jobs)}
+
+
+def throttle(sc):
+    """Per-family proposal from the plan: 1 breach -> 100% sampling for 2 weeks; 2 breaches or any sensitive escaped defect -> drop one mode.
+    Re-promote after 10 consecutive clean jobs (clean = passed, no reject)."""
+    prev = load_state().get("families", {})
+    reviews = kept(read_jsonl(REVIEWS))
+    out = {}
+    for name, f in sc["families"].items():
+        br = []
+        if f["landed"] and f["escaped"] / f["landed"] > TH["escaped_defect"]:
+            br.append(f"escaped defects {f['escaped']}/{f['landed']}")
+        if f["rev_n"] >= TH["min_review_n"] and f["rev_bad"] / f["rev_n"] > TH["review_reject"]:
+            br.append(f"review rejects {f['rev_bad']}/{f['rev_n']}")
+        elif f["rev_bad"] and f["rev_n"] < TH["min_review_n"]:
+            br.append(f"review reject {f['rev_bad']}/{f['rev_n']} (small sample)")
+        if f["draft_n"] >= TH["min_review_n"] and f["draft_bad"] / f["draft_n"] > TH["draft_reject"]:
+            br.append(f"draft rejects {f['draft_bad']}/{f['draft_n']}")
+        quality = br
+        mode = (prev.get(name) or {}).get("mode", "v2")
+        i = MODES.index(mode) if mode in MODES else 1
+        reasons = []
+        if f["escaped_sensitive"] or len(quality) >= 2:
+            i = min(i + 1, len(MODES) - 1)
+            reasons.append("drop one mode: " + ("sensitive-area escaped defect" if f["escaped_sensitive"] else "2+ breaches"))
+            samp = 100
+        elif len(quality) == 1:
+            samp = 100
+            reasons.append("sample 100% for 2 weeks: " + quality[0])
+        else:
+            samp = int(os.environ.get("MINI_SAMPLE_PCT", "20"))
+            streak = 0
+            for _job, _r, bad in reversed(job_verdicts([r for r in reviews if r.get("family") == name], None)):
+                if bad:   # a job any review rejected breaks the streak, even after an ok re-review
+                    break
+                streak += 1
+            if (prev.get(name) or {}).get("mode") not in (None, MODES[0]) and streak >= 10:
+                i = max(i - 1, 0)
+                reasons.append("re-promote: 10 clean in a row")
+        out[name] = {"mode": MODES[i], "sample_pct": samp, "breaches": quality, "reasons": reasons, "jobs": f["jobs"]}
+    return out
+
+
+def global_sample(reviews, prev=None):
+    """{"sample_pct": 100 | None, "reason"}: review EVERY pass while more than TH review_reject of the last TH global_last
+    reviewed fix jobs (one entry per job, a reject if any of its reviews rejected it; at least TH global_min_n of them) are
+    rejects. It switches itself back off once the recent reviews are clean enough, so a better gate shows up as fewer reviews.
+    since = when it turned on (kept from prev, the previous state's global entry, while it stays on).
+    windows = its closed on-periods [since, until] from the last 30 days. A pass that finished inside one stays picked when the
+    switch turns off, or dips and comes back on with a new since, so `sample list` keeps listing it until it is reviewed."""
+    prev = prev or {}
+    recent = job_verdicts([r for r in reviews if not r.get("nr")], ("fix",))[-TH["global_last"]:]   # needs-review verdicts: not sampled
+    bad = sum(1 for _job, _r, rejected in recent if rejected)
+    on = len(recent) >= TH["global_min_n"] and bad / len(recent) > TH["review_reject"]
+    cutoff = now() - GLOBAL_WINDOW_KEEP_S
+    windows = [list(w) for w in prev.get("windows") or []
+               if isinstance(w, (list, tuple)) and len(w) == 2 and parse_ts(w[1]) >= cutoff]
+    if prev.get("sample_pct") and parse_ts(prev.get("since")) and not on:
+        windows.append([prev["since"], iso()])
+    if on:
+        since = prev.get("since") if prev.get("sample_pct") else None
+        return {"sample_pct": 100, "since": since or iso(), "windows": windows, "reason": f"review rejects {bad}/{len(recent)} of the latest reviews > {TH['review_reject']:.0%}: every pass is reviewed"}
+    return {"sample_pct": None, "windows": windows, "reason": f"review rejects {bad}/{len(recent)} of the latest reviews" + ("" if len(recent) >= TH["global_min_n"] else " (too few to judge)")}
+
+
+def write_state(days=14):
+    """Recompute the throttle and write the state review_pick reads. Returns the state."""
+    st = {"written": iso(), "families": throttle(compute(days)), "global": global_sample(kept(read_jsonl(REVIEWS)), load_state().get("global"))}
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_name(STATE.name + ".tmp")
+    tmp.write_text(json.dumps(st, indent=1))
+    os.replace(tmp, STATE)   # the queue-events deliverer reads it on every passed event: never a half-written file
+    return st
+
+
+def fmt_pct(v):
+    return "n/a" if v is None else f"{v * 100:.1f}%"
+
+
+def cmd_report(a):
+    sc = compute(a.days)
+    if a.json:
+        print(json.dumps(sc, indent=1, default=str))
+        return 0
+    print(f"mini-scorecard  window={a.days}d  at {sc['window_end']}  mini-swe jobs={sc['totals']['jobs']} passed={sc['totals']['passed']} landed(ledger)={sc['totals']['landed']}")
+    print(f"{'metric':58} {'value':>8} {'limit':>8}  status")
+    for m in sc["metrics"]:
+        count = m["metric"].startswith("~/bin")
+        lim = ("<=" if m["kind"] == "max" else ">=") + (f"{m['threshold']:.0f}" if count else fmt_pct(m["threshold"]))
+        v = "n/a" if m["value"] is None else (f"{m['value']:.0f}" if count else fmt_pct(m["value"]))
+        if m["value"] is None and m["metric"].startswith(("Claude", "wasted", "scope")):
+            lim = "-"
+        print(f"{m['metric'][:58]:58} {v:>8} {lim:>8}  {m['status']}  {('n=' + str(m['n'])) if m['n'] is not None else ''} {m['note']}")
+    ni = sc.get("needs_info") or {}
+    print(f"\nneeds_info (report-only): asked {ni.get('asked', 0)}/{ni.get('jobs', 0)} jobs (ask rate {fmt_pct(ni.get('ask_rate'))}); answered-then-PASS {fmt_pct(ni.get('answered_pass_rate'))}; shadow accept/reject {ni.get('shadow_accept', 0)}/{ni.get('shadow_reject', 0)}")
+    t = sc["totals"]
+    print(f"needs-review passes (soft gate failed; all reviewed, not in the sampled-pass rate): {t['nr']} of {t['passed']} passes; "
+          f"reviewed {t['nr_rev_n']}, rejected {t['nr_rev_bad']}")
+    print("\nfamilies (jobs / passed / landed / escaped / review rejects):")
+    for k, f in sorted(sc["families"].items(), key=lambda kv: -kv[1]["jobs"])[:15]:
+        print(f"  {k[:40]:40} {f['jobs']:4} {f['passed']:4} {f['landed']:4} {f['escaped']:3}  {f['rev_bad']}/{f['rev_n']}")
+    return 0
+
+
+def cmd_throttle(a):
+    if os.environ.get("MINI_SCORECARD", "on") == "off":
+        print("disabled (MINI_SCORECARD=off)")
+        return 0
+    th = throttle(compute(a.days))
+    gl = global_sample(kept(read_jsonl(REVIEWS)))
+    print("auto-throttle (review sampling reads sample_pct from the state file; mode is a proposal nothing reads):")
+    print(f"  global: {'every pass reviewed' if gl['sample_pct'] else 'per-family rates'} ({gl['reason']})")
+    for k, v in sorted(th.items(), key=lambda kv: -kv[1]["jobs"])[:20]:
+        print(f"  {k[:40]:40} mode={v['mode']:13} sample={v['sample_pct']:3}%  {'; '.join(v['reasons']) or 'no change'}")
+    if a.write_state:
+        write_state(a.days)
+        print(f"state written: {STATE}")
+    return 0
+
+
+def pctile(xs, q):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else None
+
+
+def cmd_caps(a):
+    """Dry run only: nothing enforces a cap. Bucket = the spec's fix_steps rounded to 20 (size proxy); cap = mult x PASS p90 in the bucket."""
+    rows, ex = [], exclusions()
+    for f in glob.glob(str(QLOGS / "*.done.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue    # an unreadable record is skipped (it used to reuse the previous record, or raise on the first)
+        if not isinstance(d, dict) or "mini-swe-runner" not in str(d.get("runner") or "") or d.get("id") in ex \
+                or (parse_ts(d.get("persisted_at")) or 0) < now() - a.days * 86400:
+            continue
+        try:
+            fs = int(json.load(open(d["task_file"])).get("fix_steps") or 0) if d.get("task_file") else 0
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            fs = 0
+        rows.append((((fs + 19) // 20) * 20, is_pass(d), float(d.get("active_s") or 0)))
+    tot_saved = tot_fail = 0.0
+    table = {}
+    print(f"fail-fast cap dry run ({a.days}d, cap = {a.mult} x PASS p90 per fix_steps bucket; NOT enforced anywhere)")
+    for b in sorted({r[0] for r in rows}):
+        ok = [t for bb, o, t in rows if bb == b and o]
+        bad = [t for bb, o, t in rows if bb == b and not o]
+        if len(ok) < 5:
+            print(f"  fix_steps<={b:3}: {len(ok)} passes, {len(bad)} fails: too few passes for a cap")
+            tot_fail += sum(bad)
+            continue
+        cap = a.mult * pctile(ok, 0.9)
+        table[str(b)] = {"cap_s": round(cap), "pass_p90_s": round(pctile(ok, 0.9)), "n_pass": len(ok)}
+        saved = sum(t - cap for t in bad if t > cap)
+        tot_saved += saved
+        tot_fail += sum(bad)
+        wrongly = sum(1 for t in ok if t > cap)
+        print(f"  fix_steps<={b:3}: pass p90={pctile(ok, 0.9):6.0f}s cap={cap:6.0f}s  fails={len(bad)} saved={saved / 3600:5.2f}h  passes over cap (would be killed)={wrongly}/{len(ok)}")
+    print(f"total fail GPU-h {tot_fail / 3600:.1f}h, a cap would have saved {tot_saved / 3600:.1f}h")
+    if a.write:
+        out = Path(os.environ.get("MINI_FAILFAST_CAPS_FILE") or HOME / "failfast-caps.json")
+        out.write_text(json.dumps({"written": iso(), "mult": a.mult, "buckets": table}, indent=1))
+        print(f"caps table written: {out} (the runner reads it only when MINI_FAILFAST_CAP=1)")
+    return 0
+
+
+def cmd_sample(a):
+    if os.environ.get("MINI_SCORECARD", "on") == "off":
+        print("disabled (MINI_SCORECARD=off)")
+        return 0
+    st, done = load_state(), {r.get("job") for r in read_jsonl(REVIEWS)}
+    rows = [j for j in load_jobs(a.days)
+            if j["ok"] and j["id"] not in done and (j["nr"] or job_kind(j) == "auto" or picked(j["id"], sample_pct(j["family"], st, j["t"])))
+            and job_kind(j) in ("fix", "auto")]
+    for j in rows:
+        print(f"{j['id']}  {j['family']:30} {j['label']}{'  [needs-review]' if j['nr'] else ''}{'  [auto]' if job_kind(j) == 'auto' else ''}")
+    glob_pct = (st.get("global") or {}).get("sample_pct")
+    n_win = len(global_windows(st.get("global")))
+    n_nr = sum(1 for j in rows if j["nr"])
+    print(f"# {len(rows)} passed job(s) selected for review and not reviewed yet{f' ({n_nr} needs-review, always reviewed)' if n_nr else ''} ("
+          + (f"global review-all switch on since {st['global'].get('since', '?')}: {st['global'].get('reason', '')}" if glob_pct else f"pct {os.environ.get('MINI_SAMPLE_PCT', '20')} default") + ")"
+          + (f"; passes from {n_win} earlier review-all period(s) included" if n_win else "")
+          + ("; review one: ~/bin/mini-scorecard review brief <id>" if rows else ""))
+    return 0
+
+
+def cmd_exclude(a):
+    if a.sub == "list":
+        ex = exclusions()
+        for job, r in ex.items():
+            print(f"{job}  {r.get('ts', '?')}  {r.get('reason', '')}")
+        print(f"# {len(ex)} job(s) excluded from the scorecard")
+        return 0
+    if a.sub == "add" and not a.reason.strip():
+        print("exclude: --reason must say why these jobs do not test the model", file=sys.stderr)
+        return 2
+    ex, ts = exclusions(), iso()
+    for job in a.job:
+        if (job in ex) == (a.sub == "add"):
+            print(f"exclude: {job} already {'excluded' if a.sub == 'add' else 'counted'}")
+            continue
+        append(EXCLUDED, {"ts": ts, "job": job, "op": a.sub, "reason": a.reason})
+        ex = exclusions()   # a job named twice in one command is written once
+        print(f"exclude: {job} {'excluded' if a.sub == 'add' else 'counted again'}")
+    if os.environ.get("MINI_SCORECARD", "on") != "off":
+        try:   # the rates and the review-all switch change at once
+            write_state()
+        except Exception as e:
+            print(f"exclude: sampling state not refreshed ({e})", file=sys.stderr)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    lg = sub.add_parser("ledger").add_subparsers(dest="sub", required=True)
+    la = lg.add_parser("add")
+    for x in ("--job", "--commit"):
+        la.add_argument(x, required=True)
+    for x in ("--repo", "--family", "--note"):
+        la.add_argument(x, default="")
+    ll = lg.add_parser("list")
+    ll.add_argument("--n", type=int, default=20)
+    sp = sub.add_parser("sample").add_subparsers(dest="sub", required=True)
+    sl = sp.add_parser("list")
+    sl.add_argument("--days", type=int, default=14)
+    rv = sub.add_parser("review").add_subparsers(dest="sub", required=True)
+    ra = rv.add_parser("add")
+    ra.add_argument("--job", required=True)
+    ra.add_argument("--verdict", required=True, choices=["ok", "reject"])
+    ra.add_argument("--kind", default=None, choices=["fix", "auto", "test_draft", "research"], help="default: from the job's spec (fix if unknown)")
+    ra.add_argument("--family", default="")
+    ra.add_argument("--note", default="")
+    rb = rv.add_parser("brief")
+    rb.add_argument("job")
+    rp = sub.add_parser("report")
+    rp.add_argument("--days", type=int, default=14)
+    rp.add_argument("--json", action="store_true")
+    cp = sub.add_parser("caps")
+    cp.add_argument("--days", type=int, default=14)
+    cp.add_argument("--mult", type=float, default=2.0)
+    cp.add_argument("--write", action="store_true", help="write the caps table the runner reads under MINI_FAILFAST_CAP=1")
+    ex = sub.add_parser("exclude").add_subparsers(dest="sub", required=True)
+    for name in ("add", "remove"):
+        x = ex.add_parser(name)
+        x.add_argument("--job", required=True, nargs="+")
+        x.add_argument("--reason", required=(name == "add"), default="")
+    ex.add_parser("list")
+    th = sub.add_parser("throttle")
+    th.add_argument("--days", type=int, default=14)
+    th.add_argument("--write-state", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd == "ledger" and a.sub == "add":
+        append(LEDGER, {"ts": iso(), "job": a.job, "commit": a.commit, "repo": os.path.expanduser(a.repo), "family": a.family, "note": a.note})
+        print(f"ledger: {a.job} -> {a.commit[:12]}")
+        return 0
+    if a.cmd == "ledger":
+        for r in read_jsonl(LEDGER)[-a.n:]:
+            print(f"{r['ts']} {r['job']} {r['commit'][:12]} {r.get('family', '')} {r.get('repo', '')}")
+        return 0
+    if a.cmd == "review" and a.sub == "brief":
+        return cmd_brief(a)
+    if a.cmd == "exclude":
+        return cmd_exclude(a)
+    if a.cmd == "review":
+        rec = job_record(a.job)
+        fam = a.family or (family_of(rec) if rec else "")   # the throttle's re-promote streak and the per-family rates need it
+        kind = a.kind or (job_kind(rec) if rec else "fix")
+        kind = kind if kind in ("fix", "auto", "test_draft", "research") else "fix"
+        row = {"ts": iso(), "job": a.job, "verdict": a.verdict, "kind": kind, "family": fam, "note": a.note}
+        if rec and is_nr(rec) and kind == "fix":
+            row["nr"] = True    # a needs-review pass: kept out of the sampled-pass rates and the review-all switch
+        append(REVIEWS, row)
+        print(f"review: {a.job} {a.verdict}{f' (family {fam})' if fam else ''}")
+        if a.job in exclusions():
+            print(f"review: {a.job} is excluded from the scorecard (`exclude list`); this verdict counts only after `exclude remove`")
+        if os.environ.get("MINI_SCORECARD", "on") != "off":
+            try:   # a verdict changes the sampling at once (a reject puts its family, maybe every pass, under review)
+                st = write_state()
+                if a.verdict == "reject" or st["global"]["sample_pct"]:
+                    print(f"sampling: family {fam or '?'} at {sample_pct(fam, st)}%; global: {st['global']['reason']}")
+            except Exception as e:   # the verdict is recorded either way
+                print(f"review: sampling state not refreshed ({e})", file=sys.stderr)
+        return 0
+    return {"report": cmd_report, "throttle": cmd_throttle, "sample": cmd_sample, "caps": cmd_caps}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,23 @@
+# The real config. Only config.example.toml is committed — the real one names
+# hosts, endpoints and local paths and must never reach git.
+config.toml
+config.*.toml
+!config.example.toml
+
+# Everything a round produces.
+runs/
+logs/
+transcripts/
+results/local/
+results/**/*.diff
+*.log
+
+# Transcripts contain verbatim source from whatever repository the task ran
+# against. Never commit them.
+*.transcript.json
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

@@ -1,0 +1,4 @@
+v12 Strata head-to-head, qwen3.6 Darkbloom arm, cell debug. Plan: ../STRATA-H2H-PLAN.md
+DRIVER=/Users/user/Desktop/GitHub Projects/bakeoff/bakeoff-v12-strata-h2h.sh
+ROSTER_ONLY=qwen:debug
+MAX_S=14400

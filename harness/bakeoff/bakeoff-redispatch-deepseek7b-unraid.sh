@@ -1,0 +1,123 @@
+#!/bin/bash
+# Re-dispatch of deepseek-r1:7b on UNRAID, both tasks, at 32768 context.
+#
+# Why: the original unraid-7b driver used --num-ctx 131072 for deepseek-r1:*
+# because the model *supports* 128K. It does -- but it does not FIT Unraid's
+# 3080 at that size. Measured live from /api/ps during the run:
+#
+#   deepseek-r1:7b  size=20.6GB  size_vram=11.0GB  context_length=131072
+#
+# A 7.6B Q4_K_M model is ~4.7GB of weights; the rest is KV cache, and ~9.6GB
+# of the total was spilled to CPU. The photo-upload task consequently burned
+# the full 1800s timeout with files=0 -- a hardware-fit failure recorded as a
+# model failure. Same pattern already documented for deepseek-r1:14b and
+# qwen2.5-coder:14b on this GPU: KV cache, not weights, is the binding
+# constraint.
+#
+# 32768 is the realistic setting for this GPU (~121KB/token measured here ->
+# ~4GB KV, ~8.7GB total, resident), and matches what qwen2.5-coder:7b already
+# uses on Unraid.
+#
+# Deliberate asymmetry: the Mac Studio run of this same model stays at
+# 131072. The owner's call -- the per-backend context ceiling is itself the data
+# point we want for writing backend routing rules, not something to
+# normalize away. Record the context alongside every result.
+#
+# Waits for the qwen7b photo-upload re-dispatch to finish so only one job
+# touches the 3080 at a time.
+set -uo pipefail
+
+BASE="/Users/user/Desktop/GitHub Projects"
+WT_BASE="$BASE/bakeoff-build-2026-08-22"
+OUTDIR="$BASE/model-buildoff-2026-08-22"
+HOST="http://192.0.2.82:11434"
+WORKER="/Users/user/bin/ollama-worker.py"
+MODEL="deepseek-r1:7b"
+SLUG="deepseek-r1-7b-unraid"
+NUMCTX=32768
+TIMEOUT_S=1800
+
+DRIVER_LOG="$OUTDIR/driver.log"
+RESULTS_CSV="$OUTDIR/results.csv"
+
+NUDGE="
+
+Your first response must contain a tool call, not just text -- start immediately by exploring the file system."
+
+TASK1_RESELL="Build a photo-upload feature for this resell-tracker web app, usable from mobile iOS devices (mobile-friendly UI, works well opened in Safari on an iPhone), that lets a user upload one or more images and match them to a specific order. This is mainly for gift card orders and coin orders/purchases -- the uploaded photos serve as a proof/record for those order types. Implement this as a real, working feature: a UI for uploading (ideally supporting camera/photo-library access on iOS), a way to associate the upload with a specific order, real storage of the uploaded images, and any necessary backend/API routes. Explore the existing codebase structure first (framework, styling conventions, API routes, database schema) and follow its existing patterns rather than inventing a new style.
+
+When you are done, respond with a short written summary (no further tool calls) describing exactly what you built, which files you created/changed, and any part of the feature you were not able to complete or verify."
+
+TASK2_CLAMSHELL="Build a new Swift module for this Clamshell project called ConfirmationBridge that implements challenge-signed remote confirmation using P-256 (ECDSA). Purpose: let a privileged action on the host require an explicit signed approval from a human physically at the client, not just anyone who can reach the host. This should be a standalone module, not yet wired into the real streaming protocol.
+
+Requirements:
+1. A device can produce a signed response to a challenge using a P-256 key.
+2. A correctly-signed response for a given challenge verifies successfully.
+3. A replayed signature/nonce (reusing a previous valid response) must be rejected.
+4. An expired challenge/nonce must be rejected -- the challenge has a limited validity window.
+
+Write a real, synchronous self-test that exercises all three properties end to end: a valid signature verifies, a replay is rejected, and a genuinely expired nonce is rejected (actually wait for the real expiry window to elapse -- do not simulate or fake the clock). Wire the self-test up so it is runnable (e.g. as a CLI subcommand or test target), consistent with how this project already organizes its code. Explore the existing codebase first (check main.swift and whether a Sources/Clamshell/Auth directory already exists) before writing new code."
+
+echo "[ds7b-unraid-rerun] waiting for qwen7b re-dispatch to finish @ $(date '+%H:%M:%S')" >> "$DRIVER_LOG"
+while ! grep -aq "QWEN7B PHOTO-UPLOAD RE-DISPATCH COMPLETE" "$DRIVER_LOG"; do
+  sleep 30
+done
+
+run_task() {
+  local TASK_NAME="$1" TASK_TEXT="$2" REPO="$3" VERIFY="$4"
+  local WT_DIR="$WT_BASE/$REPO/$SLUG"
+  local LOG="$OUTDIR/$SLUG-$TASK_NAME-UNRAID7B-CTX32K.log"
+
+  if [ ! -d "$WT_DIR" ]; then
+    echo "[ds7b-unraid-rerun] SKIP (worktree missing): $TASK_NAME -- $WT_DIR" >> "$DRIVER_LOG"
+    return
+  fi
+  if [ "$REPO" = "resell-tracker" ] && [ ! -x "$WT_DIR/node_modules/.bin/next" ]; then
+    echo "[ds7b-unraid-rerun] ABORT: node_modules/.bin/next missing in $WT_DIR" >> "$DRIVER_LOG"
+    return
+  fi
+
+  git -C "$WT_DIR" reset --hard >/dev/null 2>&1
+  git -C "$WT_DIR" clean -fd >/dev/null 2>&1
+
+  local START_TS; START_TS=$(date +%s)
+  echo "[ds7b-unraid-rerun] START: $MODEL / $TASK_NAME ctx=$NUMCTX @ $(date '+%Y-%m-%d %H:%M:%S')" >> "$DRIVER_LOG"
+
+  python3 "$WORKER" \
+    --model "$MODEL" \
+    --host "$HOST" \
+    --cwd "$WT_DIR" \
+    --task "${TASK_TEXT}${NUDGE}" \
+    --verify "$VERIFY" \
+    --max-iters 30 \
+    --num-ctx "$NUMCTX" \
+    --temperature 0.6 --top-p 0.95 \
+    --manual-tools \
+    > "$LOG" 2>&1 &
+  local WORKER_PID=$!
+
+  ( sleep "$TIMEOUT_S" && kill -TERM "$WORKER_PID" 2>/dev/null ) &
+  local WATCHER_PID=$!
+
+  wait "$WORKER_PID" 2>/dev/null
+  local EXIT=$?
+  kill "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID" 2>/dev/null
+
+  local END_TS DUR TIMED_OUT FILES
+  END_TS=$(date +%s); DUR=$((END_TS - START_TS))
+  TIMED_OUT="false"; [ "$DUR" -ge "$TIMEOUT_S" ] && TIMED_OUT="true"
+  FILES=$(git -C "$WT_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+  # Record the VRAM split so the backend-routing rule has real evidence.
+  local PS_SNAP
+  PS_SNAP=$(curl -s --max-time 10 "$HOST/api/ps" 2>/dev/null | tr -d '\n' | head -c 600)
+  echo "[ds7b-unraid-rerun] ps-after $TASK_NAME: $PS_SNAP" >> "$DRIVER_LOG"
+
+  echo "[ds7b-unraid-rerun] DONE: $MODEL / $TASK_NAME exit=$EXIT dur=${DUR}s timedout=$TIMED_OUT files=$FILES" >> "$DRIVER_LOG"
+  echo "$MODEL-CTX32K,$TASK_NAME,$EXIT,$DUR,$TIMED_OUT,$FILES" >> "$RESULTS_CSV"
+}
+
+run_task "resell-tracker-photo-upload" "$TASK1_RESELL" "resell-tracker" "npm run build"
+run_task "clamshell-confirmation-bridge" "$TASK2_CLAMSHELL" "clamshell" "swift build"
+
+echo "=== DEEPSEEK-R1:7B UNRAID CTX32K RE-DISPATCH COMPLETE @ $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$DRIVER_LOG"

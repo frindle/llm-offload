@@ -1,0 +1,10 @@
+{
+ "args": [
+  "--fn",
+  "dispatch",
+  "--reach-anchor",
+  "const best = job.queues[0]"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

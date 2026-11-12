@@ -1,0 +1,48 @@
+# Runs the PUBLISHED image (ghcr.io/frindle/llm-offload-cpu-runner) with a fixed LAN identity on Unraid's br0 macvlan.
+# Deploy dir on Unraid: /mnt/user/appdata/dispatch-cpu-runner/  (this file, .env with API URL + enrollment code, cache/, state/)
+# Normally you install via the Unraid Docker UI template instead (unraid/dispatch-cpu-runner.xml); this is the equivalent.
+# Dev (build locally, hot-reload the agent from ./agent, plain bridge network): see docker-compose.dev.yml.
+services:
+  cpu-runner:
+    image: ghcr.io/frindle/llm-offload-cpu-runner:latest
+    pull_policy: always
+    container_name: dispatch-cpu-runner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CPU_RUNNER_ID: unraid-cpu-1
+      # Disk limits (lane-job cap, free-space floor, cache caps; README "Disk use"): defaults are fine; the queue can set
+      # them (`cpu_lane.py config lane_max=1`) or put them in .env (see env.example), where they win over the queue's.
+      # A second, lane-only runner (it takes lane jobs only, the main runner keeps the plain ones): give it its own
+      # CPU_RUNNER_ID and CPU_RUNNER_ACCEPT: lane here. Env only; the queue must know accept "lane".
+    volumes:
+      # npm + node_modules + uv caches. Capped at about 20 GB worst case, rebuilt on demand: keep ./cache out of backups.
+      - ./cache:/cache
+      - ./state:/state            # the enrolled token lives here (0600); keep it private
+      # scratch checkouts: Docker storage (on Unraid that is docker.img; when it fills, every container suffers). Each job's
+      # dir is removed when the job ends and the volume is wiped at startup, so it only holds the jobs running now.
+      - cpu-runner-work:/work
+    networks:
+      lan:
+        ipv4_address: ${CPU_RUNNER_IP:?set CPU_RUNNER_IP in .env (a free LAN address)}
+    mac_address: ${CPU_RUNNER_MAC:?set CPU_RUNNER_MAC in .env (a locally administered MAC)}
+    # ---- explicit resource limits (shared by all CPU_RUNNER_CONCURRENCY jobs) ----
+    cpus: ${CPU_RUNNER_CPUS:-16}
+    mem_limit: ${CPU_RUNNER_MEM:-40g}
+    memswap_limit: ${CPU_RUNNER_MEM:-40g}
+    pids_limit: 4096
+    # ---- privileges: only what the empty-netns + privilege-drop wrapper needs ----
+    cap_drop: [ALL]
+    cap_add: [SYS_ADMIN, NET_ADMIN, SETUID, SETGID, SETPCAP, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
+    # If the startup selftest cannot create a network namespace add:  security_opt: ["seccomp=unconfined"]
+    stop_grace_period: 45s
+    init: true
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+networks:
+  lan:
+    external: true
+    name: br0
+volumes:
+  cpu-runner-work:

@@ -1,0 +1,245 @@
+{
+  "source": "/Users/user/Desktop/GitHub Projects/model-buildoff-2026-08-22/results-v7.csv",
+  "source_rows": 30,
+  "dataset_text": "model,backend,task,rep,exit_code,verify_passed,duration_s,timed_out,files_changed,iterations,ctx,stop_reason,transcript\nqwen3.8:27b-q8_0,macstudio,resell-tracker-photo-upload,1,2,yes,1737,false,5,31,65536,none,/Users/user/bin/ollama-worker-logs/20260823T083948Z.json\nqwen3.8:27b-q8_0,macstudio,clamshell-confirmation-bridge,1,1,no,1303,false,2,31,65536,none,/Users/user/bin/ollama-worker-logs/20260823T090922Z.json\nqwen3-14b-agentic,macstudio,resell-tracker-photo-upload,1,1,no,394,false,1,8,32768,none,/Users/user/bin/ollama-worker-logs/20260823T092949Z.json\nqwen3-14b-agentic,macstudio,clamshell-confirmation-bridge,1,1,no,1063,false,1,23,32768,none,/Users/user/bin/ollama-worker-logs/20260823T093621Z.json\ndeepseek-r1:32b,macstudio,resell-tracker-photo-upload,1,0,yes,625,false,0,7,131072,none,/Users/user/bin/ollama-worker-logs/20260823T095420Z.json\ndeepseek-r1:32b,macstudio,clamshell-confirmation-bridge,1,1,no,857,false,3,15,131072,none,/Users/user/bin/ollama-worker-logs/20260823T100449Z.json\nqwen2.5-coder:14b,macstudio,resell-tracker-photo-upload,1,1,no,108,false,1,16,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T101922Z.json\nqwen2.5-coder:14b,macstudio,clamshell-confirmation-bridge,1,1,no,218,false,4,31,32768,none,/Users/user/bin/ollama-worker-logs/20260823T102057Z.json\nqwen3-coder-next:q4_K_M,macstudio,resell-tracker-photo-upload,1,2,yes,170,false,0,9,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T102549Z.json\nqwen3-coder-next:q4_K_M,macstudio,clamshell-confirmation-bridge,1,1,no,2402,false,4,31,32768,none,/Users/user/bin/ollama-worker-logs/20260823T103229Z.json\nqwen3.8:27b-q8_0,macstudio,resell-tracker-photo-upload,2,143,no,1800,true,1,20,65536,none,/Users/user/bin/ollama-worker-logs/20260823T110925Z.json\nqwen3.8:27b-q8_0,macstudio,clamshell-confirmation-bridge,2,0,yes,1271,false,3,24,65536,none,/Users/user/bin/ollama-worker-logs/20260823T114038Z.json\nqwen3-14b-agentic,macstudio,resell-tracker-photo-upload,2,1,no,256,false,1,7,32768,none,/Users/user/bin/ollama-worker-logs/20260823T115942Z.json\nqwen3-14b-agentic,macstudio,clamshell-confirmation-bridge,2,1,no,381,false,2,9,32768,none,/Users/user/bin/ollama-worker-logs/20260823T120353Z.json\ndeepseek-r1:32b,macstudio,resell-tracker-photo-upload,2,2,yes,893,false,0,31,131072,none,/Users/user/bin/ollama-worker-logs/20260823T121036Z.json\ndeepseek-r1:32b,macstudio,clamshell-confirmation-bridge,2,1,no,1437,false,1,14,131072,none,/Users/user/bin/ollama-worker-logs/20260823T122518Z.json\nqwen2.5-coder:14b,macstudio,resell-tracker-photo-upload,2,2,yes,186,false,1,16,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T124936Z.json\nqwen2.5-coder:14b,macstudio,clamshell-confirmation-bridge,2,1,no,131,false,3,31,32768,none,/Users/user/bin/ollama-worker-logs/20260823T125230Z.json\nqwen3-coder-next:q4_K_M,macstudio,resell-tracker-photo-upload,2,2,yes,204,false,0,15,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T125547Z.json\nqwen3-coder-next:q4_K_M,macstudio,clamshell-confirmation-bridge,2,2,yes,1475,false,0,31,32768,none,/Users/user/bin/ollama-worker-logs/20260823T130510Z.json\nqwen3.8:27b-q8_0,macstudio,resell-tracker-photo-upload,3,143,no,1800,true,1,23,65536,none,/Users/user/bin/ollama-worker-logs/20260823T132433Z.json\nqwen3.8:27b-q8_0,macstudio,clamshell-confirmation-bridge,3,143,no,1800,true,3,21,65536,none,/Users/user/bin/ollama-worker-logs/20260823T135555Z.json\nqwen3-14b-agentic,macstudio,resell-tracker-photo-upload,3,1,no,1652,false,1,11,32768,none,/Users/user/bin/ollama-worker-logs/20260823T142333Z.json\nqwen3-14b-agentic,macstudio,clamshell-confirmation-bridge,3,1,no,189,false,2,8,32768,none,/Users/user/bin/ollama-worker-logs/20260823T145055Z.json\ndeepseek-r1:32b,macstudio,resell-tracker-photo-upload,3,1,no,1764,false,1,16,131072,none,/Users/user/bin/ollama-worker-logs/20260823T145428Z.json\ndeepseek-r1:32b,macstudio,clamshell-confirmation-bridge,3,1,no,918,false,2,14,131072,none,/Users/user/bin/ollama-worker-logs/20260823T152426Z.json\nqwen2.5-coder:14b,macstudio,resell-tracker-photo-upload,3,1,no,197,false,3,25,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T153946Z.json\nqwen2.5-coder:14b,macstudio,clamshell-confirmation-bridge,3,2,yes,212,false,0,17,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T154318Z.json\nqwen3-coder-next:q4_K_M,macstudio,resell-tracker-photo-upload,3,2,yes,925,false,0,8,32768,context_ceiling,/Users/user/bin/ollama-worker-logs/20260823T154814Z.json\nqwen3-coder-next:q4_K_M,macstudio,clamshell-confirmation-bridge,3,1,no,2710,false,0,0,32768,none,none\n",
+  "tasks": [
+    {
+      "id": "extract_1",
+      "class": "extract",
+      "question": "In the dataset, for model 'qwen3.8:27b-q8_0' on task 'resell-tracker-photo-upload' at rep 1, what is the value of duration_s?",
+      "answer": 1737.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "extract_2",
+      "class": "extract",
+      "question": "In the dataset, for model 'qwen3.8:27b-q8_0' on task 'clamshell-confirmation-bridge' at rep 1, what is the value of duration_s?",
+      "answer": 1303.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "extract_3",
+      "class": "extract",
+      "question": "In the dataset, for model 'qwen3-14b-agentic' on task 'resell-tracker-photo-upload' at rep 1, what is the value of duration_s?",
+      "answer": 394.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "extract_4",
+      "class": "extract",
+      "question": "In the dataset, for model 'qwen3-14b-agentic' on task 'clamshell-confirmation-bridge' at rep 1, what is the value of duration_s?",
+      "answer": 1063.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "extract_5",
+      "class": "extract",
+      "question": "In the dataset, for model 'deepseek-r1:32b' on task 'resell-tracker-photo-upload' at rep 1, what is the value of duration_s?",
+      "answer": 625.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "extract_6",
+      "class": "extract",
+      "question": "In the dataset, for model 'deepseek-r1:32b' on task 'clamshell-confirmation-bridge' at rep 1, what is the value of duration_s?",
+      "answer": 857.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "compute_mean_1",
+      "class": "compute",
+      "question": "Across every row for model 'deepseek-r1:32b', what is the MEAN of duration_s? Round to one decimal place.",
+      "answer": 1082.3,
+      "tolerance": 0.15,
+      "unit": "seconds"
+    },
+    {
+      "id": "compute_mean_2",
+      "class": "compute",
+      "question": "Across every row for model 'qwen2.5-coder:14b', what is the MEAN of duration_s? Round to one decimal place.",
+      "answer": 175.3,
+      "tolerance": 0.15,
+      "unit": "seconds"
+    },
+    {
+      "id": "compute_mean_3",
+      "class": "compute",
+      "question": "Across every row for model 'qwen3-14b-agentic', what is the MEAN of duration_s? Round to one decimal place.",
+      "answer": 655.8,
+      "tolerance": 0.15,
+      "unit": "seconds"
+    },
+    {
+      "id": "compute_mean_4",
+      "class": "compute",
+      "question": "Across every row for model 'qwen3-coder-next:q4_K_M', what is the MEAN of duration_s? Round to one decimal place.",
+      "answer": 1314.3,
+      "tolerance": 0.15,
+      "unit": "seconds"
+    },
+    {
+      "id": "compute_mean_5",
+      "class": "compute",
+      "question": "Across every row for model 'qwen3.8:27b-q8_0', what is the MEAN of duration_s? Round to one decimal place.",
+      "answer": 1618.5,
+      "tolerance": 0.15,
+      "unit": "seconds"
+    },
+    {
+      "id": "compute_total_iters",
+      "class": "compute",
+      "question": "Summing the iterations column across ALL rows in the dataset, what is the total?",
+      "answer": 543.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "compute_ceiling_count",
+      "class": "compute",
+      "question": "How many rows have stop_reason equal to 'context_ceiling'?",
+      "answer": 7.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "compute_zero_files",
+      "class": "compute",
+      "question": "How many rows have files_changed equal to 0?",
+      "answer": 8.0,
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "multihop_slowest",
+      "class": "multihop",
+      "question": "For each model, compute the mean of (duration_s divided by iterations) using only rows where iterations is greater than 0. Which model has the HIGHEST such mean? Answer with the model name exactly as it appears.",
+      "answer": "deepseek-r1:32b",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "multihop_slowest_value",
+      "class": "multihop",
+      "question": "Using that same calculation -- mean of (duration_s / iterations) over rows where iterations > 0 -- what is the value for the model with the HIGHEST mean? Round to one decimal place.",
+      "answer": 75.6,
+      "tolerance": 0.6,
+      "unit": "seconds per iteration"
+    },
+    {
+      "id": "multihop_ceiling_files",
+      "class": "multihop",
+      "question": "Consider only those models that have at least one row with stop_reason 'context_ceiling'. Among those models, which one has the largest TOTAL of files_changed summed across all of its rows? Answer with the model name.",
+      "answer": "qwen2.5-coder:14b",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_model_1",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for model 'mistral-large:123b'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_model_2",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for model 'codellama:34b'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_model_3",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for model 'gemma3:27b'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_task_1",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s across rows whose task is 'django-rest-migration'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_task_2",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s across rows whose task is 'kubernetes-operator-crd'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_column",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean value of the 'gpu_memory_mb' column?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_future",
+      "class": "abstain",
+      "question": "According to the dataset, what was the p95 latency recorded during the November 2026 regression sweep?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_model_nearmiss",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for model 'qwen3-coder-next:q8_0'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_column_nearmiss",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean value of the 'duration_ms' column?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_backend_value",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for rows whose backend is 'unraid'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_rep",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s across all rows at rep 4?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    },
+    {
+      "id": "abstain_combination",
+      "class": "abstain",
+      "question": "In the dataset, what is the mean duration_s for rows where model is 'deepseek-r1:32b' AND stop_reason is 'context_ceiling'?",
+      "answer": "__ABSENT__",
+      "tolerance": 0.0,
+      "unit": ""
+    }
+  ],
+  "counts": {
+    "extract": 6,
+    "compute": 8,
+    "multihop": 3,
+    "abstain": 12
+  }
+}

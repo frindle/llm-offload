@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NOT INSTALLED. docsum_server.py: LAN-only web UI for private doc summaries (port 7690). Installing the always-on
+     service is a separate step the owner approves. To install:
+       cp ~/bin/launchd/com.example.docsum-ui.plist ~/Library/LaunchAgents/ &&
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.docsum-ui.plist
+     To remove: launchctl bootout gui/$(id -u)/com.example.docsum-ui && rm ~/Library/LaunchAgents/com.example.docsum-ui.plist
+     The log carries only timestamps, route classes, opaque job ids, status codes and byte counts. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.docsum-ui</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/user/bin/docsum_server.py</string>
+    <string>--port</string>
+    <string>7690</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/user/bin/ollama-queue-logs/docsum-ui.log</string>
+  <key>StandardErrorPath</key><string>/Users/user/bin/ollama-queue-logs/docsum-ui.log</string>
+</dict>
+</plist>

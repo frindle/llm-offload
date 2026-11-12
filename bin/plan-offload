@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""plan-offload: once a plan is approved, hand its code steps to the local lane (mini-auto) instead of writing them by hand.
+
+  plan-offload check  [--plan PLAN] [UNITS|-]      parse and route every unit; nothing is created or enqueued
+  plan-offload submit [--plan PLAN] [UNITS|-] [--only UNIT]... [--model M] [--dry-run]
+                                                   one `mini-auto new --submit` per lane unit (worktree, run dir, the
+                                                   mini-submit checks, enqueue), recorded in the plan's ledger. A unit the
+                                                   ledger already holds a job for is skipped unless --only names it.
+                                                   Refuses everything while any selected unit has an ERROR.
+                                                   --dry-run prints the commands and creates nothing.
+  plan-offload status [--plan PLAN | --all]        each unit's job, result, review and next step
+  plan-offload hook                                the PostToolUse(ExitPlanMode) hook: hook JSON on stdin, the
+                                                   "offload the approved plan" instructions as additionalContext
+  plan-offload install-hook [--dry-run]            register that hook in ~/.claude/settings.json (the owner runs this)
+
+Units come from ```offload fences in the plan file (--plan), and/or a units file or stdin (-) in the same format:
+
+  unit: invoice-total-rounding   the job name and queue label: lowercase words joined by hyphens, <= 40 chars,
+                                 at least two words of 3+ letters (mini-submit's label rule)
+  repo: ~/path/to/checkout       the git checkout the change lands in (`mini-auto review JOB ok` copies it there, uncommitted)
+  base: HEAD                     optional, default HEAD: the commit the job starts from
+  file: src/totals.py            optional lead, repeatable: the file that changes (must be tracked at base)
+  fn: round_total                optional lead: the function that changes
+  route: claude - <why>          optional; default lane
+  desc: The requirement as an issue reporter would write it: what happens now, what should happen instead, one
+        concrete example (input -> expected output). Lines after it are appended to it (indent them when one starts
+        with a key word such as `file:`).
+
+A lane unit is one behaviour change inside existing function(s) of one file: the lane (mini-swe-runner mode auto)
+diagnoses it, writes the failing test, fixes it and runs the gates, and Claude reviews every pass
+(`mini-auto review JOB ok|reject`; ok lands it uncommitted). Claude keeps (route: claude) new files, new functions,
+wiring across files, config and docs, edits under ~40 lines, and the must-not-offload areas (money, auth, secrets,
+migrations, the offload gates). check and submit also detect those with the runner's own rules (AUTO_FORBID) and route
+them to Claude whatever the unit says. When two lane units change the same file, the second waits ("later"): it could
+not land after the first, because a landing copies only onto the copy its job started from. Land and commit the first,
+then `submit --only` the second.
+
+Kill switch: PLAN_OFFLOAD=off, or the file ~/.ollama-dispatch/plan-offload/OFF: the hook stays silent.
+Env: MINI_AUTO_CMD (the mini-auto command), MINI_RUNS, MINI_WT_ROOT, OFFLOAD_HOME, OFFLOAD_QUEUE_LOGS (as mini-auto),
+PLAN_OFFLOAD_SETTINGS (the settings file install-hook edits).
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+RUNS = Path(os.environ.get("MINI_RUNS") or Path.home() / ".ollama-dispatch/mini-runs")
+WT_ROOT = Path(os.environ.get("MINI_WT_ROOT") or Path.home() / "dispatch-worktrees")
+OHOME = Path(os.environ.get("OFFLOAD_HOME") or os.path.expanduser("~/.ollama-dispatch"))
+LEDGER_DIR = OHOME / "plan-offload"
+SETTINGS = Path(os.path.expanduser(os.environ.get("PLAN_OFFLOAD_SETTINGS") or "~/.claude/settings.json"))
+HOOK_CMD = "python3 ~/bin/plan-offload hook"
+KEY_RE = re.compile(r"^(\s*)(?:[-*]\s+)?(unit|repo|base|file|fn|route|desc)\s*:\s?(.*)$", re.I)
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)[ \t]*offload[ \t]*\n(.*?)^[ \t]*\1[ \t]*$", re.M | re.S)
+ROUTE_RE = re.compile(r"^\s*(lane|claude)\b[\s:\u2013\u2014-]*(.*)$", re.I | re.S)
+JOB_RE = re.compile(r"^job_id:\s*([0-9a-f]{6,})\s*$", re.M)
+CODE_EXT = r"py|js|jsx|ts|tsx|mjs|cjs|swift|go|rs|rb|java|kt|c|cc|cpp|h|hpp|m|mm|php|sh|bash|zsh|lua|dart|ex|exs|vue|svelte"
+CODE_SIGNAL = re.compile(r"[\w./-]+\.(?:%s)\b" % CODE_EXT)
+PLAN_PATH_RE = re.compile(r"(/[^\s\"'\\]*/\.claude/plans/[\w.-]+\.md)")
+MIN_DESC = 40
+MAX_UNIT = 40
+_MODS = {}
+
+
+def die(msg, rc=1):
+    print(f"plan-offload: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def _load(name, path):
+    if name not in _MODS:
+        ld = SourceFileLoader(name, str(path))
+        m = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ld))
+        ld.exec_module(m)
+        _MODS[name] = m
+    return _MODS[name]
+
+
+def runner():
+    return _load("mini_swe_runner_po", os.environ.get("MINI_RUNNER") or HERE / "mini-swe-runner.py")
+
+
+def submit_lib():
+    return _load("mini_submit_po", os.environ.get("MINI_SUBMIT_LIB") or HERE / "mini-submit")
+
+
+def auto_lib():
+    return _load("mini_auto_po", os.environ.get("MINI_AUTO_LIB") or HERE / "mini-auto")
+
+
+def git(d, *a):
+    try:
+        p = subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def off():
+    return (os.environ.get("PLAN_OFFLOAD", "on").strip().lower() in ("off", "0", "no", "false")
+            or (LEDGER_DIR / "OFF").exists())
+
+
+# ---------------------------------------------------------------------------------------------------- units
+def fences(text):
+    """The bodies of the ```offload (or ~~~offload) fences of a markdown text, joined."""
+    return "\n".join(m.group(2) for m in FENCE_RE.finditer(text or ""))
+
+
+def parse_units(text, src="units"):
+    """([unit dict], [error]) from `key: value` lines. A unit starts at `unit:`; desc takes the lines after it (a line
+    indented deeper than its `unit:` line stays desc text even when it starts with a key word)."""
+    units, errs, cur, last = [], [], None, None
+    for n, raw in enumerate((text or "").splitlines(), 1):
+        line = raw.rstrip()
+        m = KEY_RE.match(line)
+        ind = len(line) - len(line.lstrip())
+        if m and (cur is None or last != "desc" or ind <= cur["_ind"]):
+            k, v = m.group(2).lower(), m.group(3).strip()
+            if k == "unit":
+                cur = {"unit": v, "file": [], "_where": f"{src}:{n}", "_ind": ind}
+                units.append(cur)
+            elif cur is None:
+                errs.append(f"{src}:{n}: `{k}:` before the first `unit:` line")
+                continue
+            elif k == "file":
+                cur["file"] += [x.strip("`'\" ") for x in re.split(r"[,\s]+", v) if x.strip("`'\" ")]
+            elif k in cur:
+                errs.append(f"{src}:{n}: unit {cur['unit']!r} has a second `{k}:` line")
+            else:
+                cur[k] = v
+            last = k
+        elif not line.strip():
+            if cur is not None and last == "desc":
+                cur["desc"] = cur.get("desc", "") + "\n"
+        elif cur is not None and last == "desc":
+            cur["desc"] = (cur.get("desc", "") + "\n" + line.strip()).lstrip("\n")
+        elif line.lstrip().startswith("#"):
+            continue
+        else:
+            errs.append(f"{src}:{n}: not a `key: value` line of a unit ({line.strip()[:60]!r})")
+    for u in units:
+        u["desc"] = re.sub(r"\n{3,}", "\n\n", u.get("desc", "")).strip()
+    return units, errs
+
+
+def read_units(plan=None, units_arg=None):
+    """(units, errors, plan path or None, plan text) from the plan's fences and/or a units file / stdin."""
+    units, errs, ptext, ppath = [], [], "", None
+    if plan:
+        ppath = Path(os.path.expanduser(plan))
+        try:
+            ptext = ppath.read_text(errors="replace")
+        except OSError as e:
+            die(f"--plan {ppath}: {e}", 2)
+        u, e = parse_units(fences(ptext), ppath.name)
+        units += u
+        errs += e
+    if units_arg:
+        try:
+            t = sys.stdin.read() if units_arg == "-" else Path(os.path.expanduser(units_arg)).read_text(errors="replace")
+        except OSError as e:
+            die(f"{units_arg}: {e}", 2)
+        body = fences(t) if FENCE_RE.search(t) else t
+        u, e = parse_units(body, "stdin" if units_arg == "-" else Path(units_arg).name)
+        units += u
+        errs += e
+    return units, errs, ppath, ptext
+
+
+def tracked(top, base):
+    rc, out, _ = git(top, "ls-tree", "-r", "--name-only", f"{base}^{{commit}}")
+    return [x for x in out.split("\n") if x] if rc == 0 else None
+
+
+def resolve_lead(f, files):
+    """(the tracked path, []) for a lead: exact, else the one tracked path ending in /f; else (None, the candidates)."""
+    f = re.sub(r":\d+(?:-\d+)?$", "", re.sub(r"^\./", "", str(f).strip()))
+    if f in files:
+        return f, []
+    c = [x for x in files if x.endswith("/" + f)]
+    return (c[0], []) if len(c) == 1 else (None, c)
+
+
+def base_blob(top, base, f):
+    try:
+        p = subprocess.run(["git", "-C", str(top), "show", f"{base}:{f}"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def route_unit(u, seen):
+    """Fill u's route (lane | claude), reason, top, base, leads, errors and warnings. seen: the unit names so far."""
+    u["errors"], u["warnings"], u["after"] = [], [], None
+    name = u.get("unit", "")
+    bad = submit_lib().check_label(name)
+    if bad or len(name) > MAX_UNIT:
+        u["errors"].append("unit name (the queue label): " + (bad or f"{len(name)} chars, max {MAX_UNIT} (a retry suffix "
+                                                                     "must still fit the 48-char label)"))
+    elif name in seen:
+        u["errors"].append(f"unit name {name!r} is used twice")
+    seen.add(name)
+    rt = (u.get("route") or "lane").strip()
+    m = ROUTE_RE.match(rt)
+    if not m:
+        u["errors"].append(f"route {rt!r}: lane, or claude - <why>")
+    want, why = (m.group(1).lower(), m.group(2).strip()) if m else ("lane", "")
+    u["route"], u["reason"] = want, (why if want == "claude" else "")
+    if want == "claude" and not why:
+        u["warnings"].append("route claude without a reason (route: claude - <why>)")
+    repo = u.get("repo", "").strip()
+    u["base"] = (u.get("base") or "HEAD").strip()
+    u["top"], u["leads"] = None, []
+    if not repo:
+        u["errors"].append("no `repo:` line")
+    else:
+        rc, out, _ = git(os.path.realpath(os.path.expanduser(repo)), "rev-parse", "--show-toplevel")
+        if rc or not out.strip():
+            u["errors"].append(f"repo {repo!r} is not a git checkout")
+        else:
+            u["top"] = os.path.realpath(out.strip())
+    if u["top"]:
+        files = tracked(u["top"], u["base"])
+        if files is None:
+            remote, _, br = u["base"].partition("/")
+            _, rem, _ = git(u["top"], "remote")
+            if br and remote in rem.split():
+                u["warnings"].append(f"base {u['base']} is not fetched here yet (mini-auto fetches it; the file leads were "
+                                     "not checked)")
+            else:
+                u["errors"].append(f"base {u['base']!r} is not a commit in {u['top']}")
+            u["leads"] = list(u["file"])
+        else:
+            for f in u["file"]:
+                r, cands = resolve_lead(f, files)
+                if r is None and u["route"] == "lane":
+                    u["errors"].append(f"file lead {f!r} matches {len(cands)} tracked files ({', '.join(cands[:4])}): give "
+                                       "its path" if cands else
+                                       f"file lead {f!r} is not a tracked file at {u['base']} (new files stay with Claude)")
+                u["leads"].append(r or f)
+            for f in (u["leads"] if u["route"] == "lane" else []):
+                if f not in files:
+                    continue
+                try:
+                    cur = (Path(u["top"]) / f).read_bytes()
+                except OSError:
+                    cur = None
+                if cur != base_blob(u["top"], u["base"], f):
+                    u["warnings"].append(f"the checkout's {f} differs from {u['base']}'s (uncommitted edits, or another commit "
+                                         f"checked out): the job starts from {u['base']}, and its landing refuses until the "
+                                         "checkout's copy matches that again; commit first, or set base to what is checked out")
+    if u["route"] == "lane":
+        if len(u.get("desc", "")) < MIN_DESC:
+            u["errors"].append(f"desc is {len(u.get('desc', ''))} chars: the lane works from it alone (now -> should, one "
+                               f"concrete example; >= {MIN_DESC} chars)")
+        R = runner()
+        names = [("repo", x) for x in (R.auto_repo_names(u["top"]) if u["top"] else [])]
+        names += [("file hint", f) for f in u["leads"]] + [("function hint", u.get("fn"))]
+        hits = R.auto_forbidden(names, u.get("desc", ""))
+        if hits:
+            u["route"] = "claude"
+            u["reason"] = "must-not-offload: " + "; ".join(f"{w} {v!r} ({h})" for w, v, h in hits)[:240]
+            u["errors"] = [e for e in u["errors"] if not e.startswith(("desc is", "file lead"))]
+            u["warnings"] = [w for w in u["warnings"] if not w.startswith("the checkout's")]
+        elif os.environ.get("MINI_AUTO", "on").strip().lower() in ("off", "0", "no", "false"):
+            u["route"], u["reason"] = "claude", "the lane is off (MINI_AUTO=off)"
+    return u
+
+
+def route_all(units):
+    """Route every unit; a lane unit that changes a file an earlier lane unit changes waits for it (u["after"])."""
+    seen = set()
+    for u in units:
+        route_unit(u, seen)
+    first = {}
+    for u in units:
+        if u["route"] != "lane" or u["errors"]:
+            continue
+        for f in u["leads"]:
+            k = (u["top"], f)
+            if k in first and first[k] != u["unit"] and not u["after"]:
+                u["after"] = first[k]
+            first.setdefault(k, u["unit"])
+    for u in units:
+        if u["route"] == "claude" and not u["errors"]:
+            for f in u["leads"]:
+                if (u["top"], f) in first:
+                    u["warnings"].append(f"lane unit {first[(u['top'], f)]} changes {f} too: its landing refuses once you have "
+                                         "edited that file, so write this one after that unit lands, or route both to claude")
+    return units
+
+
+def unit_line(u):
+    lead = " ".join(x for x in (f"file={','.join(u['leads'])}" if u.get("leads") else "",
+                                f"fn={u['fn']}" if u.get("fn") else "") if x)
+    if u["errors"]:
+        head = f"ERROR   {u.get('unit') or '?'}  " + "; ".join(u["errors"])
+    elif u["route"] == "claude":
+        head = f"claude  {u['unit']}  {u['reason'] or '(no reason given)'}"
+    elif u["after"]:
+        head = (f"later   {u['unit']}  waits for lane unit {u['after']} (same file): after that one lands and is committed, "
+                f"submit --only {u['unit']}")
+    else:
+        head = f"lane    {u['unit']}  {u['top']}@{u['base']}" + (f"  {lead}" if lead else "")
+    return head + "".join(f"\n        warn: {w}" for w in u["warnings"])
+
+
+def counts(units):
+    ok = [u for u in units if not u["errors"]]
+    return (sum(1 for u in ok if u["route"] == "lane" and not u["after"]), sum(1 for u in ok if u["route"] == "claude"),
+            sum(1 for u in ok if u["route"] == "lane" and u["after"]), len(units) - len(ok))
+
+
+# ---------------------------------------------------------------------------------------------------- ledger
+def ledger_key(ppath):
+    stem = Path(ppath).stem if ppath else "adhoc"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", stem)[:80] or "adhoc"
+
+
+def ledger_path(ppath):
+    return LEDGER_DIR / f"{ledger_key(ppath)}.jsonl"
+
+
+def ledger_add(ppath, row):
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "plan": str(ppath) if ppath else None, **row}
+    with open(ledger_path(ppath), "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def ledger_latest(path):
+    """{unit: its latest ledger row}, in first-seen order."""
+    out = {}
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("unit"):
+            out[r["unit"]] = r
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------- check / submit
+def _src_args(a):
+    parts = []
+    if a.plan:
+        parts += ["--plan", shlex.quote(str(a.plan))]
+    if a.units:
+        parts.append("-" if a.units == "-" else shlex.quote(a.units))
+    return " ".join(parts)
+
+
+def cmd_check(a):
+    units, errs, _, _ = read_units(a.plan, a.units)
+    if not units and not errs:
+        print("no units: put them in an ```offload fence of the plan, or pass a units file / - (stdin)")
+        return 1
+    route_all(units)
+    for e in errs:
+        print(f"ERROR   {e}")
+    for u in units:
+        print(unit_line(u))
+    n_lane, n_claude, n_later, n_bad = counts(units)
+    n_bad += len(errs)
+    print(f"{n_lane} lane, {n_claude} claude, {n_later} later, {n_bad} with errors"
+          + ("" if n_bad else "; submit: ~/bin/plan-offload submit " + _src_args(a)))
+    return 1 if n_bad else 0
+
+
+def job_name(u):
+    """The unit's name, or name-rN when a run dir, worktree or dispatch branch of that name already exists."""
+    for i in range(1, 100):
+        n = u["unit"] if i == 1 else f"{u['unit']}-r{i}"
+        taken = (RUNS / n).exists() or (WT_ROOT / n).exists() or (
+            u["top"] and git(u["top"], "rev-parse", "-q", "--verify", f"refs/heads/dispatch/{n}")[0] == 0)
+        if not taken:
+            return n
+    die(f"no free job name for unit {u['unit']}")
+
+
+def mini_auto_cmd():
+    env = os.environ.get("MINI_AUTO_CMD")
+    return shlex.split(env) if env else [sys.executable, str(HERE / "mini-auto")]
+
+
+def pending_overlap(u, latest):
+    """Warnings for lane jobs of this ledger that change one of u's files and have not landed yet."""
+    out = []
+    for other, row in latest.items():
+        if other == u["unit"] or row.get("route") != "lane" or not row.get("job") or row.get("repo") != u["top"]:
+            continue
+        both = sorted(set(row.get("files") or []) & set(u["leads"]))
+        if both:
+            st, _ = unit_state(row)
+            if st.startswith(("queued", "passed")):
+                out.append(f"lane unit {other} (job {row['job']}, {st}) also changes {', '.join(both)} and has not landed: "
+                           "whichever lands second is refused")
+    return out
+
+
+def cmd_submit(a):
+    units, errs, ppath, _ = read_units(a.plan, a.units)
+    if not units:
+        die("no units: put them in an ```offload fence of the plan, or pass a units file / - (stdin)"
+            + (f" ({errs[0]})" if errs else ""), 2)
+    if a.only:
+        unknown = sorted(set(a.only) - {u.get("unit") for u in units})
+        if unknown:
+            die(f"--only {', '.join(unknown)}: no such unit", 2)
+        units = [u for u in units if u.get("unit") in a.only]
+    route_all(units)
+    bad = [u for u in units if u["errors"]]
+    if errs or bad:
+        for e in errs:
+            print(f"ERROR   {e}")
+        for u in bad:
+            print(unit_line(u))
+        die("nothing submitted: fix the units above, or leave them out with --only UNIT", 1)
+    latest = ledger_latest(ledger_path(ppath))
+    plan_arg = f" --plan {shlex.quote(str(ppath))}" if ppath else ""
+    rc_all, queued = 0, 0
+    for u in units:
+        prev = latest.get(u["unit"])
+        if u["route"] == "claude":
+            print(unit_line(u))
+            if not a.dry_run and not (prev and prev.get("route") == "claude"):
+                ledger_add(ppath, {"unit": u["unit"], "route": "claude", "reason": u["reason"], "repo": u["top"],
+                                   "files": u["leads"]})
+            continue
+        if u["after"]:
+            print(unit_line(u))
+            if not a.dry_run and not prev:
+                ledger_add(ppath, {"unit": u["unit"], "route": "later", "after": u["after"], "repo": u["top"],
+                                   "files": u["leads"]})
+            continue
+        if prev and prev.get("job") and not (a.only and u["unit"] in a.only):
+            print(f"lane    {u['unit']}  already queued as job {prev['job']} ({prev.get('name')}); to submit it again: "
+                  f"--only {u['unit']}")
+            continue
+        for w in pending_overlap(u, latest):
+            print(f"warn    {u['unit']}  {w}")
+        for w in u["warnings"]:
+            print(f"warn    {u['unit']}  {w}")
+        name = job_name(u)
+        cmd = mini_auto_cmd() + ["new", "--repo", u["top"], "--base", u["base"], "--name", name]
+        for f in u["leads"]:
+            cmd += ["--file", f]
+        if u.get("fn"):
+            cmd += ["--fn", u["fn"]]
+        cmd += ["--desc-file", "-", "--submit", "--label", name]
+        if a.model:
+            cmd += ["--model", a.model]
+        if a.dry_run:
+            print(f"lane    {u['unit']}  would run: {' '.join(shlex.quote(c) for c in cmd)}  (desc on stdin, "
+                  f"{len(u['desc'])} chars)")
+            continue
+        try:
+            p = subprocess.run(cmd, input=u["desc"] + "\n", capture_output=True, text=True, timeout=900)
+            out, rc = (p.stdout + p.stderr).strip(), p.returncode
+        except (OSError, subprocess.SubprocessError) as e:
+            out, rc = f"mini-auto did not run: {e}", 1
+        m = JOB_RE.search(out)
+        job = m.group(1) if m and rc == 0 else None
+        run = re.search(r"^run_dir:\s*(\S+)", out, re.M)
+        ledger_add(ppath, {"unit": u["unit"], "route": "lane", "name": name, "repo": u["top"], "base": u["base"],
+                           "files": u["leads"], "fn": u.get("fn"), "job": job, "run_dir": run.group(1) if run else None,
+                           "rc": rc})
+        if job:
+            queued += 1
+            print(f"lane    {u['unit']}  queued: job {job} ({name})")
+        else:
+            rc_all = 1
+            tail = "\n".join("        " + ln for ln in out.splitlines()[-8:])
+            print(f"FAILED  {u['unit']}  not queued (mini-auto rc {rc}); write it yourself, or fix and submit{plan_arg} "
+                  f"--only {u['unit']}:\n{tail}")
+    if not a.dry_run:
+        print(f"ledger: {ledger_path(ppath)}\nnext: write the claude units yourself while the lane runs"
+              + (f" ({queued} job(s) queued)" if queued else "") + ". Each lane pass arrives as a queue event with its review "
+              "packet -> ~/bin/mini-auto review JOB ok|reject (ok lands it uncommitted; reject needs --note). A failed or "
+              f"rejected lane unit is yours to write. Progress: ~/bin/plan-offload status{plan_arg}")
+    return rc_all
+
+
+# ---------------------------------------------------------------------------------------------------- status
+def _finished(rec):
+    cwd = str(rec.get("cwd") or "")
+    if not cwd:
+        return False
+    try:
+        fin = json.loads((Path(os.path.expanduser(cwd)).parent / "finish" / "FINISHED.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(fin, dict) and str(fin.get("verdict") or "").startswith("PASS")
+
+
+def unit_state(row, plan_arg=""):
+    """(state, next step) of a ledger row."""
+    unit, route = row.get("unit"), row.get("route")
+    if route == "claude":
+        return "claude", "yours to write" + (f" ({row['reason']})" if row.get("reason") else "")
+    if route == "later":
+        return "later", (f"after {row.get('after')} lands and is committed: ~/bin/plan-offload submit{plan_arg} "
+                         f"--only {unit}")
+    job = row.get("job")
+    if not job:
+        return "not queued", f"mini-auto rc {row.get('rc')}: write it yourself, or fix and submit{plan_arg} --only {unit}"
+    MA = auto_lib()
+    rec = MA.job_record(job)
+    if not rec:
+        return "queued/running", f"job {job}: its queue event brings the result"
+    verdict = str(rec.get("runner_verdict") or "")
+    passed = rec.get("status") == "done" and (verdict == "PASS" or verdict.startswith("NEEDS-REVIEW"))
+    rv = MA.latest_review(job)
+    if passed and not rv:
+        return f"passed ({verdict})", (f"review: ~/bin/mini-scorecard review brief {job}, then "
+                                       f"~/bin/mini-auto review {job} ok|reject")
+    if passed and rv.get("verdict") == "ok":
+        return "reviewed ok", (f"landed by the review (else ~/bin/mini-auto land {job}); commit it in {row.get('repo')}, then "
+                               f"~/bin/mini-scorecard ledger add --job {job} --commit <sha> --repo {row.get('repo')}")
+    if passed:
+        return "rejected", f"yours to write; the model's attempt: ~/bin/mini-auto show {job}"
+    if _finished(rec):
+        return "finished (mini-finish PASS)", f"~/bin/mini-auto land {job}, then commit it in {row.get('repo')}"
+    return f"failed ({rec.get('status')}, {verdict or '?'})", f"yours to write; why: ~/bin/mini-auto show {job}"
+
+
+def cmd_status(a):
+    if a.all:
+        paths = sorted(LEDGER_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    else:
+        paths = [ledger_path(os.path.expanduser(a.plan) if a.plan else None)]
+    shown = 0
+    for p in paths:
+        latest = ledger_latest(p)
+        if not latest:
+            continue
+        plan = next((r.get("plan") for r in latest.values() if r.get("plan")), None)
+        plan_arg = f" --plan {shlex.quote(plan)}" if plan else ""
+        print(f"== {p.stem}" + (f"  ({plan})" if plan else ""))
+        for unit, r in latest.items():
+            st, nxt = unit_state(r, plan_arg)
+            print(f"  {unit:<32} {st:<26} {nxt}")
+            shown += 1
+    if not shown:
+        print("nothing submitted yet" + ("" if a.all else f" for {ledger_path(a.plan).stem}"))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- hook
+TEMPLATE = """~/bin/plan-offload submit --plan {plan} - <<'EOF'
+unit: <area-change>
+repo: <checkout path>
+file: <path in the repo>
+fn: <function>
+desc: <what happens now -> what should happen, with one concrete example>
+EOF"""
+
+HEAD = ("PLAN APPROVED -> OFFLOAD-FIRST CODING (plan-offload): the local lane writes the lane-sized code steps; you write the "
+        "rest and review its passes.")
+RULES = ("A lane unit = one behaviour change inside existing function(s) of one file; the lane diagnoses it, writes the "
+         "failing test, fixes it and runs the gates, and you review each pass. Keep for yourself (route: claude - <why>): new "
+         "files or functions, wiring across files, config/docs, edits under ~40 lines, and must-not-offload areas (money, "
+         "auth, secrets, migrations, the offload gates; plan-offload also detects these and routes them to you).")
+
+
+def after_text(pp):
+    return ("Write the claude units yourself while the lane runs. Each lane pass arrives as a queue event with its review "
+            "packet: ~/bin/mini-auto review JOB ok|reject (ok lands it uncommitted). A failed or rejected lane unit is yours "
+            f"to write. Progress: ~/bin/plan-offload status --plan {pp}")
+
+
+def hook_context(plan_text, plan_path):
+    """The additionalContext for an approved plan, or None when it has no code work."""
+    units, errs = parse_units(fences(plan_text), Path(plan_path).name if plan_path else "plan")
+    pp = shlex.quote(str(plan_path)) if plan_path else "<plan file>"
+    if units or errs:
+        route_all(units)
+        lines = [ln for u in units for ln in unit_line(u).splitlines()] + [f"ERROR   {e}" for e in errs]
+        n_lane, n_claude, n_later, n_bad = counts(units)
+        if n_bad or errs:
+            first = ("First: fix the ERROR lines in the plan's ```offload fence (or route those units to claude), then run "
+                     f"~/bin/plan-offload submit --plan {pp}")
+        elif n_lane:
+            first = (f"First, before writing any code: ~/bin/plan-offload submit --plan {pp}   (queues {n_lane} lane "
+                     f"unit(s); the ledger tracks them)")
+        else:
+            first = (f"No unit goes to the lane now. Record the plan's units with ~/bin/plan-offload submit --plan {pp}, "
+                     "then write the claude units.")
+        return "\n".join([HEAD, "The plan's offload units route as:", *("  " + ln for ln in lines), first, after_text(pp)])
+    if not CODE_SIGNAL.search(plan_text or ""):
+        return None
+    return "\n".join([HEAD, "Before writing code, split the plan's code steps into units and queue the lane-sized ones, one "
+                      "block per unit (file and fn are optional leads; unit is the queue label, two or more words of 3+ "
+                      "letters):", TEMPLATE.format(plan=pp), RULES,
+                      "A preview without side effects: the same input to `~/bin/plan-offload check`. If no step fits the "
+                      "lane, say so in one line and proceed.", after_text(pp)])
+
+
+def transcript_plan(tp):
+    """The last non-agent plan file the session's transcript names, or ''."""
+    try:
+        with open(os.path.expanduser(str(tp)), "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - (4 << 20)))
+            tail = fh.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+    for p in reversed(PLAN_PATH_RE.findall(tail)):
+        if "-agent-" not in p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def saved_plan(plan_text):
+    """A copy of a plan that came without a file path, so `submit --plan` can read it."""
+    d = LEDGER_DIR / "plans"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"plan-{hashlib.sha256(plan_text.encode()).hexdigest()[:12]}.md"
+    if not p.exists():
+        p.write_text(plan_text)
+    return str(p)
+
+
+def _hook_log(d, src, path, n_ctx):
+    try:
+        LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+        tr, ti = d.get("tool_response"), d.get("tool_input")
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": d.get("session_id"), "event": d.get("hook_event_name"),
+               "tool": d.get("tool_name"), "mode": d.get("permission_mode"),
+               "input_keys": sorted(ti.keys()) if isinstance(ti, dict) else type(ti).__name__,
+               "response_keys": sorted(tr.keys()) if isinstance(tr, dict) else type(tr).__name__,
+               "plan_from": src, "plan_path": path or None, "context_chars": n_ctx}
+        with open(LEDGER_DIR / "hook.log", "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def cmd_hook(_a):
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    if not isinstance(d, dict) or off() or d.get("tool_name") != "ExitPlanMode" or d.get("agent_id"):
+        return 0
+    tr, ti = d.get("tool_response"), d.get("tool_input")
+    if isinstance(tr, str):
+        try:
+            tr = json.loads(tr)
+        except ValueError:
+            tr = {"_text": tr}
+    if isinstance(tr, list):
+        tr = {"_text": "\n".join(str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in tr)}
+    tr = tr if isinstance(tr, dict) else {}
+    ti = ti if isinstance(ti, dict) else {}
+    if tr.get("isAgent") or tr.get("awaitingLeaderApproval"):
+        _hook_log(d, "skipped: agent or awaiting leader approval", "", 0)
+        return 0
+    plan = tr.get("plan") or ti.get("plan") or ""
+    src = "tool_response.plan" if tr.get("plan") else "tool_input.plan" if ti.get("plan") else ""
+    path = tr.get("filePath") or ti.get("planFilePath") or ""
+    if not path and tr.get("_text"):
+        m = PLAN_PATH_RE.search(str(tr["_text"]))
+        path = m.group(1) if m else ""
+    if not plan and not path:
+        path = transcript_plan(d.get("transcript_path"))
+    if not plan and path:
+        try:
+            plan, src = Path(os.path.expanduser(str(path))).read_text(errors="replace"), "file"
+        except OSError:
+            plan = ""
+    if not isinstance(plan, str) or not plan.strip():
+        _hook_log(d, "none", path, 0)
+        return 0
+    try:
+        if not path:
+            path = saved_plan(plan)
+        ctx = hook_context(plan, path)
+    except (Exception, SystemExit) as e:  # never break the session over this
+        ctx = (f"PLAN APPROVED -> OFFLOAD-FIRST CODING: plan-offload could not read the plan's units ({type(e).__name__}: "
+               f"{str(e)[:160]}); run ~/bin/plan-offload check --plan {path or '<plan file>'}")
+    _hook_log(d, src, path, len(ctx or ""))
+    if ctx:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": ctx}}))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- install-hook
+def cmd_install_hook(a):
+    path = Path(os.path.realpath(SETTINGS))
+    try:
+        text = path.read_text()
+        d = json.loads(text)
+    except (OSError, ValueError) as e:
+        die(f"{path}: {e}", 2)
+    if not isinstance(d, dict) or not isinstance(d.get("hooks", {}), dict):
+        die(f"{path}: not a settings object with a hooks object", 2)
+    groups = d.setdefault("hooks", {}).setdefault("PostToolUse", [])
+    if not isinstance(groups, list):
+        die(f"{path}: hooks.PostToolUse is not a list", 2)
+    for g in groups:
+        for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+            if isinstance(h, dict) and "plan-offload hook" in str(h.get("command", "")):
+                print(f"already installed: PostToolUse matcher {g.get('matcher')!r} -> {h.get('command')}")
+                return 0
+    entry = {"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 30}]}
+    if a.dry_run:
+        print(f"would add to hooks.PostToolUse in {path}:\n" + json.dumps(entry, indent=2))
+        return 0
+    groups.append(entry)
+    new = json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+    mode = stat.S_IMODE(path.stat().st_mode)
+    stamp = path.name + ".bak-plan-offload-" + time.strftime("%Y%m%dT%H%M%S")
+    bak, i = path.with_name(stamp), 1
+    while bak.exists():  # never overwrite an earlier backup
+        bak, i = path.with_name(f"{stamp}-{i}"), i + 1
+    shutil.copy2(path, bak)
+    tmp = path.with_name(path.name + ".tmp-plan-offload")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(new)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    print(f"installed: PostToolUse matcher 'ExitPlanMode' -> {HOOK_CMD} (backup {bak}); it applies from the next plan approval")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for nm in ("check", "submit"):
+        s = sub.add_parser(nm)
+        s.add_argument("--plan")
+        s.add_argument("units", nargs="?")
+        if nm == "submit":
+            s.add_argument("--only", action="append")
+            s.add_argument("--model")
+            s.add_argument("--dry-run", action="store_true")
+    st = sub.add_parser("status")
+    st.add_argument("--plan")
+    st.add_argument("--all", action="store_true")
+    sub.add_parser("hook")
+    ih = sub.add_parser("install-hook")
+    ih.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd in ("check", "submit") and not (a.plan or a.units):
+        die("pass --plan PLAN (its ```offload fences) and/or a units file or - (stdin)", 2)
+    return {"check": cmd_check, "submit": cmd_submit, "status": cmd_status, "hook": cmd_hook,
+            "install-hook": cmd_install_hook}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

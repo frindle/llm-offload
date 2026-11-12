@@ -1,0 +1,10 @@
+{
+ "args": [
+  "--fn",
+  "truncate_words",
+  "--fix-mode",
+  "single_shot"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

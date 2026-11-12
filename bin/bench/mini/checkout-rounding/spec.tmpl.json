@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "roundCents"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

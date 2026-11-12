@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "slugify"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

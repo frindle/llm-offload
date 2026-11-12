@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "parsePrice"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

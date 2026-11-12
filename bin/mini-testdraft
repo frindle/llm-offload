@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""mini-testdraft: lever 1 of the offload plan. A LOCAL model drafts the frozen test; Claude only checks it.
+
+  mini-testdraft check SPEC.json --draft TESTFILE [--ref DIR] [--keep]   ACCEPT/REJECT a drafted test against the already-written reference fix
+  mini-testdraft prompt SPEC.json [--ref DIR]                          the drafting brief for the local model (TASK + ref diff + rules)
+
+`check` swaps the draft in for the spec's frozen test inside a throwaway copy of baseline_from, then runs mini-validate on it
+(V2 static + G5 rules, V3 red for the right reason, V4 ref green, V5 EVERY ref hunk is caught, V6 sizing, V7 reverse order).
+V6 allows up to DRAFT_MAX_TESTS (10) tests, not the fix-job cap of 5: a drafted test lands with the ref and no fix job follows it.
+ACCEPT needs all of them. Read-only: the real spec, baseline and ref are never written. Claude still reads an ACCEPTed test before it lands.
+
+  mini-testdraft emit SPEC.json --out DIR      a test_draft JOB for the queue: DIR/spec.json (phase_a_only) + TASK.md (brief with the ref diff) + base/ (no test)
+
+LIVE PATH (default OFF): MINI_TESTDRAFT_MODE=on mini-submit DIR/spec.json --label <area>-test-draft --model <m>. The runner runs Phase A only
+(the local model drafts the test), then runs `check` on it; RESULT PASS = ACCEPT (V1-V7 + mutation >= 0.70), FAIL = REJECT. A REJECT is fed
+back as the next attempt's prompt (up to test_attempts; emit sets 3): the failing checks, plus the draft's own test output with the ref applied
+when it fails there. Nothing is landed: Claude reads an ACCEPTed draft at DIR-run/draft_<test> and copies it into the baseline.
+Kill switch: MINI_TESTDRAFT=off makes both subcommands print "disabled" and exit 2.
+Never use for must-not-offload areas (money, auth, migrations, gate logic): `check` refuses a spec whose paths match them unless --shadow.
+"""
+import argparse
+import difflib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+DRAFT_MAX_TESTS = 10   # mini-validate --max-tests for a draft (fix jobs keep 5). 2026-11-02: an 8-test draft at mutation 0.982 was
+                       # rejected on size alone, and its retry, cut to 4 tests, scored 0.702
+VALIDATE = Path(os.environ.get("MINI_VALIDATE") or HERE / "mini-validate")
+FORBIDDEN = re.compile(r"resell|bfmr|tax|pnl|auth|secret|keychain|token|migrat|mini-validate|mini-swe-runner|mini-submit|mini-spec|canary", re.I)
+
+
+def load(spec_path, ref):
+    sp = Path(spec_path).resolve()
+    spec = json.loads(sp.read_text())
+    rd = Path(os.path.expanduser(ref or spec.get("ref") or "ref"))
+    rd = rd if rd.is_absolute() else sp.parent / rd
+    return sp, spec, rd
+
+
+def guard(spec, shadow):
+    blob = " ".join([str(spec.get("baseline_from")), *map(str, spec.get("allowed") or []), str(spec.get("test_file"))])
+    if FORBIDDEN.search(blob) and not shadow:
+        print(f"REFUSED: {blob[:120]} matches a must-not-offload area; pass --shadow to score it without landing anything")
+        return False
+    return True
+
+
+def line_mutation_check(spec, w, base, rd, changed, a):
+    """Python refs: mini_mutate mutates only the lines the ref changed and kills with the spec's own test_cmd (mutmut's indir mode
+    could not score tests outside the source dir or plain-script tests; whole-function scope counted lines the task never touched).
+    Fewer than 3 mutants on the changed lines: V5 (every ref hunk caught) decides alone."""
+    spc = importlib.util.spec_from_file_location("mini_mutate", HERE / "mini_mutate.py")
+    M = importlib.util.module_from_spec(spc)
+    spc.loader.exec_module(M)
+    pairs = {f: (base / f).read_text(errors="replace") if (base / f).is_file() else "" for f in changed}
+    r = M.score(w, pairs, spec["test_cmd"], env={k: str(v) for k, v in (spec.get("env") or {}).items()}, max_mutants=a.max_mutants, jobs=4)
+    if "unscored" in r:
+        return a.allow_unscored, "line-scoped unscored: " + r["unscored"]
+    if r["total"] < 3:
+        return True, f"line-scoped: only {r['total']} mutant(s) on the changed lines; V5 decides"
+    ok = r["score"] >= a.min_mutation
+    surv = "; ".join(f"{s['file']}:{s['line']} {s['op']} {s['before'][:40]!r}->{s['after'][:30]!r}" for s in r["survivors"][:6])
+    return ok, (f"line-scoped on {', '.join(changed)}: score={r['score']} ({r['killed'] + r['timeout']}/{r['total']} killed"
+                + (f", sampled from {r['found']}" if r["found"] > r["total"] else "") + f") {'>=' if ok else '<'} {a.min_mutation}"
+                + (f"; survivors: {surv}" if surv else ""))
+
+
+def mutation_check(spec, base, rd, a):
+    """V5 is blind when the ref is one big hunk (a stub replaced by a whole function), so also require a mutation score on what the ref
+    changes: the draft must kill >= --min-mutation of the mutants. Python: line-scoped mini_mutate (2026-11-02); JS/TS or mixed: StrykerJS on
+    the changed functions. Strict: an unscored result fails unless --allow-unscored."""
+    if a.min_mutation <= 0:
+        return True, "disabled (--min-mutation 0)"
+    allowed = list(spec.get("allowed") or [])
+    w = Path(tempfile.mkdtemp(prefix="mini-testdraft-mut-")) / "w"
+    try:
+        shutil.copytree(base, w, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        changed = [f for f in allowed if (rd / f).is_file()
+                   and ((base / f).read_text(errors="replace") if (base / f).is_file() else None) != (rd / f).read_text(errors="replace")]
+        for f in changed:
+            (w / f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(rd / f, w / f)
+        if changed and all(f.endswith(".py") for f in changed) and os.environ.get("MINI_TESTDRAFT_MUT", "line") == "line":
+            return line_mutation_check(spec, w, base, rd, changed, a)
+        spc = importlib.util.spec_from_file_location("mini_swe_runner", os.environ.get("MINI_RUNNER") or HERE / "mini-swe-runner.py")
+        R = importlib.util.module_from_spec(spc)
+        spc.loader.exec_module(R)
+        fns = []
+        for f in allowed:
+            if (rd / f).is_file():
+                a_ = (base / f).read_text().splitlines() if (base / f).is_file() else []
+                b_ = (rd / f).read_text().splitlines()
+                shutil.copy2(rd / f, w / f)
+                touched = {j for t, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a_, b_, autojunk=False).get_opcodes() if t != "equal" for j in range(j1, max(j2, j1 + 1))}
+                for name, d in R.functions(f, (rd / f).read_text()).items():
+                    if d[1] is not None and any(d[0] - 1 <= j < d[1] for j in touched):
+                        fns.append(name)
+        if not fns:
+            return a.allow_unscored, "no changed function found to mutate"
+        cfg = {"min_mutants": 3, **(spec.get("mutation_gate") if isinstance(spec.get("mutation_gate"), dict) else {}), "mutmut_mode": "indir", "fail_below": a.min_mutation}
+        if a.mutmut_pythonpath:
+            cfg["mutmut_pythonpath"] = a.mutmut_pythonpath
+        s2 = {**spec, "target_fn": sorted(set(fns)), "mutation_gate": {**cfg, "required": not a.allow_unscored}}
+        env_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:" + env_path
+        ok, det, score = R.run_mutation_gate(str(w), s2, allowed, 1500)
+        if score is None and not a.allow_unscored:
+            ok = False
+        return ok, det + (f" (min {a.min_mutation})" if score is not None else "")
+    finally:
+        shutil.rmtree(w.parent, ignore_errors=True)
+
+
+def ref_run(spec, base, rd, timeout=180, tail=2500):
+    """The draft's own output with the ref applied: base + the ref's files, the spec's test_cmd, contained like the mutation runs
+    (throwaway HOME, sandbox). Unbuffered, so a script runner's PASS/FAIL lines and the traceback come out in order (mini-validate keeps
+    only rc and per-test status, which left a rejected draft with nothing to fix it by). -> (rc or None, output tail or reason)."""
+    spc = importlib.util.spec_from_file_location("mini_mutate", HERE / "mini_mutate.py")
+    M = importlib.util.module_from_spec(spc)
+    spc.loader.exec_module(M)
+    tmp = Path(tempfile.mkdtemp(prefix="mini-testdraft-ref-"))
+    try:
+        w = tmp / "w"
+        shutil.copytree(base, w, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        for f in spec.get("allowed") or []:
+            if (rd / f).is_file():
+                (w / f).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(rd / f, w / f)
+        env = {**os.environ, **{k: str(v) for k, v in (spec.get("env") or {}).items()}, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+        c = M._contain(tmp, env, spec["test_cmd"])
+        if isinstance(c, str):
+            return None, "not run: " + c
+        env, wrap, cmd = c
+        try:
+            p = subprocess.run([*wrap, "bash", "-c", cmd], cwd=w, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               errors="replace", timeout=timeout, start_new_session=True)
+        except subprocess.TimeoutExpired:
+            return None, f"timed out after {timeout}s"
+        out = p.stdout or "(no output)"
+        for d in {str(w), os.path.realpath(w)}:  # tracebacks name the throwaway copy: show repo-relative paths
+            out = out.replace(d + "/", "")
+        return p.returncode, out[-tail:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_check(a):
+    sp, spec, rd = load(a.spec, a.ref)
+    if spec.get("steps"):
+        print("REFUSED: step-chained specs are not supported yet; check one step at a time")
+        return 2
+    if not guard(spec, a.shadow):
+        return 2
+    draft = Path(a.draft).resolve()
+    if not draft.is_file():
+        print(f"no draft file {draft}")
+        return 2
+    tmp = Path(tempfile.mkdtemp(prefix="mini-testdraft-"))
+    try:
+        base = tmp / "base"
+        shutil.copytree(os.path.expanduser(spec["baseline_from"]), base, symlinks=True,
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "node_modules"))
+        nm = Path(os.path.expanduser(spec["baseline_from"])) / "node_modules"
+        if nm.exists():
+            (base / "node_modules").symlink_to(nm)
+        venv = Path(os.path.expanduser(spec["baseline_from"])) / ".venv"
+        if venv.exists():
+            (base / ".venv").symlink_to(venv)
+        for gcmd in (["init", "-q"], ["config", "user.email", "t@localhost"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"], ["add", "-A"],
+                     ["commit", "-qm", "base"]):
+            subprocess.run(["git", "-C", str(base), *gcmd], capture_output=True)
+        tf = base / spec["test_file"]
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(draft, tf)
+        subprocess.run(["git", "-C", str(base), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(base), "commit", "-qm", "draft test"], capture_output=True)
+        sdir = tmp / "spec"
+        sdir.mkdir()
+        s2 = {**spec, "baseline_from": str(base), "ref": str(rd)}
+        t = spec.get("task")
+        if isinstance(t, str) and not t.startswith(("#", "\n")) and len(t) < 400 and (sp.parent / t).is_file() and not Path(t).is_absolute():
+            s2["task"] = str((sp.parent / t).resolve())
+        (sdir / "spec.json").write_text(json.dumps(s2, indent=1))
+        # MINI_CONTAIN=1: the draft is local-model code, so mini-validate's runs (and its runner --check-only) are contained too
+        p = subprocess.run([sys.executable, str(VALIDATE), str(sdir / "spec.json"), "--max-tests", str(DRAFT_MAX_TESTS)],
+                           capture_output=True, text=True, timeout=7200, env={**os.environ, "MINI_CONTAIN": "1"})
+        lines = [ln for ln in (p.stdout + p.stderr).splitlines() if re.match(r"\s+s\d+ V\d|\[mini-validate\] (PASS|FAIL)", ln)]
+        print("\n".join(lines) or (p.stdout + p.stderr)[-800:])
+        ok = p.returncode == 0
+        mok, mdet = mutation_check(spec, base, rd, a)
+        ref_red = any(re.match(r"\s+s\d+ V4 [^:]*: FAIL (?!skipped|no reference)", ln) for ln in lines) or "fails on the unmutated ref" in mdet
+        if ref_red:  # the scorer's 400-char tail is multi-line noise; the full output follows in the block below
+            mdet = re.sub(r"(\(rc=[^)]*\)):.*", r"\1", mdet, flags=re.S)
+        print(f"  mutation: {'ok' if mok else 'FAIL'} {' '.join(mdet.split())}")
+        ok = ok and mok
+        if ref_red:
+            rrc, rout = ref_run(spec, base, rd)  # what a retry needs: which assertion fails once the fix is in
+            print(f"--- draft vs ref: test output (tail, rc={rrc}) ---\n{rout.rstrip()}\n--- end ---")
+        print(f"mini-testdraft: {'ACCEPT' if ok else 'REJECT'} ({draft.name} vs ref {rd.name})")
+        if a.keep:
+            print(f"kept: {tmp}")
+            tmp = None
+        return 0 if ok else 1
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def build_prompt(sp, spec, rd):
+    base = Path(os.path.expanduser(spec["baseline_from"]))
+    task = spec.get("task") or "TASK.md"
+    tp = Path(task) if Path(task).is_absolute() else sp.parent / task
+    ttxt = tp.read_text() if tp.is_file() else str(task)
+    diffs = []
+    for f in spec.get("allowed") or []:
+        r = rd / f
+        if r.is_file():
+            a_ = (base / f).read_text().splitlines(True) if (base / f).is_file() else []
+            diffs.append("".join(difflib.unified_diff(a_, r.read_text().splitlines(True), f"a/{f}", f"b/{f}", n=3)))
+    harness = ""
+    # mini-spec's python test_cmd runs the file as a plain script (the runner's py_direct_run test)
+    if str(spec.get("test_file", "")).endswith(".py") and not re.search(r"\b(?:pytest|unittest|nose2?|tox)\b", spec.get("test_cmd") or ""):
+        harness = ("\n- The test runs as a plain script: plain functions (no pytest fixtures), every one listed in the explicit "
+                   "`TESTS = [...]` list, and the file ends with the `if __name__ == \"__main__\":` block that prints one "
+                   "`RESULT <name> PASS|FAIL <Type>: <msg>` line per test and exits 1 on any failure (the skeleton has it: keep it).")
+    return (f"""Write ONLY the test file `{spec['test_file']}`. Do not edit any other file. Run it with: {spec['test_cmd']}
+
+TASK (the behaviour to pin):
+{ttxt}
+
+The reference fix (a diff you must NOT apply; the test must FAIL on the baseline and PASS once this diff is applied):
+{chr(10).join(diffs)}
+Rules:
+- 2 to {DRAFT_MAX_TESTS} tests, one per behaviour the diff changes. Each assertion must fail on the baseline for the reason the TASK describes (not an import error or NameError).
+- EVERY hunk of the reference diff must be needed: removing any one hunk must make some test fail. Aim at each changed line.
+- Assert exact values, not just truthiness or that the call returns. No mocking of the function under test.
+- Run the code and assert on what it does. Never read its source (open/read_text/inspect.getsource/ast.parse) and assert a string or call is in it: that is rejected.
+- No sys.exit(0), bare except, skipped or empty tests. Tests must pass in reverse order.{harness}
+- The checks run your test contained: a throwaway HOME, no writes outside the temp dir and the work dir, no connections to services
+  that were already running. Find files relative to the test file (Path(__file__).parent), keep any state in a temp dir.
+""")
+
+
+def cmd_prompt(a):
+    sp, spec, rd = load(a.spec, a.ref)
+    print(build_prompt(sp, spec, rd))
+    return 0
+
+
+def cmd_emit(a):
+    """Write a test_draft job dir for mini-submit: baseline without the test, TASK.md = the drafting brief, spec with phase_a_only and the
+    acceptance command. Submit with: MINI_TESTDRAFT_MODE=on mini-submit OUT/spec.json --label <area>-test-draft --model <m>."""
+    sp, spec, rd = load(a.spec, a.ref)
+    if spec.get("steps"):
+        print("REFUSED: step-chained specs are not supported yet")
+        return 2
+    if not guard(spec, False):
+        return 2
+    out = Path(a.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        print(f"{out} is not empty")
+        return 2
+    out.mkdir(parents=True, exist_ok=True)
+    src = Path(os.path.expanduser(spec["baseline_from"]))
+    base = out / "base"
+    shutil.copytree(src, base, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    (base / spec["test_file"]).unlink(missing_ok=True)
+    for gcmd in (["init", "-q"], ["config", "user.email", "t@localhost"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"], ["add", "-A"],
+                 ["commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", str(base), *gcmd], capture_output=True)
+    (out / "TASK.md").write_text(build_prompt(sp, spec, rd))
+    me = Path(os.path.realpath(__file__))
+    extra = " --mutmut-pythonpath " + " ".join(a.mutmut_pythonpath) if a.mutmut_pythonpath else ""
+    s2 = {**spec, "mode": "two-phase", "baseline_from": str(base), "task": str(out / "TASK.md"), "ref": str(rd), "phase_a_only": True,
+          "draft_accept_cmd": f"{sys.executable} {me} check {sp} --ref {rd} --draft {{draft}}{extra}",
+          # a rejected draft is retried with the check's findings (runner, phase_a_only): room for 3 drafting attempts
+          "test_attempts": max(int(spec.get("test_attempts", 0) or 0), 3), "timeout": max(int(spec.get("timeout", 0) or 0), 3000)}
+    (out / "spec.json").write_text(json.dumps(s2, indent=1))
+    print(f"emitted {out}/spec.json")
+    return 0
+
+
+def main(argv=None):
+    if os.environ.get("MINI_TESTDRAFT", "on") == "off":
+        print("disabled (MINI_TESTDRAFT=off)")
+        return 2
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("spec")
+    c.add_argument("--draft", required=True)
+    c.add_argument("--ref")
+    c.add_argument("--keep", action="store_true")
+    c.add_argument("--shadow", action="store_true")
+    c.add_argument("--min-mutation", type=float, default=0.7, help="required mutation score on the changed functions (0 disables); plan threshold 0.70")
+    c.add_argument("--allow-unscored", action="store_true", help="do not fail when the mutation tool is missing or produced nothing")
+    c.add_argument("--max-mutants", type=int, default=60, help="line-scoped scorer: cap (evenly sampled) on mutants run")
+    c.add_argument("--mutmut-pythonpath", nargs="*", default=[], help="repo-relative dirs added to PYTHONPATH for mutmut (e.g. lib)")
+    e = sub.add_parser("emit")
+    e.add_argument("spec")
+    e.add_argument("--out", required=True)
+    e.add_argument("--ref")
+    e.add_argument("--mutmut-pythonpath", nargs="*", default=[])
+    p = sub.add_parser("prompt")
+    p.add_argument("spec")
+    p.add_argument("--ref")
+    a = ap.parse_args(argv)
+    return {"check": cmd_check, "prompt": cmd_prompt, "emit": cmd_emit}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

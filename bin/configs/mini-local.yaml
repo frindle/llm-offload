@@ -1,0 +1,193 @@
+# Overlay on mini.yaml: use as `mini -c mini.yaml -c ~/bin/configs/mini-local.yaml`
+agent:
+  instance_template: |
+    Please solve this issue: {{task}}
+
+    ## Project rules (these override the workflow below)
+
+    - The task text says which command checks your work. Run it after every edit. Do not submit until it gives the result the task asks for.
+    - Make the smallest change that satisfies the task. Edit only the files the task names. Do not create any file the task does not name, and keep throwaway helper scripts outside the repository (in /tmp). Never use /tmp to stage edits to the files you may change: edit those files in place, in small edits, and run the test after each.
+    - If a file, module or function that the task says already exists is MISSING, stop. Do NOT create or stub it. Submit with a final message that begins MISSING: and names it.
+    - Do not add routes, models, parameters or behaviour that the task does not ask for.
+    - Never run git add, git commit or git stash.
+
+    You can execute bash commands and edit files to implement the necessary changes.
+
+    ## Recommended Workflow
+
+    This workflow should be done step-by-step so that you can iterate on your changes and any possible problems.
+
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases to ensure your fix is robust
+    6. Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+    - Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+      Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    Example of a CORRECT response:
+    <example_response>
+    I need to understand the structure of the repository first. Let me check what files are in the current directory to get a better understanding of the codebase.
+
+    [Makes bash tool call with {"command": "ls -la"} as arguments]
+    </example_response>
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+
+    ## Useful command examples
+
+    ### Create a new file:
+
+    ```bash
+    cat <<'EOF' > newfile.py
+    import numpy as np
+    hello = "world"
+    print(hello)
+    EOF
+    ```
+
+    ### Edit files with sed:
+
+    {%- if system == "Darwin" -%}
+    <important>
+    You are on MacOS (BSD sed): use `sed -i ''` instead of `sed -i`. Only the single-line substitutions below work; for multi-line or line-range replacements use a small python3 heredoc that reads the file, replaces an exact string and writes it back.
+    </important>
+    {%- endif -%}
+
+    ```bash
+    # Replace all occurrences
+    sed -i 's/old_string/new_string/g' filename.py
+
+    # Replace only first occurrence
+    sed -i 's/old_string/new_string/' filename.py
+
+    # Replace first occurrence on line 1
+    sed -i '1s/old_string/new_string/' filename.py
+
+    # Replace all occurrences in lines 1-10
+    sed -i '1,10s/old_string/new_string/g' filename.py
+    ```
+
+    ### View file content:
+
+    ```bash
+    # View specific lines with numbers
+    nl -ba filename.py | sed -n '10,20p'
+    ```
+
+    ### Any other command you want to run
+
+    ```bash
+    anything
+    ```
+  step_limit: 60
+  cost_limit: 0.0
+  mode: yolo
+environment:
+  timeout: 300
+model:
+  # Context control (mini_ext/mini_ctx.py, API-bound copy only): old tool output shrunk, 32k-token ceiling. strip_old_thinking drops
+  # old `<think>` text and deviates from the model card (preserve_thinking), so it stays off until the owner approves it.
+  model_class: mini_ctx.CtxLitellmModel
+  strip_old_thinking: false
+  shrink_obs: true
+  stable_prefix: true  # ON: Darkbloom prefix-caches (verified 2026-10-16: 14s cold vs 1.2s warm); default shrink rewrote the prefix every turn and killed the cache. Shrinks old output in blocks so the prompt prefix is append-only.
+  ceiling_tokens: 32000
+  # Observation cap (upstream: 10000 chars, head 5000 + tail 5000). A 35B model at ~39k prompt tokens per call timed out
+  # mini6-amz-photo, with full `node --test` TAP / pytest output piling into the context each run. Here: under 3000 chars as is (4500 when it is not test-runner output);
+  # bigger test-runner output (TAP, node spec reporter, pytest) is cut to failing tests + error/expected/actual lines + totals
+  # (max 40 lines of failures, 300 chars each, then the totals always); other output under 4500 chars is passed whole (a 100-line `nl -ba | sed -n` read
+  # fits); bigger is head 1200 + tail 2300 (3500 total < 4500, so head and tail never overlap).
+  observation_template: |
+    {%- set out = output.output -%}
+    {%- set ns = namespace(keep=[], tot=[], blk=false, ind=0, n=0) -%}
+    {%- if out | length >= 3000 and ("TAP version" in out or "# tests " in out or "ℹ tests" in out or "test session starts" in out) -%}
+    {%- for ln in out.splitlines() -%}
+    {%- set t = ln.strip() -%}
+    {%- set ind = ln | length - ln.lstrip() | length -%}
+    {%- if ns.blk and (not t or ind > ns.ind) -%}
+    {%- if t and ns.n < 10 -%}{%- set ns.keep = ns.keep + [ln[ns.ind:][:300]] -%}{%- endif -%}
+    {%- set ns.n = ns.n + (1 if t else 0) -%}
+    {%- else -%}
+    {%- set ns.blk = false -%}
+    {%- set key = t.split(":")[0] -%}
+    {%- if t.startswith("# tests") or t.startswith("# pass") or t.startswith("# fail") or t.startswith("# cancelled") or t.startswith("ℹ tests") or t.startswith("ℹ pass") or t.startswith("ℹ fail") or t.startswith("ℹ cancelled") or (t.startswith("=") and (" passed" in t or " failed" in t)) -%}
+    {%- set ns.tot = ns.tot + [t[:300]] -%}
+    {%- elif t.startswith("not ok") or t.startswith("error:") or t.startswith("expected:") or t.startswith("actual:") or t.startswith("message:") or t.startswith("code:") or t.startswith("name:") or t.startswith("location:") or t.startswith("test at ") or t.startswith("✖") or t.startswith("E  ") or t.startswith("FAILED") or t.startswith("AssertionError") or (not t.startswith("at ") and " " not in key.split("[")[0].strip() and key.split("[")[0].strip().endswith("Error") and ":" in t) -%}
+    {%- set ns.keep = ns.keep + [t[:300]] -%}
+    {%- if t in ["error:", "expected:", "actual:"] or t.startswith("error: |") or t.startswith("expected: |") or t.startswith("actual: |") -%}
+    {%- set ns.blk = true -%}{%- set ns.ind = ind -%}{%- set ns.n = 0 -%}
+    {%- endif -%}
+    {%- endif -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {%- endif -%}
+    {%- if out | length < 3000 -%}
+    {
+      "returncode": {{ output.returncode }},
+      "output": {{ out | tojson }}
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- elif ns.keep -%}
+    {
+      "returncode": {{ output.returncode }},
+      "output_summary": {{ (ns.keep[:40] + ns.tot) | join("\n") | tojson }},
+      "elided_chars": {{ out | length }},
+      "warning": "Test output summarised to the failing tests, their error/expected/actual lines and the totals. For more, rerun with `| grep -n PATTERN` or `| tail -40`."
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- elif out | length < 4500 -%}
+    {
+      "returncode": {{ output.returncode }},
+      "output": {{ out | tojson }}
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- else -%}
+    {
+      "returncode": {{ output.returncode }},
+      "output_head": {{ out[:1200] | tojson }},
+      "output_tail": {{ out[-2300:] | tojson }},
+      "elided_chars": {{ out | length - 3500 }},
+      "warning": "Output too long: pipe through `grep -n` or `tail -40`."
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+    {%- endif -%}
+  # qwen3.6 "thinking for precise coding" preset: model_profiles.yaml (qwen3.6 card L664), via model_profile.build_request_fields
+  # No-think (spec key `no_think`, default OFF; bool or {A,B,single}): the runner adds `-c model.model_kwargs.extra_body.chat_template_kwargs.
+  # enable_thinking=false` for that run. Probed 2026-10-16: Darkbloom honours it (3 completion tokens vs 126 with a thinking preamble).
+  # The card's instruct sampling (temp 0.7 / top_p 0.8 / presence 1.5) is NOT applied automatically; the sampling below stays as is.
+  model_kwargs:
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 12288
+    timeout: 900
+    presence_penalty: 1.0
+    extra_body:
+      top_k: 20
+      repetition_penalty: 1.0
+      chat_template_kwargs: {enable_thinking: true, preserve_thinking: true}

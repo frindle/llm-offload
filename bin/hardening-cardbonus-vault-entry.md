@@ -1,0 +1,5 @@
+## 2026-10-14 card-bonus pipeline root-cause hardening (machine-config e8ef63d)
+- 1a53991 invented tiers: cause = placeholder --intent, no intent validation; traceability leaks (test titles as setup data, bare decimals allowlisted); relevance only measures vs the model's own refimpl. Fix: intent_defect (AUTO_INTENT_CHECK), spec_conformance.py, leaks closed (DISPATCH_TRACE_TITLES/DECIMALS).
+- v2 stuck 29/40 +0 kills: bare-line survivors, 5/11 equivalent, no-edit prose-runaway round. Fix: mutant_sweep.py excludes proven-equivalent survivors + attaches witness inputs (VR_SWEEP_EQUIV_EXCLUDE, MUTANT_SWEEP); no-edit re-feed built but default OFF (MUTFB_NOOP_RETRIES=0; canary seam mutfb pins stop).
+- Stage-check zero-diff override: stage re-dispatched while green -> AUTO_STAGE_GREEN_AFTER_FAIL. Prune 196a86a verified.
+- Tests test-mutant-sweep, test-auto-cardbonus-fixes, test-trace-invented-constants (revert-checks bite); canary 250/250; seams in ~/bin/hardening-cardbonus-seams.md (canary not edited). Pre-existing: backtest voicemail-ui-s1-schema contract-broken, independent of these changes.

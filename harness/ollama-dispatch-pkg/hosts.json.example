@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to $OLLAMA_DISPATCH_HOME/hosts.json (default ~/.ollama-dispatch/hosts.json) and edit. Each host has a URL and an optional usable_bytes budget (bytes of model weights the host can hold). 'primary' is the preferred/big-budget host (config.BIG_HOST_NAME, override with OLLAMA_DISPATCH_PRIMARY_HOST). Other hosts are overflow capacity, used only when a model provably fits their usable_bytes. usable_bytes=null means 'unmeasured' -- such a host is never chosen by auto-routing.",
+  "hosts": {
+    "primary": {
+      "url": "http://127.0.0.1:11434",
+      "usable_bytes": 47000000000
+    },
+    "gpu-node": {
+      "url": "http://ollama-host.example.lan:11434",
+      "usable_bytes": 10000000000
+    }
+  }
+}

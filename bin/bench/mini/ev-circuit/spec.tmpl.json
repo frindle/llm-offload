@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "max_charge_amps"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

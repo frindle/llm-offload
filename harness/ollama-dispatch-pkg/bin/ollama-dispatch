@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin launcher for the one-command orchestrator.
+# Runs the package from the repo root regardless of where it is invoked.
+exec python3 -m ollama_dispatch.cli "$@"

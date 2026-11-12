@@ -1,0 +1,10 @@
+{
+ "args": [
+  "--fn",
+  "kmToMiles",
+  "--fn",
+  "milesToKm"
+ ],
+ "intake": "local-ready",
+ "steps": 2
+}

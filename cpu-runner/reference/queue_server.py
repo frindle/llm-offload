@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Reference implementation of the queue-side `cpu` job API (stdlib, in-memory).
+
+This is the contract the real queue (ollama-queue-api.py) must implement; the
+tests run the agent and client against it. State is in-memory; the real queue
+would persist rows in ollama-queue-state.json under its flock.
+Auth: `Authorization: Bearer <token>` on every request except GET /api/cpu/health.
+
+Model hold: while the queue host's models are unavailable (`Store.model_hold`, the real queue's Darkbloom Sandbox
+hold), spec.llm jobs stay pending (other jobs are still claimed), their view says why, and a relay call from a job
+already running gets 503 `sandbox_hold` with Retry-After. The real queue first waits for the hold to lift.
+
+Runner limits (agent README "Disk use"): a claim says what it can take, `accept` "all" | "plain" (no lane job, i.e.
+none with spec.setup or spec.llm) | "lane" (lane jobs only) | "none" (absent = "all"), and why the runner takes less
+work, `hold` {"all": why, "lane": why, "plain": why}. A pending job's `waiting` gives those reasons once every
+online runner is held for it. The claim's `lane_max` and `disk` (the runner's usage report) are kept for the
+dashboard. `Store.ignore_accept` makes this server behave like a queue from before `accept` (it hands out the
+oldest pending job regardless).
+"""
+import base64, json, re, secrets, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MAX_ATTEMPTS = 3
+RUNNER_FRESH_S = 180        # a runner that has not polled for this long is not online
+HOLD_WAITING = "darkbloom sandbox hold: model jobs wait until it is released"
+HOLD_ERROR = "darkbloom sandbox hold: the queue host's models are unloaded until the hold is released"
+PER_ATTEMPT = ("log", "phase", "progress", "artifacts", "llm_calls", "llm_errors", "llm_held")
+
+
+def is_lane(spec):
+    """A lane job (spec.setup / spec.llm): what a claim's accept "plain" and a runner's hold "lane" leave out."""
+    return bool(spec.get("setup") or spec.get("llm"))
+
+
+class Store:
+    def __init__(self, token, clock=time.time):
+        self.token, self.clock = token, clock
+        self.jobs, self.order = {}, []
+        self.lock = threading.Lock()
+        self.runner_seen = {}
+        self.runner_caps = {}       # runner_id -> last capability report (claim body `caps`)
+        self.codes = set()          # live single-use enrollment codes
+        self.config = {"concurrency": 2, "lease_s": 60}
+        self.enrolled = []
+        # spec.llm: where /api/cpu/jobs/<id>/llm/v1/... is forwarded (an OpenAI-style base URL ending in /v1) and the
+        # key added on the way. Only the queue side ever holds the key.
+        self.llm_upstream = None
+        self.llm_key = None
+        self.model_hold = False     # True: the models are unavailable; spec.llm jobs wait (see the module doc)
+        self.runner_hold = {}       # runner_id -> its last claim's `hold` ({} = none)
+        self.runner_lane_max = {}   # runner_id -> its last claim's `lane_max`
+        self.runner_disk = {}       # runner_id -> its last usage report (claim `disk`)
+        self.ignore_accept = False  # True: act like a queue from before `accept` (see the module doc)
+
+    def waiting(self, j):
+        """Why a pending job is not being claimed (None: a runner that may take it is online, it is just queued)."""
+        if j["spec"].get("llm") and self.model_hold:
+            return HOLD_WAITING
+        online = [r for r, t in self.runner_seen.items() if t >= self.clock() - RUNNER_FRESH_S]
+        if not online:
+            return "no runner online"
+        why = []
+        for r in online:
+            h = self.runner_hold.get(r) or {}
+            w = h.get("all") or (h.get("lane") if is_lane(j["spec"]) else h.get("plain"))
+            if not w:
+                return None
+            why.append("%s: %s" % (r, w) if len(online) > 1 else w)
+        return "; ".join(why)
+
+    def reap(self):
+        """Lease expiry: running jobs whose lease lapsed go back to pending (or failed_infra)."""
+        now = self.clock()
+        for j in self.jobs.values():
+            if j["status"] == "running" and j["lease_expires"] < now:
+                j["events"].append(("lease_expired", j["runner_id"], now))
+                j["lease_token"] = j["runner_id"] = None
+                if j["attempt"] >= MAX_ATTEMPTS:
+                    j["status"] = "failed_infra"
+                    j["result"] = {"exit_code": None, "infra_error": "lease expired %d times" % j["attempt"]}
+                else:
+                    j["status"] = "pending"
+
+
+class H(BaseHTTPRequestHandler):
+    store = None
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body=None, raw=None, ctype=None, headers=None):
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else b"")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype or ("application/octet-stream" if raw is not None else "application/json"))
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _llm(self, jid, sub, method):
+        """spec.llm relay target: check the job and its lease, then forward to the upstream with the key."""
+        S = self.store
+        body = self._body() if method == "POST" else None
+        with S.lock:
+            S.reap()
+            j = S.jobs.get(jid)
+            if j is None:
+                return self._send(404, {"error": "not found"})
+            if j["status"] != "running" or not j["lease_token"] or \
+                    self.headers.get("X-Lease-Token") != j["lease_token"]:
+                return self._send(409, {"error": "lease lost"})
+            if not j["spec"].get("llm"):
+                return self._send(403, {"error": "job did not ask for llm"})
+            if (method, sub) not in (("POST", "chat/completions"), ("GET", "models")):
+                return self._send(405, {"error": "method not allowed"})
+            j["llm_calls"] = j.get("llm_calls", 0) + 1
+            if S.model_hold:
+                j["llm_held"] = j.get("llm_held", 0) + 1
+                return self._send(503, {"error": {"message": HOLD_ERROR, "type": "sandbox_hold", "code": "sandbox_hold"}},
+                                  headers={"Retry-After": "30"})
+            upstream, key = S.llm_upstream, S.llm_key
+
+        def failed(code, **kw):     # an answer the job's call did not get through on: counted as an llm error
+            with S.lock:
+                j["llm_errors"] = j.get("llm_errors", 0) + 1
+            return self._send(code, **kw)
+        if not upstream:
+            return failed(503, body={"error": "no llm upstream configured"})
+        req = urllib.request.Request(upstream.rstrip("/") + "/" + sub, data=body, method=method)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                return self._send(r.status, raw=r.read(), ctype=r.headers.get("Content-Type") or "application/json")
+        except urllib.error.HTTPError as e:
+            return failed(e.code, raw=e.read(), ctype=e.headers.get("Content-Type") or "application/json")
+        except Exception as e:
+            return failed(502, body={"error": "upstream unreachable: %s" % type(e).__name__})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def _json(self):
+        b = self._body()
+        return json.loads(b) if b else {}
+
+    def _route(self, method):
+        S = self.store
+        path = self.path.split("?")[0]
+        if path == "/api/cpu/health":
+            return self._send(200, {"ok": True})
+        if method == "POST" and path == "/api/cpu/enroll":
+            b = self._json()
+            with S.lock:
+                ok = b.get("code") in S.codes
+                S.codes.discard(b.get("code"))
+                if ok:
+                    S.enrolled.append(b.get("runner_id"))
+            if not ok:
+                return self._send(403, {"error": "invalid, expired or already used enrollment code"})
+            return self._send(200, {"token": S.token, "runner_id": b.get("runner_id"), "config": S.config})
+        if self.headers.get("Authorization") != "Bearer " + S.token:
+            return self._send(401, {"error": "unauthorized"})
+        m = re.match(r"^/api/cpu/jobs/([0-9a-f]+)/llm/v1/(chat/completions|models)$", path)
+        if m:
+            return self._llm(m.group(1), m.group(2), method)
+        with S.lock:
+            S.reap()
+            if method == "POST" and path == "/api/cpu/jobs":
+                b = self._json()
+                jid = uuid.uuid4().hex
+                S.jobs[jid] = {"id": jid, "spec": b["spec"], "status": "uploading", "attempt": 0,
+                               "blobs": {}, "result": None, "lease_token": None, "runner_id": None,
+                               "lease_expires": 0, "cancel": False, "events": [],
+                               "label": b.get("label"), "created": S.clock()}
+                S.order.append(jid)
+                return self._send(201, {"id": jid})
+            if method == "POST" and path == "/api/cpu/claim":
+                b = self._json()
+                rid = b.get("runner_id")
+                S.runner_seen[rid] = S.clock()
+                if isinstance(b.get("caps"), dict):
+                    S.runner_caps[rid] = b["caps"]
+                hold = b.get("hold") if isinstance(b.get("hold"), dict) else {}
+                S.runner_hold[rid] = {k: str(v)[:300] for k, v in hold.items() if k in ("all", "lane", "plain") and v}
+                if isinstance(b.get("lane_max"), int):
+                    S.runner_lane_max[rid] = b["lane_max"]
+                if isinstance(b.get("disk"), dict):
+                    S.runner_disk[rid] = dict(b["disk"])
+                accept = "all" if S.ignore_accept or b.get("accept") not in ("plain", "lane", "none") else b["accept"]
+                if accept == "none":
+                    return self._send(204)
+                for jid in S.order:
+                    j = S.jobs[jid]
+                    if j["status"] == "pending" and not j["cancel"] and not (j["spec"].get("llm") and S.model_hold) \
+                            and not (accept == "plain" and is_lane(j["spec"])) \
+                            and not (accept == "lane" and not is_lane(j["spec"])):
+                        for k in PER_ATTEMPT:       # each attempt starts clean: an earlier one's output is not its
+                            j.pop(k, None)
+                        j["status"] = "running"
+                        j["attempt"] += 1
+                        j["runner_id"] = b["runner_id"]
+                        j["lease_token"] = secrets.token_hex(8)
+                        j["lease_expires"] = S.clock() + int(b.get("lease_s") or 60)
+                        j["events"].append(("claimed", b["runner_id"], S.clock()))
+                        spec = dict(j["spec"], has_patch="patch" in j["blobs"], has_tools="tools" in j["blobs"])
+                        return self._send(200, {"job": {"id": jid, "spec": spec, "attempt": j["attempt"],
+                                                        "lease_token": j["lease_token"]}})
+                return self._send(204)
+            if method == "GET" and path == "/api/cpu/config":
+                return self._send(200, {"config": S.config})
+            if method == "GET" and path == "/api/cpu/runners":
+                return self._send(200, {"runners": S.runner_seen})
+            m = re.match(r"^/api/cpu/jobs/([0-9a-f]+)(?:/(\w+))?$", path)
+            if not m or m.group(1) not in S.jobs:
+                return self._send(404, {"error": "not found"})
+            j, sub = S.jobs[m.group(1)], m.group(2)
+            if sub is None and method == "GET":
+                live = j["status"] in ("pending", "running")
+                return self._send(200, {"id": j["id"], "status": j["status"], "attempt": j["attempt"],
+                                        "result": j["result"], "runner_id": j["runner_id"],
+                                        "phase": j.get("phase"), "progress": j.get("progress"),
+                                        "log_size": len(j.get("log") or b""), "has_artifacts": "artifacts" in j,
+                                        "llm_calls": j.get("llm_calls", 0), "llm_errors": j.get("llm_errors", 0),
+                                        "llm_held": j.get("llm_held", 0),
+                                        "model_hold": bool(j["spec"].get("llm")) and live and S.model_hold,
+                                        "waiting": S.waiting(j) if j["status"] == "pending" else None})
+            if sub == "log" and method == "GET":
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    off = max(0, int((q.get("off") or ["0"])[0]))
+                except ValueError:
+                    return self._send(400, {"error": "bad off"})
+                log = bytes(j.get("log") or b"")
+                return self._send(200, raw=log[off:], headers={"X-Log-Size": str(len(log))})
+            if sub == "log" and method == "POST":
+                b = self._json()
+                if j["status"] != "running" or j["lease_token"] != b.get("lease_token"):
+                    return self._send(409, {"error": "lease lost"})
+                log = j.setdefault("log", bytearray())
+                try:
+                    off, data = int(b.get("off")), base64.b64decode(b.get("data_b64") or "")
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad log chunk"})
+                if off > len(log):
+                    return self._send(416, {"error": "gap", "size": len(log)})
+                log += data[len(log) - off:]          # an overlap (a resent chunk) appends only what is new
+                for k in ("phase", "progress"):
+                    if isinstance(b.get(k), str):
+                        j[k] = b[k][:200]
+                return self._send(200, {"ok": True, "size": len(log)})
+            if sub == "artifacts":
+                if method == "PUT":
+                    if j["status"] != "running" or j["lease_token"] != self.headers.get("X-Lease-Token"):
+                        return self._send(409, {"error": "lease lost"})
+                    j["artifacts"] = self._body()
+                    return self._send(200, {"ok": True, "bytes": len(j["artifacts"])})
+                if method == "GET" and "artifacts" in j:
+                    return self._send(200, raw=j["artifacts"])
+                return self._send(404, {"error": "no artifacts"})
+            if sub is None and method == "DELETE":
+                j["cancel"] = True
+                if j["status"] in ("pending", "uploading"):
+                    j["status"] = "cancelled"
+                return self._send(200, {"ok": True})
+            if sub in ("payload", "patch", "tools"):
+                if method == "PUT":
+                    j["blobs"][sub] = self._body()
+                    return self._send(200, {"ok": True, "bytes": len(j["blobs"][sub])})
+                if method == "GET" and sub in j["blobs"]:
+                    return self._send(200, raw=j["blobs"][sub])
+                return self._send(404, {"error": "no blob"})
+            if sub == "ready" and method == "POST":
+                if "payload" not in j["blobs"]:
+                    return self._send(400, {"error": "payload missing"})
+                if j["status"] == "uploading":
+                    j["status"] = "pending"
+                return self._send(200, {"ok": True})
+            if sub in ("heartbeat", "result", "release") and method == "POST":
+                b = self._json()
+                if j["status"] != "running" or j["lease_token"] != b.get("lease_token"):
+                    return self._send(409, {"error": "lease lost"})
+                if sub == "heartbeat":
+                    j["lease_expires"] = S.clock() + int(b.get("lease_s") or 60)
+                    for k in ("phase", "progress"):
+                        if isinstance(b.get(k), str):
+                            j[k] = b[k][:200]
+                    return self._send(200, {"ok": True, "cancel": j["cancel"]})
+                if sub == "release":
+                    j["status"], j["lease_token"], j["runner_id"] = "pending", None, None
+                    return self._send(200, {"ok": True})
+                j["result"] = {k: v for k, v in b.items() if k != "lease_token"}
+                j["status"] = "failed_infra" if b.get("infra_error") else "done"
+                if b.get("infra_error") and j["attempt"] < MAX_ATTEMPTS and b.get("infra_error") == "isolation_unavailable":
+                    j["status"], j["result"] = "pending", None
+                return self._send(200, {"ok": True})
+        return self._send(404, {"error": "no route"})
+
+    def do_GET(self): self._route("GET")
+    def do_POST(self): self._route("POST")
+    def do_PUT(self): self._route("PUT")
+    def do_DELETE(self): self._route("DELETE")
+
+
+def serve(token, host="127.0.0.1", port=0):
+    store = Store(token)
+    handler = type("Handler", (H,), {"store": store})
+    srv = ThreadingHTTPServer((host, port), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, store
+
+
+if __name__ == "__main__":
+    import sys
+    srv, _ = serve(sys.argv[1], "0.0.0.0", int(sys.argv[2]) if len(sys.argv) > 2 else 7685)
+    print("listening", srv.server_address, flush=True)
+    threading.Event().wait()

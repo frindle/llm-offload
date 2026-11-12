@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-dispatch-mcp"
+version = "0.1.0"
+description = "MCP server for safe, measurable dispatch to local inference hosts: host-readiness gating, claim-vs-verify enforcement, and a routing table that ships with its own falsification status."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["mcp", "llm", "ollama", "dispatch", "evaluation"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+]
+dependencies = ["mcp>=1.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+agent-dispatch-mcp = "agent_dispatch_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_dispatch_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/agent_dispatch_mcp/data" = "agent_dispatch_mcp/data"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

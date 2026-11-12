@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""doc-summary FILE.pdf --scenario "who I am / what I need to know / what I'm deciding" [--ctx N]
+
+Copies the PDF into the private dir (~/Documents/doc-summaries/private/<id>/, mode 700), queues a local Darkbloom
+summary job on whatever model Darkbloom has loaded (never chosen by the user) (label docsum-<id>), prints only the opaque id and where the PDF/Markdown will appear. Nothing about the
+document or scenario is sent to the queue row, logs or this program's output.
+"""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import docsum_cli  # noqa: E402
+
+PRIVATE_ROOT = os.path.expanduser("~/Documents/doc-summaries/private")
+QUEUE = os.path.expanduser("~/bin/ollama-queue.py")
+RUNNER = os.path.expanduser("~/bin/docsum_run.py")
+
+
+def build_enqueue_cmd(job, model, ctx, python=None):
+    cmd = [python or sys.executable, QUEUE, "enqueue", "--runner", RUNNER, "--task-kind", "research",
+           "--label", "docsum-" + job["job_id"], "--bundle", "docsum", "--model", model, "--host", "auto",
+           "--cwd", job["dir"], "--task-file", job["task_file"]]
+    return cmd + (["--num-ctx", str(ctx)] if ctx else [])
+
+
+def main(argv=None):
+    try:
+        a = docsum_cli.parse_args(sys.argv[1:] if argv is None else argv)
+        model = docsum_cli.current_model()
+        job = docsum_cli.prepare_job(a["pdf"], a["scenario"], PRIVATE_ROOT)
+    except ValueError as e:
+        print("doc-summary: %s" % e, file=sys.stderr)
+        return 2
+    r = subprocess.run(build_enqueue_cmd(job, model, a["ctx"]), capture_output=True, text=True)
+    if r.returncode != 0:
+        print("doc-summary: E_ENQUEUE rc=%d (job dir kept: %s)" % (r.returncode, job["dir"]), file=sys.stderr)
+        return 1
+    print("job %s queued (label docsum-%s)" % (job["job_id"], job["job_id"]))
+    print("result (private): %s/summary.pdf and summary.md" % job["dir"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

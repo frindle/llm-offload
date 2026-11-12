@@ -1,0 +1,110 @@
+#!/bin/bash
+# Re-dispatch of qwen2.5-coder:14b on Mac Studio, both tasks.
+#
+# Why: the macstudio driver computes its worktree slug with `tr '/:' '-'`,
+# which converts ':' and '/' but NOT dots -- so it looked for
+# "qwen2.5-coder-14b" while the actual worktree is "qwen2-5-coder-14b"
+# (created earlier, when dots were also converted). run_task silently
+# SKIPs on a missing worktree, so both tasks vanished at 13:37 on
+# 2026-08-22 with no error and no results.csv row -- the model simply
+# isn't in the data.
+#
+# The 7B-round worktrees (qwen2.5-coder-7b-macstudio) preserve dots, so
+# the naming convention changed partway through the session and only the
+# two older dotted models were affected: qwen2.5-coder:14b (lost, this
+# script) and qwen3.8:27b-q8_0 (caught before its turn -- compatibility
+# symlinks now exist for both slugs, so the live driver resolves them).
+#
+# Settings copied verbatim from bakeoff-driver-macstudio-remaining.sh for
+# this model: 32768 context (the `*)` default -- it does not match the
+# deepseek/MFDoom 131072 case), --temperature 0.6 --top-p 0.95 --top-k 20
+# (the `qwen*` case), NO --manual-tools (native tool-calling works), and
+# no retry nudge (that is qwen3.8-only).
+#
+# Chained behind the MFDoom re-dispatch so only one job uses the Mac
+# Studio at a time.
+set -uo pipefail
+
+BASE="/Users/user/Desktop/GitHub Projects"
+WT_BASE="$BASE/bakeoff-build-2026-08-22"
+OUTDIR="$BASE/model-buildoff-2026-08-22"
+HOST="http://localhost:11434"
+WORKER="/Users/user/bin/ollama-worker.py"
+MODEL="qwen2.5-coder:14b"
+SLUG="qwen2.5-coder-14b"
+TIMEOUT_S=1800
+
+DRIVER_LOG="$OUTDIR/driver.log"
+RESULTS_CSV="$OUTDIR/results.csv"
+
+TASK1_RESELL="Build a photo-upload feature for this resell-tracker web app, usable from mobile iOS devices (mobile-friendly UI, works well opened in Safari on an iPhone), that lets a user upload one or more images and match them to a specific order. This is mainly for gift card orders and coin orders/purchases -- the uploaded photos serve as a proof/record for those order types. Implement this as a real, working feature: a UI for uploading (ideally supporting camera/photo-library access on iOS), a way to associate the upload with a specific order, real storage of the uploaded images, and any necessary backend/API routes. Explore the existing codebase structure first (framework, styling conventions, API routes, database schema) and follow its existing patterns rather than inventing a new style.
+
+When you are done, respond with a short written summary (no further tool calls) describing exactly what you built, which files you created/changed, and any part of the feature you were not able to complete or verify."
+
+TASK2_CLAMSHELL="Build a new Swift module for this Clamshell project called ConfirmationBridge that implements challenge-signed remote confirmation using P-256 (ECDSA). Purpose: let a privileged action on the host require an explicit signed approval from a human physically at the client, not just anyone who can reach the host. This should be a standalone module, not yet wired into the real streaming protocol.
+
+Requirements:
+1. A device can produce a signed response to a challenge using a P-256 key.
+2. A correctly-signed response for a given challenge verifies successfully.
+3. A replayed signature/nonce (reusing a previous valid response) must be rejected.
+4. An expired challenge/nonce must be rejected -- the challenge has a limited validity window.
+
+Write a real, synchronous self-test that exercises all three properties end to end: a valid signature verifies, a replay is rejected, and a genuinely expired nonce is rejected (actually wait for the real expiry window to elapse -- do not simulate or fake the clock). Wire the self-test up so it is runnable (e.g. as a CLI subcommand or test target), consistent with how this project already organizes its code. Explore the existing codebase first (check main.swift and whether a Sources/Clamshell/Auth directory already exists) before writing new code."
+
+echo "[qwen25-14b-rerun] waiting for MFDoom re-dispatch to finish @ $(date '+%H:%M:%S')" >> "$DRIVER_LOG"
+while ! grep -aq "MFDOOM RE-DISPATCH COMPLETE" "$DRIVER_LOG"; do
+  sleep 30
+done
+
+run_task() {
+  local TASK_NAME="$1" TASK_TEXT="$2" REPO="$3" VERIFY="$4"
+  local WT_DIR="$WT_BASE/$REPO/$SLUG"
+  local LOG="$OUTDIR/$SLUG-$TASK_NAME-MACSTUDIO2-RERUN.log"
+
+  if [ ! -d "$WT_DIR" ]; then
+    echo "[qwen25-14b-rerun] ABORT (worktree still missing): $TASK_NAME -- $WT_DIR" >> "$DRIVER_LOG"
+    return
+  fi
+  if [ "$REPO" = "resell-tracker" ] && [ ! -x "$WT_DIR/node_modules/.bin/next" ]; then
+    echo "[qwen25-14b-rerun] ABORT: node_modules/.bin/next missing in $WT_DIR" >> "$DRIVER_LOG"
+    return
+  fi
+
+  git -C "$WT_DIR" reset --hard >/dev/null 2>&1
+  git -C "$WT_DIR" clean -fd >/dev/null 2>&1
+
+  local START_TS; START_TS=$(date +%s)
+  echo "[qwen25-14b-rerun] START: $MODEL / $TASK_NAME @ $(date '+%Y-%m-%d %H:%M:%S')" >> "$DRIVER_LOG"
+
+  python3 "$WORKER" \
+    --model "$MODEL" \
+    --host "$HOST" \
+    --cwd "$WT_DIR" \
+    --task "$TASK_TEXT" \
+    --verify "$VERIFY" \
+    --max-iters 30 \
+    --num-ctx 32768 \
+    --temperature 0.6 --top-p 0.95 --top-k 20 \
+    > "$LOG" 2>&1 &
+  local WORKER_PID=$!
+
+  ( sleep "$TIMEOUT_S" && kill -TERM "$WORKER_PID" 2>/dev/null ) &
+  local WATCHER_PID=$!
+
+  wait "$WORKER_PID" 2>/dev/null
+  local EXIT=$?
+  kill "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID" 2>/dev/null
+
+  local END_TS DUR TIMED_OUT FILES
+  END_TS=$(date +%s); DUR=$((END_TS - START_TS))
+  TIMED_OUT="false"; [ "$DUR" -ge "$TIMEOUT_S" ] && TIMED_OUT="true"
+  FILES=$(git -C "$WT_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+  echo "[qwen25-14b-rerun] DONE: $MODEL / $TASK_NAME exit=$EXIT dur=${DUR}s timedout=$TIMED_OUT files=$FILES" >> "$DRIVER_LOG"
+  echo "$MODEL-RERUN,$TASK_NAME,$EXIT,$DUR,$TIMED_OUT,$FILES" >> "$RESULTS_CSV"
+}
+
+run_task "resell-tracker-photo-upload" "$TASK1_RESELL" "resell-tracker" "npm run build"
+run_task "clamshell-confirmation-bridge" "$TASK2_CLAMSHELL" "clamshell" "swift build"
+
+echo "=== QWEN2.5-CODER:14B RE-DISPATCH COMPLETE @ $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$DRIVER_LOG"

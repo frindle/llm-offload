@@ -1,0 +1,106 @@
+# Overlay for two-phase phase A (write a failing test), on top of mini-local.yaml: `mini -c mini.yaml -c mini-local.yaml -c mini-testwrite.yaml`.
+# Only the instance template and the command timeout change. mini-local.yaml's template is the fix workflow ("Please solve this issue", "Edit the source
+# code to resolve the issue"); under it the 35B often fixed the code in phase A as well (50 live logs carry "phase A touched other
+# files (reverted)", e.g. arr-webhook.py 11x), spending the 30-step phase A budget on a fix that is reverted anyway.
+# The command timeout drops to 120 s (mini-local.yaml: 300). scrapy r2 5f2fbdc72e8e: the drafted test hung in reactor.run() and
+# every run of it took the full 300 s, so two runs used the attempt's wall; one test file finishes in seconds.
+environment:
+  timeout: 120
+agent:
+  instance_template: |
+    Please WRITE A FAILING TEST for this issue. This is the test-writing phase: do NOT fix the code; a later phase, in a fresh context, writes the fix against your test. {{task}}
+
+    ## Project rules (these override everything else)
+
+    - Create or edit only the test file the task names. Never edit, create or delete any other file: no `sed -i` on source, no python or shell that writes a source file. A changed source file is put back before your test is judged, so a fix made here is lost and your test is judged against the ORIGINAL code.
+    - The task text says which command runs your test. Run it after every edit. Every failing case must fail on an assertion about a concrete value for the reason the task gives (not on a crash, an import error or a timeout); any guard the task allows must PASS on the current code.
+    - Keep throwaway helper scripts outside the repository (in /tmp).
+    - If a file, module or function that the task says already exists is MISSING, stop. Do NOT create or stub it. Submit with a final message that begins MISSING: and names it.
+    - Never run git add, git commit or git stash.
+
+    You can execute bash commands and edit the test file.
+
+    ## Recommended Workflow
+
+    This workflow should be done step-by-step so that you can iterate on your test.
+
+    1. Read the code under test that the task names (grep -n, then read it by line range)
+    2. Write the test file the task names; it calls the real code
+    3. Run the task's test command and check that each case fails for the stated reason on the current code
+    4. Correct the TEST (never the code) until it does
+    5. Submit by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+    - Submit your test and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+      Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    Example of a CORRECT response:
+    <example_response>
+    I need to read the function under test before I write the test. Let me find where it is defined.
+
+    [Makes bash tool call with {"command": "grep -n 'def ' path/to/module.py | head -40"} as arguments]
+    </example_response>
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+
+    ## Useful command examples
+
+    ### Create the test file:
+
+    ```bash
+    cat <<'EOF' > path/to/test_file.py
+    import module_under_test
+    ...
+    EOF
+    ```
+
+    ### Edit the test file with sed:
+
+    {%- if system == "Darwin" -%}
+    <important>
+    You are on MacOS (BSD sed): use `sed -i ''` instead of `sed -i`. Only the single-line substitutions below work; for multi-line or line-range replacements use a small python3 heredoc that reads the file, replaces an exact string and writes it back.
+    </important>
+    {%- endif -%}
+
+    ```bash
+    # Replace all occurrences
+    sed -i 's/old_string/new_string/g' path/to/test_file.py
+
+    # Replace only first occurrence
+    sed -i 's/old_string/new_string/' path/to/test_file.py
+    ```
+
+    ### View file content:
+
+    ```bash
+    # View specific lines with numbers
+    nl -ba filename.py | sed -n '10,20p'
+    ```
+
+    ### Any other command you want to run
+
+    ```bash
+    anything
+    ```

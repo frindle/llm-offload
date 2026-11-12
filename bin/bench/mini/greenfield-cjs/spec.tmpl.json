@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "parseCards"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

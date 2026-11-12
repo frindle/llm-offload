@@ -1,0 +1,49 @@
+services:
+  ollama-queue:
+    build: .
+    # Or use a prebuilt image instead of build:
+    # image: ghcr.io/YOURNAME/ollama-queue-dashboard:latest
+    container_name: ollama-queue
+    ports:
+      - "7684:7684"                 # dashboard + API + /v1 LLM endpoint
+    environment:
+      # Set a token to require Authorization: Bearer <token> (or X-Api-Token)
+      # on every request. Leave unset only on a trusted network / behind a proxy.
+      QUEUE_API_TOKEN: "${QUEUE_API_TOKEN:-}"
+      # Fallback Ollama host for jobs that pin none. Set to one of your servers,
+      # e.g. http://host.docker.internal:11434 (Ollama on the Docker host).
+      OLLAMA_DEFAULT_HOST: "${OLLAMA_DEFAULT_HOST:-}"
+      # Optional. Comma-separated host substrings that are VRAM-limited, used
+      # only to bias model-fit auto-selection.
+      # OLLAMA_UNRAID_HOSTS: "192.0.2.15,gpu-box"
+      # Optional web-search/research + Obsidian dispatch logging (leave unset if unused).
+      # SEARXNG_HOST: "http://searxng:8080"
+      # OBSIDIAN_URL: "http://obsidian:27123"
+      # OBSIDIAN_TOKEN: "${OBSIDIAN_TOKEN:-}"
+    volumes:
+      - ./config:/config            # servers.json (edited via the Settings page)
+      - queue-data:/data            # queue state, logs, live logs (persisted)
+      # --- Target repos for the in-container coding feedback loop --------------
+      # The coding-dispatch verify/gate/review loop runs INSIDE this container, so
+      # it needs the repos it checks out and verifies mounted here (read-write:
+      # the queue creates a throwaway git worktree per job and runs `npm ci` /
+      # `prisma generate` / `tsc` / the project's tests against it). Point --repo
+      # (or --cwd) at a path under the mount. A repo's OWN deps install at verify
+      # time via the env-parity bootstrap; nothing is baked into the image.
+      # Example (edit to your host path):
+      # - /mnt/user/appdata/dispatch-repos:/repos
+    # Lets the container reach an Ollama running on the Docker HOST as
+    # http://host.docker.internal:11434. Remote LAN hosts (e.g.
+    # http://192.0.2.10:11434) are reached directly and need no special config.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+    # --- Alternative: host networking -------------------------------------
+    # If you prefer the container to share the host's network stack (so
+    # 127.0.0.1:11434 on the host is reachable and no port mapping is needed),
+    # comment out `ports:` and `extra_hosts:` above and uncomment:
+    # network_mode: host
+
+volumes:
+  queue-data:

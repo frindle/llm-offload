@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""mini-validate SPEC.json [--ref DIR] [--keep] | mini-validate --check-fresh SPEC.json
+
+Pre-submit validation of a mini-swe-runner two-phase job whose frozen test(s) and reference fix were written by Opus
+(design: ~/.ollama-dispatch/mini-swe-workflow-design.md, section b). Model-free. Writes VALIDATION.md next to the spec;
+queue-submit refuses a mini-swe-runner spec without a fresh passing one (`--check-fresh` is that check).
+
+Per step (a plain spec is one step), against a throwaway git copy of baseline_from with the earlier steps' reference applied:
+  V1 spec sane            mini-precheck (precheck_all)
+  V2 test static          test_static + G5 rules (globals() discovery, alias rebinding, undefined names, bare except, sys.exit(0))
+  V3 red, right reason    runner --check-only --try-test: per-test classification (G1)
+  V4 ref green            runner --check-only --try-fix FILE=ref: every fix gate (suite, fn_scope fail, no_hacks, red_without_fix...);
+                          FAIL too when suite_cmd is red at baseline, unless spec suite_baseline_red gives the reason
+  V5 hunks covered        ref minus each diff hunk: the test must go red for an allowed reason (blank/comment-only hunks skipped)
+  V6 sizing               <= 40 changed ref lines, <= 5 tests (--max-tests, up to 12: mini-testdraft check uses 10), fix_steps formula <= 80
+  V7 order independence   TEST_ORDER=reverse against the ref is green (or the test declares ORDER_DEPENDENT = True)
+  V8 rule coverage        the step TASK's `## Rule coverage`: every rule line names, in backticks, a test the frozen file defines;
+                          no section is a WARN only, as is a section with no bad/missing-input rule (mini_rule_coverage.py);
+                          skipped for a local-model draft (MINI_CONTAIN=1 or phase_a_only), whose test names are the model's
+
+Reference layout: spec["ref"] (or --ref) is a dir holding, per step, s<N>/<allowed file> (cumulative: step N's file includes
+steps 1..N-1), or for a plain spec <allowed file> directly.
+
+Before validating, the spec fields mini-submit's C4 demands are written into spec.json (so one run is enough; --no-fill skips it):
+red_ok [], baseline_green [], fn_scope "enforce" and target_fn (the baseline functions the ref edits) when missing; fix_steps raised
+to V6's formula and fix_wall to 20 s per step. Present but invalid values are left alone for V1 to name. Each fill is printed and
+listed in VALIDATION.md.
+"""
+import argparse
+import difflib
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+RUNNER = Path(os.environ.get("MINI_RUNNER") or HERE / "mini-swe-runner.py")
+DAEMON_PATH = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+MAX_LINES, MAX_TESTS, MAX_STEPS = 40, 5, 80
+FIX_JOB_MAX_TESTS = MAX_TESTS   # a VALIDATION.md made with a higher cap is refused by --check-fresh: it never admits a fix job
+
+
+def load_runner():
+    sp = importlib.util.spec_from_file_location("mini_swe_runner", RUNNER)
+    r = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(r)
+    return r
+
+
+def sha_file(p):
+    p = Path(os.path.expanduser(str(p)))
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing"
+
+
+def fingerprint(spec_path, spec, R):
+    """{label: sha} of the spec, every step's frozen test (in baseline_from) and every task file."""
+    out = {"spec": sha_file(spec_path)}
+    steps = R.merged_steps(spec) if spec.get("steps") else [spec]
+    for i, sp in enumerate(steps, 1):
+        base = Path(os.path.expanduser(sp.get("baseline_from", ".")))
+        out[f"test s{i} {sp.get('test_file')}"] = sha_file(base / sp.get("test_file", "?"))
+        t = sp.get("task")
+        if isinstance(t, str) and not R.is_inline_task(t):
+            tp = Path(os.path.expanduser(t))
+            out[f"task s{i} {tp.name}"] = sha_file(tp if tp.is_absolute() else Path(spec_path).parent / tp)
+    return out
+
+
+def load_coverage():
+    sp = importlib.util.spec_from_file_location("mini_rule_coverage", HERE / "mini_rule_coverage.py")
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    return m
+
+
+def task_text(sp, spec_path, R, base_dir=None):
+    """The step's task text: an inline task as is, else the file. A relative path is a file in the working tree, as the runner
+    reads it (so base_dir, the step's copy of baseline_from), else next to the spec. "" when unreadable (V1/V3 name it)."""
+    t = sp.get("task")
+    if not isinstance(t, str):
+        return ""
+    if R.is_inline_task(t):
+        return t
+    tp = Path(os.path.expanduser(t))
+    cands = [tp] if tp.is_absolute() else ([Path(base_dir) / tp] if base_dir else []) + [Path(spec_path).parent / tp]
+    for cand in cands:
+        try:
+            return cand.read_text()
+        except OSError:
+            continue
+    return ""
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args], capture_output=True, text=True)
+
+
+def scratch_base(src, dst, overlay):
+    """Throwaway git repo: baseline_from's tree (never its .git) + overlay {rel: source file}, committed."""
+    shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", "node_modules"))
+    # installed deps are linked, never copied: a node spec's typecheck_cmd (./node_modules/.bin/tsc) needs them in the scratch copy
+    for dep in (".venv", "node_modules"):
+        if (Path(src) / dep).exists():
+            (Path(dst) / dep).symlink_to(Path(src) / dep)
+    for rel, f in overlay.items():
+        shutil.copy2(f, Path(dst, rel))
+    git(dst, "init", "-q")
+    for k, v in (("user.email", "mini-validate@localhost"), ("user.name", "mini-validate"), ("commit.gpgsign", "false")):
+        git(dst, "config", k, v)
+    git(dst, "add", "-A")
+    git(dst, "commit", "-qm", "mini-validate scratch baseline")
+
+
+CONTAIN = []  # [runner module] when the frozen test is a local-model draft: MINI_CONTAIN=1 (mini-testdraft check) or a phase_a_only spec
+
+
+def run(cmd, cwd, env=None, timeout=900):
+    """bash -c cmd in cwd -> (rc, stdout+stderr); rc 124 on timeout, the whole process group killed. A draft runs contained like the
+    mutation scorer (the runner's contain(): throwaway HOME, sandbox-exec, writes only to the temp dirs and cwd; Fable review #5).
+    Every run gets DISPATCH_VERIFY_SANDBOX=1, set last so a spec env cannot clear it: the code under test never enqueues a real job."""
+    e = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(env or {}), "DISPATCH_VERIFY_SANDBOX": "1"}
+    e.pop("OPENAI_API_KEY", None)
+    ct, wrap = None, ()
+    if CONTAIN:
+        ct = tempfile.mkdtemp(prefix="mini-validate-ct-")
+        e, wrap, cmd = CONTAIN[0].contain(cmd, str(cwd), e, ct)
+    try:
+        p = subprocess.Popen([*wrap, "bash", "-c", cmd], cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             errors="replace", start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=timeout)
+            return p.returncode, out + err
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.communicate()
+            return 124, "TIMEOUT"
+    finally:
+        if ct:
+            shutil.rmtree(ct, ignore_errors=True)
+
+
+def hunks(a, b):
+    """Diff opcodes (non-equal) between two line lists, grouped as unified-diff hunks with 0 context."""
+    return [op for op in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if op[0] != "equal"]
+
+
+# The runner's fn_scope rule (mini-swe-runner.py `_code`): a blank or comment-only line cannot change behaviour.
+COMMENT_LINE = re.compile(r"\s*(?:#|//|/\*|\*)")
+
+
+def comment_only(a, b, op):
+    """True when every line hunk `op` deletes from a or inserts from b is blank or comment-only. No test can catch such a hunk,
+    so V5 skips it instead of failing a reference fix that keeps its doc comments true (seen 2026-11-03, bfmr-split-tiebreak).
+    Same blind spot as fn_scope: a comment-looking line inside a multi-line string literal counts as a comment."""
+    _t, i1, i2, j1, j2 = op
+    return all(not ln.strip() or COMMENT_LINE.match(ln) for ln in a[i1:i2] + b[j1:j2])
+
+
+def without_hunk(a, b, skip):
+    out, k = [], -1
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        k += tag != "equal"  # skip indexes the non-equal opcodes, as hunks() returns them
+        out += a[i1:i2] if (tag != "equal" and k == skip) else b[j1:j2]
+    return out
+
+
+def step_refs(spec, refdir, R):
+    """[(n, merged step spec, {allowed file: ref path}, prior overlay)] in order; the overlay is the earlier steps' ref files."""
+    steps = R.merged_steps(spec) if spec.get("steps") else [spec]
+    out, prior = [], {}
+    for n, sp in enumerate(steps, 1):
+        sdir = refdir / f"s{n}" if spec.get("steps") else refdir
+        ref_files = {f: str(sdir / f) for f in sp.get("allowed") or [] if (sdir / f).is_file()}
+        out.append((n, sp, ref_files, dict(prior)))
+        prior = {**prior, **ref_files}
+    return out
+
+
+def start_text(sp, prior, f):
+    """The step's starting text of f: the earlier steps' ref, else baseline_from's working tree (what scratch_base copies)."""
+    p = Path(prior[f]) if f in prior else Path(os.path.expanduser(sp["baseline_from"])) / f
+    return p.read_text() if p.is_file() else ""
+
+
+def ref_sizing(sp, prior, ref_files):
+    """(changed ref lines, fix_steps formula): V6's numbers, from the files alone."""
+    changed = 0
+    for f, pth in ref_files.items():
+        a, b = start_text(sp, prior, f).splitlines(True), Path(pth).read_text().splitlines(True)
+        changed += sum(max(i2 - i1, j2 - j1) for _t, i1, i2, j1, j2 in hunks(a, b))
+    return changed, min(max(20 + 2 * changed, 30), 80)
+
+
+def infer_target_fn(R, sp, prior, ref_files):
+    """The functions the step's reference fix edits: per changed line, the innermost function holding it that already exists at the
+    step's start (V1 refuses a target_fn the baseline lacks; a new helper is in scope anyway when the target calls it). A pure deletion
+    is placed on the old side."""
+    names = []
+    for f, pth in ref_files.items():
+        old, new = start_text(sp, prior, f), Path(pth).read_text()
+        spans = {"old": R.functions(f, old), "new": R.functions(f, new)}
+
+        def holder(side, ln):
+            hit = sorted((b - a, n) for n, (a, b) in spans[side].items() if b and a <= ln <= b)
+            return next((n for _w, n in hit if R._defines(old, n)), None)
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            side, lines = ("new", range(j1 + 1, j2 + 1)) if j2 > j1 else ("old", range(i1 + 1, i2 + 1))
+            for ln in lines:
+                n = holder(side, ln)
+                if n and n not in names:
+                    names.append(n)
+    return names
+
+
+def fill_spec(R, spec, refdir):
+    """Write the fields mini-submit's C4 demands into `spec` (in place) before validation: [(step, key, old, new, why)].
+    Missing red_ok / baseline_green / fn_scope / target_fn are filled; fix_steps is raised to V6's formula (only when the step has a
+    ref) and fix_wall to 20 s per step when missing or when fix_steps was raised past it. Present but invalid values stay for V1."""
+    if spec.get("phase_a_only") or not (spec.get("steps") or spec.get("mode") == "two-phase"):
+        return []
+    raw, changes = spec.get("steps"), []
+    for n, sp, ref_files, prior in step_refs(spec, refdir, R):
+        tgt = raw[n - 1] if raw else spec
+
+        def put(k, v, why):
+            changes.append((n, k, sp.get(k, "(missing)"), v, why))
+            tgt[k] = sp[k] = v
+        if "red_ok" not in sp:
+            put("red_ok", [], "a red other than AssertionError needs an entry here")
+        if "baseline_green" not in sp:
+            put("baseline_green", [], "every frozen test must be red at baseline unless listed here")
+        if "fn_scope" not in sp:
+            put("fn_scope", "enforce", "the runner's default, made explicit")
+        if not ref_files:
+            continue  # no ref yet: V4 says so; target_fn and the sizing come from the ref
+        if "target_fn" not in sp:
+            names = infer_target_fn(R, sp, prior, ref_files)
+            put("target_fn", names, "the functions the ref edits: review it, it bounds what the fix may change" if names
+                else "the ref edits no function that exists at the step's start, so fn_scope has nothing to check")
+        changed, want = ref_sizing(sp, prior, ref_files)
+        fs = sp.get("fix_steps")
+        good = isinstance(fs, int) and not isinstance(fs, bool)
+        if not good or fs < want:
+            try:
+                cur = 0 if isinstance(fs, bool) else int(fs)
+            except (TypeError, ValueError):
+                cur = 0
+            put("fix_steps", max(cur, want), f"V6 formula for {changed} changed ref line(s)")
+        raised = sp.get("fix_steps") != fs
+        fw = sp.get("fix_wall")
+        if not (isinstance(fw, int) and not isinstance(fw, bool) and fw > 0) or (raised and fw < 20 * sp["fix_steps"]):
+            put("fix_wall", 20 * sp["fix_steps"], "20 s per fix step" + (" (fix_steps was raised)" if raised and fw else ""))
+    return changes
+
+
+def suite_red_at_baseline(out):
+    """'' when the runner's `baseline suite_cmd:` line says rc=0 (or there is no suite), else what was red. A suite that cannot even
+    load at baseline proves nothing: bfmr-split-tiebreak's suite died on ERR_MODULE_NOT_FOUND and every fix would have kept it green."""
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.search(r"baseline suite_cmd: rc=(\d+) failure lines=(\d+)", ln)
+        if m and m.group(1) != "0":
+            first = lines[i + 1].split("baseline red:", 1)[1].strip() if i + 1 < len(lines) and "baseline red:" in lines[i + 1] else ""
+            return f"suite_cmd is red at baseline (rc={m.group(1)}, {m.group(2)} failure line(s)" + (f", e.g. {first[:160]}" if first else "") + ")"
+    return ""
+
+
+def validate_step(R, n, sp, prior_ref, ref_files, prior_cmds, tmp, spec_path, log):
+    res = {}
+    env_spec = {k: v for k, v in sp.items() if not k.startswith("_")}
+    src = os.path.expanduser(sp["baseline_from"])
+    base_dir, work = Path(tmp, f"s{n}-base"), Path(tmp, f"s{n}-work")
+    scratch_base(src, base_dir, prior_ref)
+    work.mkdir()
+    vs = {**env_spec, "baseline_from": str(base_dir), "mode": "two-phase"}
+    vs.pop("steps", None)
+    if prior_cmds:
+        vs["_prior_tests"] = list(prior_cmds)
+    tf, allowed = sp["test_file"], list(sp.get("allowed") or [])
+    tp = base_dir / tf
+    # V1
+    err, warn = R.precheck(vs, None, sound=False)
+    res["V1 precheck"] = (not err, "; ".join(err)[:400] or ("ok" + (f" (WARN {'; '.join(warn)[:200]})" if warn else "")))
+    # V2
+    if not tp.is_file():
+        res["V2 static"] = (False, f"{tf} is not in baseline_from (commit the frozen test there)")
+        return res
+    text = tp.read_text()
+    bad = R.test_static(text, allowed, int(sp.get("min_asserts", 2)), tf, str(base_dir),
+                        test_rules=sp.get("test_rules") != "off", source_checks=sp.get("source_checks") != "allow")
+    res["V2 static"] = (not bad, "; ".join(bad)[:400] or "clean")
+    if CONTAIN:  # a local-model draft (mini-testdraft check, phase_a_only): its test names are the model's, not the TASK's
+        res["V8 rule coverage"] = (True, "skipped: the test is a local-model draft")
+    else:
+        errs, warns = load_coverage().check(task_text(sp, spec_path, R, base_dir), text, tf)
+        res["V8 rule coverage"] = (not errs, "; ".join(errs + [f"WARN {w}" for w in warns])[:400] or "ok")
+    if R.FROZEN_MARK in text:  # mini-spec's template, not filled in: its placeholder asserts would pass V3 for the wrong reason
+        res["V3 red/right reason"] = (False, f"skipped: {tf} is still mini-spec's frozen-test template (V2)")
+        return res
+    # V3 + V4 through the runner itself
+    vspec = Path(tmp, f"s{n}-spec.json")
+    vspec.write_text(json.dumps(vs, indent=1))
+    ref = {f: ref_files[f] for f in allowed if f in ref_files}
+    fixes = sum((["--try-fix", f"{f}={p}"] for f, p in ref.items()), [])
+    cmd = [sys.executable, str(RUNNER), "--check-only", "--cwd", str(work), "--task-file", str(vspec), "--try-test", str(tp), *fixes]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
+                       env={**os.environ, "PATH": DAEMON_PATH, **({"MINI_CONTAIN": "1"} if CONTAIN else {})})
+    out = p.stdout + p.stderr
+    log.append(f"### step {n} runner --check-only --try-test/--try-fix (rc={p.returncode})\n```\n{out[-6000:]}\n```\n")
+    acc = next((ln for ln in out.splitlines() if "try-test" in ln and ("ACCEPTED" in ln or "REJECTED" in ln)), "")
+    res["V3 red/right reason"] = ("ACCEPTED" in acc, acc.split("try-test", 1)[-1].split(":", 1)[-1].strip()[:400] if acc else f"runner rc={p.returncode}: " + out.strip()[-300:])
+    if not ref:
+        res["V4 ref green"] = (False, f"no reference file for {allowed} (ref dir)")
+        return res
+    if "ACCEPTED" not in acc:
+        res["V4 ref green"] = (False, "skipped: V3 failed")
+        return res
+    green = next((ln for ln in out.splitlines() if "try-fix:" in ln), "")
+    reds = [ln.strip()[len("[mini-runner]"):].strip() for ln in out.splitlines() if ln.startswith("[mini-runner]   ") and " FAIL" in ln]
+    res["V4 ref green"] = ("GREEN" in green, ("; ".join(reds) or green)[:500] if "GREEN" not in green else "all fix gates green")
+    red_suite = suite_red_at_baseline(out)
+    if red_suite and res["V4 ref green"][0] and not sp.get("suite_baseline_red"):
+        res["V4 ref green"] = (False, red_suite + ": the suite gate only proves no NEW failures. Fix the suite in a prep commit, narrow "
+                               "suite_cmd, or set spec suite_baseline_red to why the red lines are acceptable")
+    # V5 / V6 / V7 on a fresh copy of the work tree with the ref applied
+    w2 = Path(tmp, f"s{n}-w2")
+    shutil.copytree(base_dir, w2, symlinks=True)
+    for f, pth in ref.items():
+        shutil.copy2(pth, w2 / f)
+    tcmd = sp["test_cmd"]
+    uncaught, total, changed, docs = [], 0, 0, 0
+    for f, pth in ref.items():
+        a = (base_dir / f).read_text().splitlines(True) if (base_dir / f).is_file() else []
+        b = Path(pth).read_text().splitlines(True)
+        hs = hunks(a, b)
+        changed += sum(max(i2 - i1, j2 - j1) for _t, i1, i2, j1, j2 in hs)
+        for k, (_t, i1, i2, j1, j2) in enumerate(hs):
+            if comment_only(a, b, hs[k]):
+                docs += 1
+                continue
+            total += 1
+            (w2 / f).write_text("".join(without_hunk(a, b, k)))
+            rc, o = run(tcmd, w2)
+            per = R.parse_test_results(o)
+            # any red counts: a partial ref may legitimately crash (NameError on a dropped helper); only rc==0/all-PASS is uncaught
+            if rc == 0 or (per and not any(x[1] == "FAIL" for x in per)):
+                uncaught.append(f"{f} hunk {k + 1} (ref lines {j1 + 1}-{j2}: `{(b[j1] if j1 < len(b) else a[i1]).strip()[:60]}`)")
+        shutil.copy2(pth, w2 / f)
+    res["V5 hunks covered"] = (not uncaught, f"{total - len(uncaught)}/{total} ref hunks make the test red"
+                               + (f" ({docs} comment-only hunk(s) skipped)" if docs else "")
+                               + (f"; NOT caught: {'; '.join(uncaught)[:400]}" if uncaught else ""))
+    names, _explicit = R.declared_tests(text, tf)
+    nt = len(names or [])
+    if names is None and not str(tf).endswith(".py"):
+        # node:test / jest style frozen tests: declared_tests() only parses python
+        nt = len(re.findall(r"^\s*(?:test|it)(?:\.\w+)?\(\s*['\"`]", text, re.M))
+    want = min(max(20 + 2 * changed, 30), 80)
+    size_bad = []
+    if changed > MAX_LINES:
+        size_bad.append(f"{changed} changed ref lines > {MAX_LINES}")
+    if nt > MAX_TESTS or nt < 2:
+        size_bad.append(f"{nt} tests (need 2..{MAX_TESTS})")
+    if 20 + 2 * changed > MAX_STEPS:
+        size_bad.append(f"fix_steps formula {20 + 2 * changed} > {MAX_STEPS}: split into steps")
+    have = sp.get("fix_steps")
+    note = f"{changed} changed lines, {nt} tests; formula fix_steps={want} fix_wall={20 * want}s (spec: fix_steps={have}, fix_wall={sp.get('fix_wall')})"
+    if have is not None and int(have) < want:
+        size_bad.append(f"spec fix_steps {have} < formula {want}")
+    res["V6 sizing"] = (not size_bad, "; ".join(size_bad + [note]))
+    if "ORDER_DEPENDENT = True" in text:
+        res["V7 reverse order"] = (True, "declared ORDER_DEPENDENT")
+    else:
+        rc, o = run(tcmd, w2, env={"TEST_ORDER": "reverse"})
+        per = R.parse_test_results(o)
+        res["V7 reverse order"] = (rc == 0, f"rc={rc} " + ", ".join(f"{a} {b}" for a, b, _c, _d in per if b == "FAIL")[:300])
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("spec")
+    ap.add_argument("--ref", help="reference dir (default spec['ref'], else <spec dir>/ref)")
+    ap.add_argument("--keep", action="store_true", help="keep the scratch dirs")
+    ap.add_argument("--check-fresh", action="store_true", help="exit 0 only if VALIDATION.md next to the spec PASSED for the current spec/test/task bytes")
+    ap.add_argument("--max-age-h", type=float, default=72)
+    ap.add_argument("--max-tests", type=int, default=FIX_JOB_MAX_TESTS,
+                    help="V6 test-count cap (2..12). Only `mini-testdraft check` raises it: a drafted test lands with the ref and no fix "
+                         "job follows it. A VALIDATION.md written with a raised cap never passes --check-fresh")
+    ap.add_argument("--no-fill", action="store_true", help="do not write the missing C4 fields (red_ok, baseline_green, fn_scope, "
+                    "target_fn, fix_steps, fix_wall) into spec.json first")
+    a = ap.parse_args()
+    global MAX_TESTS
+    MAX_TESTS = max(2, min(int(a.max_tests), 12))
+    spec_path = Path(a.spec).resolve()
+    spec = json.loads(spec_path.read_text())
+    R = load_runner()
+    vfile = spec_path.parent / "VALIDATION.md"
+    refdir = Path(os.path.expanduser(a.ref or spec.get("ref") or "ref"))
+    if not refdir.is_absolute():
+        refdir = spec_path.resolve().parent / refdir   # relative ref is spec-dir relative, never cwd relative
+    filled = []
+    if not a.check_fresh and not a.no_fill:
+        filled = fill_spec(R, spec, refdir)
+        if filled:
+            spec_path.write_text(json.dumps(spec, indent=1) + "\n")
+            print(f"[mini-validate] filled {len(filled)} spec field(s) mini-submit needs (--no-fill skips this):", flush=True)
+            for n, k, old, new, why in filled:
+                print(f"  s{n} {k}: {json.dumps(old) if old != '(missing)' else old} -> {json.dumps(new)} ({why})", flush=True)
+    fp = fingerprint(spec_path, spec, R)
+    if a.check_fresh:
+        if not vfile.is_file():
+            print(f"no {vfile}: run mini-validate {spec_path}")
+            return 1
+        txt = vfile.read_text()
+        if "\nRESULT: PASS" not in txt:
+            print(f"{vfile} is not a PASS: fix the job and rerun mini-validate")
+            return 1
+        cap = re.search(r"^- test cap: (\d+)", txt, re.M)
+        if cap and int(cap.group(1)) > FIX_JOB_MAX_TESTS:
+            print(f"{vfile} was validated with a raised test cap ({cap.group(1)}; a draft check): rerun mini-validate without --max-tests")
+            return 1
+        stale = [k for k, v in fp.items() if f"- {k}: {v}" not in txt]
+        if stale:
+            print(f"{vfile} is stale (changed since validation: {stale}): rerun mini-validate")
+            return 1
+        m = re.search(r"^- runner: .*? sha=([0-9a-f]{12})\s*$", txt, re.M)
+        cur = sha_file(RUNNER)[:12]
+        if not m or m.group(1) != cur:
+            print(f"{vfile} is stale (validated against runner sha {m.group(1) if m else 'unknown'}, current {cur}): rerun mini-validate")
+            return 1
+        if time.time() - vfile.stat().st_mtime > a.max_age_h * 3600:
+            print(f"{vfile} is older than {a.max_age_h}h (baseline may have moved): rerun mini-validate")
+            return 1
+        print(f"VALIDATION fresh: {vfile}")
+        return 0
+    os.environ["PATH"] = DAEMON_PATH
+    plan = step_refs(spec, refdir, R)
+    if os.environ.get("MINI_CONTAIN") == "1" or any(sp.get("phase_a_only") for _n, sp, _r, _p in plan):
+        CONTAIN.append(R)
+    results, log = [], []
+    v1_all_err, _w = R.precheck_all(spec)
+    tmp = tempfile.mkdtemp(prefix="mini-validate-")
+    try:
+        prior_cmds = []
+        for n, sp, ref_files, prior in plan:
+            print(f"[mini-validate] step {n}/{len(plan)} {sp.get('test_file')} ...", flush=True)
+            r = validate_step(R, n, sp, prior, ref_files, prior_cmds, tmp, spec_path, log)
+            results.append(r)
+            for k, (ok, d) in r.items():
+                print(f"  s{n} {k}: {'ok' if ok else 'FAIL'} {d}", flush=True)
+            prior_cmds.append(sp["test_cmd"])
+    finally:
+        if a.keep:
+            print(f"[mini-validate] scratch kept: {tmp}")
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+    ok = not v1_all_err and all(v[0] for r in results for v in r.values())
+    lines = [f"# VALIDATION {spec_path.parent.name}", "", f"- when: {time.strftime('%Y-%m-%d %H:%M:%S')}", f"- spec: {spec_path}",
+             f"- ref: {refdir}", f"- runner: {RUNNER} sha={sha_file(RUNNER)[:12]}", "", "## Fingerprint (queue-submit compares these)", ""]
+    lines += [f"- {k}: {v}" for k, v in fp.items()]
+    if MAX_TESTS != FIX_JOB_MAX_TESTS:
+        lines += [f"- test cap: {MAX_TESTS} (--max-tests, a mini-testdraft check: not valid for submitting a fix job)"]
+    if CONTAIN:
+        lines += ["- contained: test runs had a throwaway HOME and the sandbox (a drafted test)"]
+    if filled:
+        lines += ["", "## Spec fields filled before validation (--no-fill skips this)", ""]
+        lines += [f"- s{n} {k}: {json.dumps(old) if old != '(missing)' else old} -> {json.dumps(new)} ({why})" for n, k, old, new, why in filled]
+    lines += ["", "## Checks", "", f"- V1 precheck_all (whole spec): {'ok' if not v1_all_err else 'FAIL ' + '; '.join(v1_all_err)[:400]}"]
+    for n, r in enumerate(results, 1):
+        lines += [f"- s{n} {k}: {'ok' if okk else 'FAIL'} {d}" for k, (okk, d) in r.items()]
+    lines += ["", f"RESULT: {'PASS' if ok else 'FAIL'}", "", "## Runner output", ""] + log
+    vfile.write_text("\n".join(lines) + "\n")
+    print(f"[mini-validate] {'PASS' if ok else 'FAIL'} -> {vfile}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

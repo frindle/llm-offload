@@ -1,0 +1,16 @@
+{
+  "_doc": "graphify-lane config. parents: every child folder is a project (minus skip_names, dot dirs, symlinks). extra: more project roots. ~ is expanded.",
+  "parents": ["~/Desktop/GitHub Projects.nosync"],
+  "skip_names": ["_archive", "_repo-backups", "graphify-out"],
+  "extra": ["~/bin", "~/offload-research", "~/.claude"],
+  "runner": "unraid-cpu-1",
+  "runner_fresh_s": 90,
+  "api_default": "http://127.0.0.1:7684",
+  "claim_timeout_s": 1800,
+  "run_timeout_s": 2400,
+  "setup_timeout_s": 1500,
+  "max_payload_mb": 400,
+  "graphify_bin": "~/.local/bin/graphify",
+  "graphify_python": "~/.local/share/uv/tools/graphifyy/bin/python",
+  "uv": "/opt/homebrew/bin/uv"
+}

@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "generated": "2026-08-24",
+  "provenance": {
+    "summary": "Derived from a single pre-registered dispatch round on one host with one model roster. Not a benchmark, not a general claim about these models.",
+    "n_rows": 69,
+    "reps_per_cell": 3,
+    "verdict_basis": "OBJECTIVE PROXY, NOT THE FULL RULE. The verdicts use `verifier passed` AND `self-verified in every passing run`. The intended rule additionally requires a human claim-vs-verify calibration read. That read HAS NOT BEEN DONE.",
+    "known_blind_spot": "The proxy cannot see a model that claimed success on a run where the verifier failed. That is FABRICATED_COMPLETION, an instant disqualifier, and no `unsupervised` verdict below has been screened for it.",
+    "portability_warning": "Resident sizes, host memory and the model tags below are all specific to the machine that produced this data. Re-measure before relying on any row."
+  },
+  "status_levels": {
+    "confirmed": "Survived the round's own pre-declared falsification checks AND a human calibration read. NOTHING in this table currently holds this status.",
+    "provisional": "Survived the round's falsification checks, but rests on the objective proxy alone. Pending the human calibration read. Do not present to a user as settled.",
+    "void": "The cell that produced this row was invalid. It carries NO verdict in either direction. Absence of a verdict is not a negative verdict.",
+    "not_measured": "No data was collected for this cell."
+  },
+  "verdicts": {
+    "unsupervised": "Dispatch and accept the output without a gating build/test.",
+    "harness-verified": "Dispatch, but require a build/test to pass before the output is trusted.",
+    "scaffolded": "Dispatch only with the relevant API surface, repo map or file list supplied up front.",
+    "don't dispatch": "Failed this work class at a rate that makes dispatch not worth the wall-clock.",
+    "no verdict": "Explicitly none. See status."
+  },
+  "global_caveats": [
+    "EVERY `unsupervised` verdict in this table is PROVISIONAL. The human claim-vs-verify calibration read that would confirm it has not been performed. A consumer must not render these as confirmed.",
+    "The `debugging from a symptom report` row is VOID and carries no verdict for any model. The cell was context-starved: an uncapped file read against a 228KB source file, with 10 of 18 runs hitting the iteration ceiling at 5-6 iterations. Its apparent clean 0/18 is a starved harness, not a fact about the models or the work class.",
+    "One recorded zero-tool-call run was a HARNESS failure, not an inert model: the model emitted a Qwen-XML tool-call dialect the harness could not parse, so zero calls executed. Any 'the model did nothing' inference from such a row is invalid. Where a harness cannot parse a dialect, the correct record is a harness failure.",
+    "Two work classes were never measured here at all and are marked not_measured, not negative."
+  ],
+  "work_classes": [
+    {
+      "id": "greenfield_feature_large_ts_repo",
+      "label": "greenfield feature in a large TypeScript repo",
+      "status": "provisional",
+      "notes": "Measured cell. Verdicts rest on the objective proxy.",
+      "entries": [
+        {"model": "qwen3.8:27b-q8_0", "verdict": "harness-verified", "status": "provisional", "passes": "3/3", "self_verified": "2/3", "note": "Reliable, but did not check its own work in every passing run."},
+        {"model": "qwen3-coder:30b", "verdict": "harness-verified", "status": "provisional", "passes": "3/3", "self_verified": "0/3", "note": "Perfect success rate but self-verified in ZERO passing runs. Succeeding three times without ever checking is thin evidence it will succeed on the next one, which is why the rule makes self-verification a positive requirement rather than a tiebreak."},
+        {"model": "deepseek-r1:32b", "verdict": "scaffolded", "status": "provisional", "passes": "2/3", "self_verified": "0/3", "note": null},
+        {"model": "qwen3-coder-next:q4_K_M", "verdict": "scaffolded", "status": "provisional", "passes": "2/3", "self_verified": "1/2 passing", "note": null},
+        {"model": "qwen3-14b-agentic", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": "0/3", "note": null},
+        {"model": "qwen2.5-coder:14b", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": "Retired from the roster before this cell ran."}
+      ]
+    },
+    {
+      "id": "api_recall_dependent_swift",
+      "label": "API-recall-dependent work in Swift (correctness depends on recalling a platform API accurately)",
+      "status": "provisional",
+      "notes": "Measured cell. The single `unsupervised` verdict here is provisional and unscreened for fabricated completions.",
+      "entries": [
+        {"model": "qwen3.8:27b-q8_0", "verdict": "unsupervised", "status": "provisional", "passes": "3/3", "self_verified": "3/3", "note": "PROVISIONAL. Meets the strict bar on the proxy; pending the calibration read."},
+        {"model": "qwen3-coder-next:q4_K_M", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": "3/3", "note": "Self-verified every single time and was still wrong every single time. Calibration and competence are orthogonal; this is that case in practice, and it is a distinct failure mode from 'didn't check'."},
+        {"model": "qwen3-14b-agentic", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": null},
+        {"model": "deepseek-r1:32b", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": null},
+        {"model": "qwen2.5-coder:14b", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": null},
+        {"model": "qwen3-coder:30b", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": "One of these three runs is the Qwen-XML harness failure described in global_caveats. It should be reclassified or rerun, and the inert-model disqualifier must not fire on it. This verdict is weaker than its 0/3 suggests."}
+      ]
+    },
+    {
+      "id": "debugging_from_symptom_report",
+      "label": "debugging from a bare symptom report (Python)",
+      "status": "void",
+      "notes": "VOID. This row carries no verdict for any model. The cell fed models an uncapped read of a 228KB source file and 10 of 18 runs hit the iteration ceiling at 5-6 iterations. The apparent clean 0/18 measures a starved harness, not the models and not the work class. An earlier draft read it as a genuine finding about the difficulty of the work class; that reading was wrong and has been withdrawn. Rerun with a capped read before this row is filled in, and treat 'debugging from a bare symptom report is hard for local models' as UNTESTED.",
+      "entries": [
+        {"model": "qwen3.8:27b-q8_0", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"},
+        {"model": "qwen3-14b-agentic", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"},
+        {"model": "deepseek-r1:32b", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"},
+        {"model": "qwen2.5-coder:14b", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"},
+        {"model": "qwen3-coder-next:q4_K_M", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"},
+        {"model": "qwen3-coder:30b", "verdict": "no verdict", "status": "void", "passes": null, "self_verified": null, "note": "void cell"}
+      ]
+    },
+    {
+      "id": "exploration_low_salience",
+      "label": "exploration under low evidence salience (the relevant file is one of many, nothing points at it)",
+      "status": "provisional",
+      "notes": "Measured cell, partial roster.",
+      "entries": [
+        {"model": "qwen3.8:27b-q8_0", "verdict": "harness-verified", "status": "provisional", "passes": "3/3", "self_verified": "2/3", "note": null},
+        {"model": "qwen3-14b-agentic", "verdict": "scaffolded", "status": "provisional", "passes": "1/3", "self_verified": null, "note": null},
+        {"model": "deepseek-r1:32b", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": null},
+        {"model": "qwen2.5-coder:14b", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null},
+        {"model": "qwen3-coder-next:q4_K_M", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null},
+        {"model": "qwen3-coder:30b", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null}
+      ]
+    },
+    {
+      "id": "api_surface_supplied",
+      "label": "work with the relevant API surface supplied up front",
+      "status": "provisional",
+      "notes": "Measured cell, partial roster. The `unsupervised` verdict is provisional.",
+      "entries": [
+        {"model": "qwen3.8:27b-q8_0", "verdict": "unsupervised", "status": "provisional", "passes": "3/3", "self_verified": "3/3", "note": "PROVISIONAL. Pending the calibration read."},
+        {"model": "qwen3-14b-agentic", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": null, "note": null},
+        {"model": "deepseek-r1:32b", "verdict": "don't dispatch", "status": "provisional", "passes": "0/3", "self_verified": "2/3", "note": "Checked its own work in two of three runs and failed all three."},
+        {"model": "qwen2.5-coder:14b", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null},
+        {"model": "qwen3-coder-next:q4_K_M", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null},
+        {"model": "qwen3-coder:30b", "verdict": "no verdict", "status": "not_measured", "passes": null, "self_verified": null, "note": null}
+      ]
+    },
+    {
+      "id": "followup_on_own_prior_output",
+      "label": "follow-up work on the model's own prior output",
+      "status": "not_measured",
+      "notes": "Never measured. Deliberately scoped out, because the obvious naive design -- hand a model its own prior diff and ask it to continue -- leaks the intended answer in the prompt. Needs an adversarially designed cell before it can produce trustworthy data.",
+      "entries": []
+    },
+    {
+      "id": "bulk_mechanical_transforms",
+      "label": "bulk or mechanical transforms, summarisation, reformatting",
+      "status": "not_measured",
+      "notes": "Never measured by this round and not a question it was built to answer. Widely handled well by small local models in ordinary practice; that is existing practice, not a result from this data.",
+      "entries": []
+    }
+  ],
+  "open_items": [
+    "The human claim-vs-verify calibration read. This is the single item that would move any `unsupervised` verdict from provisional to confirmed, and the only thing that can catch a FABRICATED_COMPLETION the objective proxy is blind to. Deliberately not automated with an LLM judge -- an unvalidated second instrument was this work's own recurring failure mode.",
+    "Rerun the debugging cell with a capped file read. Until then that row has no verdict at all.",
+    "Reclassify or rerun the Qwen-XML dialect run as a harness failure. Either the harness parses that dialect, or the protocol states explicitly that an unparsed dialect is recorded as a harness failure and never as an inert model.",
+    "Per-cell input caps generally. The one cell that broke was the one that could feed an oversized file into a limited context with no cap.",
+    "Per-request context instrumentation. Only cumulative prompt-token totals were recorded, so the data cannot say whether the configured context was ever actually needed per request -- and context reduction is the only lever that lowers the host-readiness threshold at all."
+  ]
+}

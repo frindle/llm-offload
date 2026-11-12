@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""ollama-land -- LAND-READY packets, the final-review lever, and the AUTO switch.
+
+The dispatch pipeline runs from enqueue to a LAND-READY change with zero human steps. This tool
+is the LAST step, behind ONE setting:
+
+    ~/.ollama-dispatch/land-mode        REVIEW (default; file absent == REVIEW) | AUTO
+
+REVIEW  nothing of this tool's merges/pushes to a product repo on its own. A finished chain is
+        packetised (landing/<chain>/packet.{md,json}) and parked `awaiting_final_review`; the
+        final reviewer (the main Claude session) reads it and runs ONE command:
+            ollama-land approve <chain>            merge per repo conventions + post-land check
+            ollama-land reject  <chain> --reason   close it, record why
+AUTO    the same code runs the same approve step itself when every mechanical gate passes AND
+        risk < threshold AND tier <= auto_max_tier AND no kill switch AND breaker closed AND the
+        shadow period has enough agreements. The default is NEVER flipped by software.
+
+Other commands: list | show | revert | go | scan | ingest | summary | stats | mode | breaker | tick
+Research basis: ~/.ollama-dispatch/merge-queue/2026-10-09-autoland-research.md
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BIN = Path(os.environ.get("LAND_BIN_DIR") or Path(__file__).resolve().parent)
+sys.path.insert(0, str(BIN))
+import land_ground  # noqa: E402
+import land_packet  # noqa: E402
+import land_go  # noqa: E402
+import land_adjudicate  # noqa: E402
+
+ROOT = Path(os.environ.get("LAND_ROOT") or (Path.home() / ".ollama-dispatch"))
+LANDING = ROOT / "landing"
+MODE_FILE = ROOT / "land-mode"
+KILL_FILE = LANDING / "KILL"
+LEDGER = LANDING / "ledger.jsonl"
+READY_MD = ROOT / "escalations" / "READY-TO-LAND.md"
+ESC_MD = ROOT / "escalations" / "ESCALATIONS.md"
+QLOGS = Path(os.environ.get("LAND_QLOGS") or (Path.home() / "bin" / "ollama-queue-logs"))
+SLICE_RUNS = ROOT / "slice-runs"
+STATES_PENDING = ("awaiting_final_review",)
+
+DEFAULT_CFG = {"auto_max_tier": "T0", "auto_risk_threshold": 25, "min_shadow_agreements": 10,
+               "delay_window_min": {"T0": 0, "T1": 10, "T2": 30}, "hold_labels": [], "check_timeout": 900,
+               "repos": {}, "go_min_score": land_go.MIN_SCORE}
+TIER_ORDER = {"T0": 0, "T1": 1, "T2": 2}
+
+
+# ---------------- small utils ----------------
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def slug(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(s)).strip("-") or "x"
+
+
+def jload(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def jsave(p, obj):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(obj, indent=1, default=str))
+    os.replace(tmp, p)
+
+
+def ledger(event, **kw):
+    try:
+        LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with LEDGER.open("a") as fh:
+            fh.write(json.dumps(dict(at=now_iso(), epoch=time.time(), event=event, **kw), default=str) + "\n")
+    except OSError:
+        pass
+
+
+def read_ledger():
+    out = []
+    try:
+        for ln in LEDGER.read_text().splitlines():
+            with contextlib.suppress(ValueError):
+                out.append(json.loads(ln))
+    except OSError:
+        pass
+    return out
+
+
+@contextlib.contextmanager
+def chain_lock(chain):
+    p = LANDING / slug(chain) / ".lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(p, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def load_cfg():
+    cfg = json.loads(json.dumps(DEFAULT_CFG))
+    cfg.update(jload(LANDING / "config.json", {}) or {})
+    return cfg
+
+
+def get_mode():
+    """REVIEW unless the file says AUTO exactly. Anything unreadable/unknown == REVIEW (fail safe)."""
+    try:
+        t = MODE_FILE.read_text().strip().upper()
+    except OSError:
+        return "REVIEW"
+    return "AUTO" if t == "AUTO" else "REVIEW"
+
+
+def packet_path(chain):
+    return LANDING / slug(chain) / "packet.json"
+
+
+def load_packet(chain):
+    return jload(packet_path(chain))
+
+
+def save_packet(P):
+    d = LANDING / slug(P["chain"])
+    jsave(d / "packet.json", P)
+    if P.get("kind") == "harness-go":
+        (d / "packet.md").write_text(render_go_md(P))
+    else:
+        (d / "packet.md").write_text(land_packet.render_md(P))
+
+
+def all_packets():
+    out = []
+    try:
+        for d in sorted(LANDING.iterdir()):
+            p = jload(d / "packet.json")
+            if isinstance(p, dict):
+                out.append(p)
+    except OSError:
+        pass
+    return out
+
+
+# ---------------- breaker / kill switch / AUTO eligibility ----------------
+def breaker_path(repo):
+    return LANDING / "breaker" / (slug(Path(repo).name) + ".json")
+
+
+def breaker_state(repo):
+    return jload(breaker_path(repo), {"consecutive_reverts": 0, "open": False})
+
+
+def breaker_record(repo, reverted):
+    b = breaker_state(repo)
+    b["consecutive_reverts"] = (b.get("consecutive_reverts", 0) + 1) if reverted else 0
+    if b["consecutive_reverts"] >= 2:
+        b.update(open=True, opened_at=now_iso(),
+                 note="two consecutive post-land reverts: landing frozen for this repo; "
+                      "`ollama-land breaker clear <repo>` once understood")
+    jsave(breaker_path(repo), b)
+    return b
+
+
+def shadow_counts():
+    agree = bad = 0
+    for r in read_ledger():
+        if r.get("event") == "main-decision" and r.get("auto_would") is not None:
+            if r["auto_would"] and r.get("decision") == "approve":
+                agree += 1
+            elif r["auto_would"] and r.get("decision") == "reject":
+                bad += 1
+    return agree, bad
+
+
+def auto_eligibility(P, cfg=None, mode=None, kill=None, breaker_open=None, shadow=None, now=None):
+    """PURE-ish. (eligible: bool, reasons: [str]). `reasons` explains every refusal."""
+    cfg = cfg or load_cfg()
+    why = []
+    if P.get("kind") not in ("integration", "dispatch"):
+        why.append("not a landable chain")
+    if P.get("state") != "awaiting_final_review":
+        why.append(f"state is {P.get('state')}")
+    if P.get("blockers"):
+        why.append("mechanical blockers: " + "; ".join(P["blockers"][:3]))
+    r = P.get("risk") or {}
+    if r.get("auto_blockers"):
+        why.append("auto-blockers: " + "; ".join(r["auto_blockers"][:3]))
+    if (r.get("score") if r.get("score") is not None else 999) >= cfg["auto_risk_threshold"]:
+        why.append(f"risk {r.get('score')} >= threshold {cfg['auto_risk_threshold']}")
+    if TIER_ORDER.get(r.get("tier"), 9) > TIER_ORDER.get(cfg["auto_max_tier"], 0):
+        why.append(f"tier {r.get('tier')} above auto_max_tier {cfg['auto_max_tier']}")
+    if (P.get("checks") or {}).get("status") not in ("pass",):
+        why.append(f"repo checks not green ({(P.get('checks') or {}).get('status')})")
+    if (P.get("gate") or {}).get("verdict") != "pass":
+        why.append("gate verdict is not a clean PASS (an LLM adjudication may flag, never approve)")
+    if (kill if kill is not None else KILL_FILE.exists()):
+        why.append("kill-switch file present")
+    if (breaker_open if breaker_open is not None else breaker_state(P.get("repo", ".")).get("open")):
+        why.append("per-repo circuit breaker open")
+    agree, bad = shadow if shadow is not None else shadow_counts()
+    if bad:
+        why.append(f"shadow period saw {bad} AUTO-eligible chain(s) that the final reviewer REJECTED")
+    if agree < cfg["min_shadow_agreements"]:
+        why.append(f"shadow period {agree}/{cfg['min_shadow_agreements']} agreements")
+    delay = (cfg.get("delay_window_min") or {}).get(r.get("tier"), 0) * 60
+    if delay and P.get("built_epoch") and (now or time.time()) - P["built_epoch"] < delay:
+        why.append(f"delay window: {int(delay / 60)} min after the packet was built")
+    return (not why), why
+
+
+# ---------------- git landing primitives ----------------
+def git(repo, *a, timeout=120):
+    return land_packet.git(repo, *a, timeout=timeout)
+
+
+def ff_ref(repo, dref, new):
+    """Fast-forward LOCAL dref to `new` (same two safe paths as the slicer's _ff_land)."""
+    old = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{dref}")[1]
+    if not old:
+        return False, f"{dref} not resolvable in {repo}"
+    if git(repo, "merge-base", "--is-ancestor", old, new)[0] != 0:
+        return False, f"{dref} ({old[:8]}) is not an ancestor of {new[:8]}: not a fast-forward"
+    cur = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")[1]
+    if cur == dref:
+        rc, out = git(repo, "merge", "--ff-only", "--no-edit", new)
+        return (rc == 0), (f"fast-forwarded checked-out {dref} {old[:8]}->{new[:8]}" if rc == 0
+                           else f"git merge --ff-only refused: {out[-300:]}")
+    wl = git(repo, "worktree", "list", "--porcelain")[1]
+    if f"branch refs/heads/{dref}" in wl:
+        return False, f"{dref} is checked out in another worktree of {repo}"
+    rc, out = git(repo, "update-ref", "-m", "ollama-land", f"refs/heads/{dref}", new, old)
+    return (rc == 0), (f"moved {dref} {old[:8]}->{new[:8]}" if rc == 0 else out[-300:])
+
+
+def push_ref(repo, dref):
+    remotes = git(repo, "remote")[1].split()
+    if not remotes:
+        return None, "no remote"
+    remote = "origin" if "origin" in remotes else remotes[0]
+    rc, out = git(repo, "push", remote, f"{dref}:{dref}", timeout=180)
+    return (rc == 0), (f"pushed {dref} to {remote}" if rc == 0 else f"push failed: {out[-300:]}")
+
+
+def do_revert(repo, dref, base_tip, tip, runner=None):
+    """Revert base_tip..tip on top of the current dref using a throw-away worktree, push, and
+    fast-forward the local ref. -> (ok, detail, new_sha)."""
+    cur = git(repo, "rev-parse", "--verify", f"refs/heads/{dref}")[1]
+    wt, err = land_packet._wt_add(repo, cur)
+    if wt is None:
+        return False, f"could not create worktree: {err[-200:]}", None
+    try:
+        rng = f"{base_tip}..{tip}"
+        rc, out = land_packet.git(wt, "revert", "--no-edit", rng)
+        if rc != 0:
+            land_packet.git(wt, "revert", "--abort")
+            return False, f"git revert {rng} failed: {out[-300:]}", None
+        new = land_packet.git(wt, "rev-parse", "HEAD")[1]
+    finally:
+        land_packet._wt_remove(repo, wt)
+    ok, d = ff_ref(repo, dref, new)
+    if not ok:
+        return False, "revert commit made but local ref not advanced: " + d, new
+    pushed, pd = push_ref(repo, dref)
+    return (pushed is not False), f"reverted {rng}; {d}; {pd}", new
+
+
+# ---------------- rows / handoff ----------------
+def close_rows(path, needles, action, flip_only_open=True):
+    """Flip `- [ ]` rows containing ANY needle to `- [x]` and append the action. Atomic rewrite.
+    -> number of rows closed."""
+    path = Path(path)
+    try:
+        lines = path.read_text().splitlines(keepends=True)
+    except OSError:
+        return 0
+    n, out = 0, []
+    for ln in lines:
+        if ln.startswith("- [ ] ") and any(nd and nd in ln for nd in needles):
+            ln = "- [x] " + ln[len("- [ ] "):].rstrip("\n") + f" [{action}]\n"
+            n += 1
+        out.append(ln)
+    if n:
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text("".join(out))
+        os.replace(tmp, path)
+    return n
+
+
+def close_all_rows(P, action):
+    needles = [f"`{P['chain']}`"] + ([f"`{P['label']}`"] if P.get("label") else [])
+    n = close_rows(READY_MD, needles, action)
+    n += close_rows(ESC_MD, needles, action)
+    return n
+
+
+# ---------------- approve / reject / revert ----------------
+class LandError(Exception):
+    pass
+
+
+def approve(chain, by="main", dry=False, runner=land_packet.sh, handoff=None, slicer=None):
+    """The ONE merge step. Refuses everything that is not exactly the packet the reviewer saw."""
+    with chain_lock(chain):
+        P = load_packet(chain)
+        if not P:
+            raise LandError(f"no packet for {chain!r}")
+        if P.get("kind") == "harness-go":
+            raise LandError("harness-go chains are not landed: `ollama-land go` enqueues them (automatic in both modes)")
+        if P.get("state") != "awaiting_final_review":
+            raise LandError(f"{chain}: state is {P.get('state')!r}, not awaiting_final_review")
+        if by == "auto":
+            if get_mode() != "AUTO":
+                raise LandError("AUTO approve refused: land-mode is not AUTO (REVIEW never lands by itself)")
+            ok, why = auto_eligibility(P)
+            if not ok:
+                raise LandError("AUTO refused: " + "; ".join(why))
+        repo, dref, br = P["repo"], P["default_branch"], P["integrate_branch"]
+        if breaker_state(repo).get("open"):
+            raise LandError(f"circuit breaker OPEN for {Path(repo).name} (two consecutive reverts): "
+                            "`ollama-land breaker clear` after a human looks")
+        cur = git(repo, "rev-parse", "--verify", f"refs/heads/{dref}")[1]
+        tip = git(repo, "rev-parse", "--verify", f"refs/heads/{br}")[1]
+        if cur != P["base_tip"] or tip != P["branch_tip"]:
+            P["state"] = "stale"
+            P.setdefault("history", []).append({"at": now_iso(), "event": "stale-at-approve",
+                                                "default_now": cur[:9], "branch_now": tip[:9]})
+            save_packet(P)
+            raise LandError("STALE: the default branch or the staged branch moved since this packet was built; "
+                            "re-run `ollama-land scan` (rebuilds the packet) and review again")
+        if dry:
+            return {"dry": True, "would_land": f"{tip[:9]} onto {dref} in {repo}", "revert": P["revert"]["command"]}
+        would = auto_eligibility(P)[0]
+        # ---- LAND ----
+        if P["kind"] == "integration" and P.get("plan"):
+            raise LandError("integration packets landed via the old slicer, which is retired -- use mini-swe")
+        else:
+            ok, d = ff_ref(repo, dref, tip)
+            if not ok:
+                raise LandError("land refused: " + d)
+            pushed, pd = push_ref(repo, dref)
+            if pushed is False:
+                P["state"] = "landed_unpushed"
+                P.setdefault("history", []).append({"at": now_iso(), "event": "push-failed", "detail": pd})
+                save_packet(P)
+                raise LandError(f"LANDED LOCALLY but the push failed ({pd}); `git -C {repo} push` by hand")
+        ledger("main-decision" if by != "auto" else "auto-decision", chain=chain, decision="approve",
+               auto_would=would, by=by)
+        P["state"] = "landed"
+        P["landed"] = {"at": now_iso(), "by": by, "sha": tip, "push": pd, "pre_land_sha": cur}
+        # ---- POST-LAND VERIFICATION ----
+        prof = land_packet.repo_profile(repo, load_cfg().get("repos"))
+        res = land_packet.run_checks(repo, tip, cur, prof, runner=runner, timeout=load_cfg()["check_timeout"])
+        P["post_land"] = {"status": res["status"], "runs": res["runs"]}
+        if res["status"] == "fail":
+            ok, detail, newsha = do_revert(repo, dref, cur, tip)
+            P["state"] = "rejected" if ok else "landed_regression_unreverted"
+            P["post_land"]["auto_revert"] = {"ok": ok, "detail": detail, "sha": newsha}
+            b = breaker_record(repo, reverted=True)
+            ledger("post-land-revert", chain=chain, ok=ok, detail=detail, breaker_open=b.get("open"))
+            action = f"post-land REGRESSION -> auto-reverted ({detail[:120]})" if ok else "post-land REGRESSION, REVERT FAILED"
+        else:
+            breaker_record(repo, reverted=False)
+            action = f"landed {tip[:9]} by {by}; post-land checks {res['status']}"
+        P.setdefault("history", []).append({"at": now_iso(), "event": P["state"], "detail": action})
+        save_packet(P)
+        # ---- bookkeeping: handoff + rows ----
+        if P["state"] == "landed" and P.get("job_id") and P["kind"] == "dispatch":
+            (handoff or land_packet.sh)([sys.executable, str(BIN / "handoff-emit.py"), "--merged", P["job_id"],
+                                         "--commit", tip, "--repo", Path(repo).name,
+                                         "--reason", f"landed via ollama-land approve ({by})",
+                                         "--override-signoff", f"ollama-land approve by {by}"])
+        P["rows_closed"] = close_all_rows(P, f"ollama-land {action}")
+        save_packet(P)
+        return P
+
+
+def reject(chain, reason, by="main"):
+    with chain_lock(chain):
+        P = load_packet(chain)
+        if not P:
+            raise LandError(f"no packet for {chain!r}")
+        if P.get("state") in ("landed", "rejected"):
+            raise LandError(f"{chain}: already {P['state']}")
+        ledger("main-decision", chain=chain, decision="reject", reason=reason, by=by,
+               auto_would=auto_eligibility(P)[0] if P.get("kind") in ("integration", "dispatch") else None)
+        P["state"] = "rejected"
+        P["rejection"] = {"at": now_iso(), "by": by, "reason": reason}
+        P.setdefault("history", []).append({"at": now_iso(), "event": "rejected", "detail": reason})
+        n = close_all_rows(P, f"ollama-land rejected: {reason[:120]}")
+        P["rows_closed"] = n
+        save_packet(P)
+        return P
+
+
+def revert_chain(chain, by="main"):
+    with chain_lock(chain):
+        P = load_packet(chain)
+        if not P or P.get("state") not in ("landed", "landed_regression_unreverted"):
+            raise LandError(f"{chain}: nothing landed to revert (state {P.get('state') if P else None})")
+        repo, dref = P["repo"], P["default_branch"]
+        ok, detail, sha = do_revert(repo, dref, P["landed"]["pre_land_sha"], P["landed"]["sha"])
+        P["state"] = "reverted" if ok else P["state"]
+        P.setdefault("history", []).append({"at": now_iso(), "event": "reverted" if ok else "revert-failed", "detail": detail})
+        if ok:
+            breaker_record(repo, reverted=True)
+            ledger("manual-revert", chain=chain, detail=detail)
+        save_packet(P)
+        if not ok:
+            raise LandError(detail)
+        return P
+
+
+# ---------------- discovery ----------------
+RANK = {"pass": 0, "skipped": 0, "concerns": 1, "disputed": 1, "fail": 2, "error": 2}
+
+
+def merge_gates(gates):
+    """One synthetic gate from several (worst verdict, union of issues, lowest relevance score)."""
+    gates = [g for g in gates if g]
+    if not gates:
+        return {}
+    worst = max(gates, key=lambda g: RANK.get(str(g.get("verdict")), 3))
+    out = dict(worst)
+    out["issues"] = [i for g in gates for i in (g.get("issues") or [])]
+    vrs = [g.get("verify_relevance") for g in gates if g.get("verify_relevance")]
+    scored = [v for v in vrs if v.get("score") is not None]
+    if scored:
+        out["verify_relevance"] = min(scored, key=lambda v: v["score"])
+    out["job_ids"] = [g.get("job_id") for g in gates]
+    return out
+
+
+def gate_for(job_id):
+    return jload(QLOGS / f"{job_id}.gate.json", {}) or {}
+
+
+def integration_candidates():
+    out = []
+    try:
+        files = sorted(SLICE_RUNS.glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        st = jload(f)
+        if not isinstance(st, dict):
+            continue
+        rec = st.get("integration")
+        if not (isinstance(rec, dict) and rec.get("status") in ("staged", "stale")):
+            continue
+        repo = st.get("repo") or ""
+        if not repo or str(ROOT) in repo or not Path(repo).is_dir():
+            continue
+        gates = [gate_for(s.get("job_id")) for s in (st.get("slices") or {}).values()
+                 if s.get("job_id") and s.get("status") == "done"]
+        out.append({"chain": st["label"], "kind": "integration", "repo": repo, "branch": rec.get("integrate_branch"),
+                    "onto": rec.get("onto"), "plan": st.get("plan_path"), "gate": merge_gates(gates),
+                    "declared_scope": rec.get("scope"), "stale_record": rec.get("status") == "stale"})
+    return out
+
+
+def go_rows():
+    """Open HARNESS GO rows -> [(label, worktree)]."""
+    out = []
+    try:
+        for ln in READY_MD.read_text().splitlines():
+            m = re.match(r"^- \[ \] `([^`]+)` \*\*HARNESS GO -- relevance review\*\*.* - `([^`]+)`\s*$", ln)
+            if m:
+                out.append((m.group(1), m.group(2)))
+    except OSError:
+        pass
+    return out
+
+
+def stage_dispatch(wt, runner=land_packet.sh):
+    """Stage a finished dispatch worktree as a scratch integrate/* branch (never main)."""
+    return {}, "old dispatch integrate tool retired -- use mini-swe"
+
+
+# ---------------- harness-go packets ----------------
+def go_packet(label, wt, cfg, execute=True, dry=False):
+    st = land_go.load_json(Path(wt) / ".preflight-state.json") or {}
+    hn = land_go.load_json(Path(wt) / ".dispatch-harness.json") or {}
+    dec = land_go.decide_go(st, hn, min_score=cfg.get("go_min_score", land_go.MIN_SCORE))
+    P = {"chain": label, "kind": "harness-go", "created": now_iso(), "worktree": str(wt), "label": label,
+         "decision": dec, "target": hn.get("target"), "fixture": hn.get("fixture"),
+         "state": "go_held" if label in cfg.get("hold_labels", []) else ("go_enqueue" if dec["action"] == "enqueue" else "go_reauthor"),
+         "blockers": [], "warnings": [], "history": []}
+    rp = Path(wt) / "refimpl.py"
+    P["refimpl_bytes"] = rp.stat().st_size if rp.is_file() else None
+    rc, stat = land_packet.sh(["git", "-C", str(wt), "status", "--short"], timeout=30)
+    P["worktree_status"] = stat.strip()[:600]
+    if execute and not dry and P["state"] != "go_held":
+        res = land_go.execute_go(wt, label, dec, ledger=LANDING / "go-ledger.jsonl")
+        P["executed"] = res
+        P["state"] = ("go_enqueued" if (res["ok"] and dec["action"] == "enqueue" and "enqueued" in res["detail"]) else
+                      "go_reauthor_sent" if (res["ok"] and dec["action"] == "reauthor") else P["state"])
+    return P
+
+
+def render_go_md(P):
+    d = P["decision"]
+    L = [f"# Harness-GO packet: {P['chain']}", "",
+         f"- state: **{P['state']}**   built: {P['created']}", f"- worktree: `{P['worktree']}`  target `{P.get('target')}`  fixture `{P.get('fixture')}`",
+         f"- automatic decision: **{d['action'].upper()}**", f"- numbers: {json.dumps(d['numbers'])}", ""]
+    if d["reasons"]:
+        L += ["## Why not straight to enqueue"] + [f"- {r}" for r in d["reasons"]] + [""]
+    if P.get("executed"):
+        L += ["## Executed", f"- {json.dumps(P['executed'], default=str)[:600]}", ""]
+    if P["state"] == "go_held":
+        L += ["## HELD by config (hold_labels): nothing was done to this chain except this packet.", ""]
+    L += ["## Notes", "- This is a dispatch-worktree/queue step only; no product repo is touched. The landing packet for the",
+          "  finished change is built after the coding job's gate (`ollama-land scan`/`ingest`).", "",
+          "```", P.get("worktree_status", ""), "```", ""]
+    return "\n".join(L)
+
+
+# ---------------- process one candidate ----------------
+def process_candidate(c, cfg, mode, no_checks=False, runner=land_packet.sh, claude=land_adjudicate.run_claude,
+                      spawner=None, allow_adjudicate=True):
+    chain = c["chain"]
+    old = load_packet(chain)
+    if old and old.get("state") in ("landed", "rejected", "reverted", "landed_unpushed", "landed_regression_unreverted"):
+        return old
+    repo = c["repo"]
+    dref = c.get("onto") or land_packet.default_branch(repo)
+    base_now = git(repo, "rev-parse", "--verify", f"refs/heads/{dref}")[1]
+    tip_now = git(repo, "rev-parse", "--verify", f"refs/heads/{c.get('branch') or '_'}")[1]
+    if (old and old.get("state") in ("awaiting_final_review", "needs_rework", "adjudicating") and old.get("base_tip") == base_now
+            and old.get("branch_tip") == tip_now and not old.get("rebuild")):
+        return old
+    # stale integration: re-stage (scratch branch only) instead of asking anyone
+    if c["kind"] == "integration" and (c.get("stale_record") or (base_now and tip_now and
+            git(repo, "merge-base", "--is-ancestor", base_now, tip_now)[0] != 0)) and c.get("plan"):
+        hist = (old or {}).get("history", [])
+        # old slicer --integrate restage is retired (use mini-swe): keep the packet as-is
+        pass
+    hist_adj = [h for h in (old or {}).get("history", []) if h.get("event", "").startswith("adjudication")]
+    P = land_packet.build_packet(c, cfg, runner=runner, run_repo_checks=not no_checks)
+    P["built_epoch"] = time.time()
+    P["history"] = list((old or {}).get("history", [])) + ([{"at": now_iso(), "event": "restage"}] if c.get("restaged") else [])
+    P["label"] = c.get("label")
+    verdict = str((P.get("gate") or {}).get("verdict") or "").lower()
+    if verdict in ("concerns", "disputed") and allow_adjudicate and P["facts"]["n_files"]:
+        diff = land_packet.sh(["git", "-C", repo, "diff", "--no-color", f"{P['base_tip']}..{P['branch_tip']}"])[1]
+        past = [h for h in P["history"] if h.get("event") == "adjudication"]
+        adj = land_adjudicate.adjudicate(P, task_intent=c.get("intent", ""), diff_text=diff,
+                                         cache_dir=LANDING / "adjudication-cache",
+                                         history=[dict(x, diff_sha256=x.get("diff_sha256")) for x in past], claude=claude)
+        ex = land_adjudicate.execute(adj, c.get("label") or chain, history=past, spawner=spawner)
+        P["adjudication"] = dict(adj, executed=ex.get("executed"), exec_detail=ex.get("detail"))
+        P["history"].append({"at": now_iso(), "event": "adjudication", "decision": adj.get("decision"),
+                             "executed": ex.get("executed"), "diff_sha256": P["diff_sha256"], "detail": ex.get("detail")})
+        if adj.get("decision") == "accept":
+            # re-evaluate blockers with the accepting adjudication attached (no second test run)
+            P["blockers"] = [b for b in P["blockers"] if "CONCERNS with no accepting adjudication" not in b]
+            P["risk"]["auto_blockers"] = list(P["risk"].get("auto_blockers", [])) + [
+                "CONCERNS verdict accepted only by LLM adjudication (research (f): never auto-approve)"]
+            P["state"] = "needs_rework" if P["blockers"] else "awaiting_final_review"
+        elif ex.get("executed") in ("re-run", "re-spec"):
+            P["state"] = "needs_rework"
+            P["blockers"].append(f"adjudicated {ex['executed']}: relaunched automatically")
+        else:
+            P["state"] = "needs_rework"
+            P["blockers"].append("adjudication unavailable/exhausted: " + str(ex.get("detail"))[:160])
+    if P["state"] == "awaiting_final_review":
+        elig, why = auto_eligibility(P, cfg, mode)
+        P["auto_would"] = {"eligible": elig, "reasons": why}
+        ledger("shadow", chain=chain, auto_would=elig, reasons=why[:4], mode=mode)
+    save_packet(P)
+    ledger("packet", chain=chain, state=P["state"], kind=P["kind"], risk=(P.get("risk") or {}).get("score"))
+    return P
+
+
+def scan(cfg=None, mode=None, build=True, no_checks=False, dry_go=False, runner=land_packet.sh, **kw):
+    cfg = cfg or load_cfg()
+    mode = mode or get_mode()
+    res = {"go": [], "packets": [], "auto_landed": []}
+    for label, wt in go_rows():
+        if not Path(wt).is_dir():
+            continue
+        P = go_packet(label, wt, cfg, execute=True, dry=dry_go)
+        save_packet(P)
+        res["go"].append((label, P["state"]))
+    if build:
+        for c in integration_candidates():
+            P = process_candidate(c, cfg, mode, no_checks=no_checks, runner=runner, **kw)
+            res["packets"].append((P["chain"], P["state"]))
+            if mode == "AUTO" and P["state"] == "awaiting_final_review":
+                ok, why = auto_eligibility(P, cfg, mode)
+                if ok:
+                    try:
+                        approve(P["chain"], by="auto")
+                        res["auto_landed"].append(P["chain"])
+                    except LandError as e:
+                        ledger("auto-refused", chain=P["chain"], why=str(e)[:200])
+        for inbox in sorted((LANDING / "inbox").glob("*.json")) if (LANDING / "inbox").is_dir() else []:
+            c = jload(inbox)
+            if c:
+                P = process_candidate(c, cfg, mode, no_checks=no_checks, runner=runner, **kw)
+                res["packets"].append((P["chain"], P["state"]))
+                if mode == "AUTO" and P["state"] == "awaiting_final_review" and auto_eligibility(P, cfg, mode)[0]:
+                    with contextlib.suppress(LandError):
+                        approve(P["chain"], by="auto")
+                        res["auto_landed"].append(P["chain"])
+                if P["state"] in ("landed", "rejected", "reverted"):
+                    with contextlib.suppress(OSError):
+                        inbox.unlink()
+    return res
+
+
+def ingest(job_id, runner=land_packet.sh):
+    """Called from the gate hook: a dispatch job finished with a landable verdict. Register it;
+    stage + packetise happens in `scan` (kept off the gate's critical path)."""
+    g = gate_for(job_id)
+    if str(g.get("verdict")) not in ("pass", "concerns"):
+        return None
+    wt = g.get("job_cwd")
+    label = g.get("job_label") or job_id
+    if not wt or not Path(wt).is_dir() or re.match(r"^(auto-(author|refine)|gate-|regate-|esc-)", label or ""):
+        return None
+    if g.get("auto_pipeline_stage") == "author" or "REFINE TASK" in str(g.get("task_intent")) or "authoring" in str(g.get("task_intent")).lower():
+        return None
+    # a slice's sub-job lands through its CHAIN integration, never on its own
+    try:
+        for f in SLICE_RUNS.glob("*.json"):
+            st = jload(f)
+            if isinstance(st, dict) and any(isinstance(x, dict) and x.get("job_id") == job_id for x in (st.get("slices") or {}).values()):
+                return None
+    except OSError:
+        pass
+    ledger("ingest", chain=label, job=job_id, verdict=g.get("verdict"))
+    return {"chain": label, "job": job_id, "worktree": wt}
+
+
+# ---------------- summary ----------------
+def summary(max_rows=8):
+    pk = all_packets()
+    wait = [p for p in pk if p.get("state") == "awaiting_final_review"]
+    rework = [p for p in pk if p.get("state") == "needs_rework"]
+    stuck = [p for p in pk if p.get("state") in ("landed_unpushed", "landed_regression_unreverted")]
+    held = [p for p in pk if p.get("state") in ("go_held", "go_reauthor")]
+    mode = get_mode()
+    lines = []
+    if wait or stuck:
+        lines.append(f"LAND QUEUE (mode {mode}): {len(wait)} chain(s) awaiting FINAL REVIEW by the main session. "
+                     "Each has a computed packet; review it, then run ONE command per chain.")
+        for p in wait[-max_rows:]:
+            r, c = p.get("risk") or {}, p.get("checks") or {}
+            lines.append(f"  - {p['chain']}  [{Path(p['repo']).name}]  tier {r.get('tier')} risk {r.get('score')}  "
+                         f"checks {c.get('status')}  gate {(p.get('gate') or {}).get('verdict')}  "
+                         f"-> ollama-land show {p['chain']} | approve | reject --reason")
+        for p in stuck:
+            lines.append(f"  - ATTENTION {p['chain']}: {p['state']} -- see ollama-land show {p['chain']}")
+    if rework:
+        lines.append(f"  ({len(rework)} chain(s) in automatic rework: " + ", ".join(p["chain"] for p in rework[:6]) + ")")
+    if held and wait:
+        lines.append(f"  ({len(held)} harness-GO chain(s) held/re-authoring)")
+    for f in sorted((LANDING / "breaker").glob("*.json")) if (LANDING / "breaker").is_dir() else []:
+        if jload(f, {}).get("open"):
+            lines.append(f"  BREAKER OPEN for {f.stem}: two consecutive post-land reverts; landing frozen there")
+    return "\n".join(lines)
+
+
+def stats():
+    led = read_ledger()
+    ag, bad = shadow_counts()
+    pk = all_packets()
+    hall = sum((p.get("findings_stats") or {}).get("hallucinated", 0) for p in pk)
+    return {"mode": get_mode(), "packets": len(pk), "by_state": {s: sum(1 for p in pk if p.get("state") == s) for s in sorted({p.get("state") for p in pk})},
+            "shadow_agreements": ag, "shadow_false_eligible": bad,
+            "post_land_reverts": sum(1 for r in led if r.get("event") == "post-land-revert"),
+            "hallucinated_findings_dropped": hall,
+            "decisions": sum(1 for r in led if r.get("event") == "main-decision")}
+
+
+# ---------------- CLI ----------------
+def cmd_list(a):
+    for p in all_packets():
+        r, c = p.get("risk") or {}, p.get("checks") or {}
+        print(f"{p['chain']:44} {p.get('state'):24} {p.get('kind'):12} "
+              f"{Path(p.get('repo') or p.get('worktree') or '-').name:18} tier={r.get('tier','-'):3} risk={str(r.get('score','-')):4} checks={c.get('status','-')}")
+
+
+def cmd_show(a):
+    p = LANDING / slug(a.chain) / "packet.md"
+    if not p.is_file():
+        sys.exit(f"no packet for {a.chain!r} (see: ollama-land list)")
+    print(p.read_text())
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ollama-land", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    s = sub.add_parser("show"); s.add_argument("chain")
+    s = sub.add_parser("approve"); s.add_argument("chain"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("reject"); s.add_argument("chain"); s.add_argument("--reason", required=True)
+    s = sub.add_parser("revert"); s.add_argument("chain")
+    s = sub.add_parser("scan"); s.add_argument("--no-checks", action="store_true"); s.add_argument("--no-build", action="store_true")
+    s.add_argument("--dry-go", action="store_true", help="evaluate HARNESS-GO rows but do not confirm/enqueue/relaunch")
+    s = sub.add_parser("go"); s.add_argument("label", nargs="?"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("ingest"); s.add_argument("--job", required=True)
+    s = sub.add_parser("summary"); s.add_argument("--scan-bg", action="store_true")
+    sub.add_parser("stats")
+    s = sub.add_parser("mode")
+    s = sub.add_parser("breaker"); s.add_argument("action", choices=["show", "clear"]); s.add_argument("repo", nargs="?")
+    s = sub.add_parser("packet", help="build/refresh the packet for a registered candidate without any action")
+    s.add_argument("chain"); s.add_argument("--no-checks", action="store_true")
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "list":
+            cmd_list(a)
+        elif a.cmd == "show":
+            cmd_show(a)
+        elif a.cmd == "approve":
+            r = approve(a.chain, by="main", dry=a.dry_run)
+            print(json.dumps(r, indent=1, default=str)[:3000] if a.dry_run else
+                  f"{a.chain}: {r['state']}  {r['history'][-1]['detail']}\nrevert: {r['revert']['command']}")
+        elif a.cmd == "reject":
+            r = reject(a.chain, a.reason)
+            print(f"{a.chain}: rejected ({r.get('rows_closed', 0)} row(s) closed)")
+        elif a.cmd == "revert":
+            r = revert_chain(a.chain)
+            print(f"{a.chain}: {r['state']}  {r['history'][-1]['detail']}")
+        elif a.cmd == "scan":
+            print(json.dumps(scan(build=not a.no_build, no_checks=a.no_checks, dry_go=a.dry_go), indent=1, default=str))
+        elif a.cmd == "go":
+            cfg = load_cfg()
+            rows = go_rows()
+            for label, wt in rows:
+                if a.label and a.label != label:
+                    continue
+                P = go_packet(label, wt, cfg, execute=not a.dry_run, dry=a.dry_run)
+                save_packet(P)
+                print(f"{label}: {P['state']} -> {P['decision']['action']}  {'; '.join(P['decision']['reasons'][:3])}")
+        elif a.cmd == "ingest":
+            c = ingest(a.job)
+            if c:
+                (LANDING / "inbox").mkdir(parents=True, exist_ok=True)
+                g = gate_for(a.job)
+                wt = c["worktree"]
+                d, out = stage_dispatch(wt)
+                if d.get("staged") or "already exists" in out:
+                    branch = d.get("target_branch") or re.search(r"(integrate/\S+)", out).group(1)
+                    repo = land_packet.sh(["git", "-C", wt, "worktree", "list", "--porcelain"])[1].split("\n")[0].split(" ", 1)[1]
+                    pf = jload(Path(wt) / ".preflight-state.json", {}) or {}
+                    jsave(LANDING / "inbox" / f"{slug(c['chain'])}.json",
+                          {"chain": c["chain"], "label": c["chain"], "kind": "dispatch", "repo": repo, "branch": branch,
+                           "job_id": a.job, "gate": g, "declared_scope": pf.get("declared_scope"), "worktree": wt})
+                    print(f"registered {c['chain']} -> {branch}")
+                else:
+                    print(f"not stageable: {out[-200:]}")
+        elif a.cmd == "summary":
+            if a.scan_bg:
+                lk = LANDING / ".scan-bg.lock"
+                LANDING.mkdir(parents=True, exist_ok=True)
+                if not lk.exists() or time.time() - lk.stat().st_mtime > 900:
+                    lk.write_text(str(os.getpid()))
+                    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "scan"], stdin=subprocess.DEVNULL,
+                                     stdout=open(LANDING / "scan-bg.log", "ab"), stderr=subprocess.STDOUT, start_new_session=True)
+            out = summary()
+            if out:
+                print(out)
+        elif a.cmd == "stats":
+            print(json.dumps(stats(), indent=1))
+        elif a.cmd == "mode":
+            print(get_mode())
+        elif a.cmd == "breaker":
+            if a.action == "show":
+                for f in sorted((LANDING / "breaker").glob("*.json")) if (LANDING / "breaker").is_dir() else []:
+                    print(f.stem, json.dumps(jload(f)))
+            else:
+                jsave(breaker_path(a.repo), {"consecutive_reverts": 0, "open": False, "cleared_at": now_iso()})
+                print("cleared", a.repo)
+        elif a.cmd == "packet":
+            cfg = load_cfg()
+            c = jload(LANDING / "inbox" / f"{slug(a.chain)}.json") or next((x for x in integration_candidates() if x["chain"] == a.chain), None)
+            if not c:
+                sys.exit(f"no registered candidate {a.chain!r}")
+            P = process_candidate(c, cfg, get_mode(), no_checks=a.no_checks, allow_adjudicate=False)
+            print(f"{P['chain']}: {P['state']}  {packet_path(P['chain'])}")
+    except LandError as e:
+        print(f"ollama-land: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

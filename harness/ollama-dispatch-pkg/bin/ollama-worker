@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Thin launcher for ollama_dispatch.worker
+exec python3 -m ollama_dispatch.worker "$@"

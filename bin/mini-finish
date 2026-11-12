@@ -1,0 +1,1265 @@
+#!/usr/bin/env python3
+"""mini-finish: Claude finishes a failed local mini job IN PLACE, in the session that launched it.
+
+  mini-finish <job>                    claim the job and print the brief: what failed, the files to finish, the frozen test
+  mini-finish <job> --check            re-run the job's own gates on the finished files (no model call). PASS: the remaining
+                                       steps of a chain go back to the local model as a continuation (steps 1..k are
+                                       replayed, no model), then the failed job is resolved and its card cleared
+  mini-finish <job> --check --dry-run  the gates only: nothing is queued, resolved or cleared
+  mini-finish <job> --take             claim a job that another live session launched or claimed
+  mini-finish --list                   failed jobs that mini-finish can take
+
+This is the escalation for a local (Darkbloom) mini-swe-runner job that ran out of road: failure class model, timeout or
+context. The local model's last attempt stays in the job's work dir. The session that launched the job gets the queue
+event with `finish=`, edits that attempt there and checks it. It runs on the subscription: no `claude -p`, no API, no
+subagent. A spec, infra, operator or harness failure is not unfinished work and goes to `mini-triage <id>`.
+
+Modes (from the job's spec):
+  single    two-phase: finish the fix against the frozen test (or the test too, if phase A never froze one).
+            Check: runner --check-only --try-test/--try-fix (every phase-B gate) plus an unchanged frozen test.
+  chain     `steps` that failed at step k: finish step k in the work dir, where steps 1..k-1 are already applied.
+            Check: replay steps 1..k with the real gates (run_dir/step-refs + step k from the work dir).
+            PASS with steps left: a continuation spec <spec dir>-c<j>/ replays 1..k and the local model does k+1..N.
+  draft     test_draft (phase_a_only): finish the drafted test. Check: --try-test --draft-check (the job's draft_accept_cmd).
+  diagnose  finish DIAGNOSIS.md. Check: --try-diagnosis (diag_check) and no tracked source edits.
+  auto      (mode "auto") a job that failed in its fix stage is finished as `single` against the two-phase spec the runner
+            derived (<run dir>/spec.auto.json). Its frozen test is model-written: check it against the Problem first. Land a
+            PASS with `mini-auto land <job>`. A failure before the fix stage (diagnose, derive) is refused: fix it directly.
+
+Refused: a job that is not a mini-swe-runner job, not failed, or of another failure class; a failed replay (the
+continuation spec's fault); a superseded job or one that already has a continuation; a missing work dir; a chain step
+k>1 without the per-step refs (runs that predate them); a verify-mode spec; a job another live session launched or
+claimed (unless --take).
+
+Files: <run dir>/finish/FINISH.json (claim), finish/local/ (the local attempt as it was when claimed), finish/check-<ts>/
+(the last check: check.log and the runner's scratch copy), finish/FINISHED.json (PASS), <home>/mini-finish.jsonl.
+
+Env: MINI_FINISH_HOME (~/.ollama-dispatch), MINI_FINISH_LOGS (~/bin/ollama-queue-logs), MINI_FINISH_LIVELOGS
+(~/bin/ollama-queue-livelogs), MINI_FINISH_STATE (~/bin/ollama-queue-state.json), MINI_RUNNER, MINI_FINISH_QUEUE,
+MINI_FINISH_SUBMIT, MINI_FINISH_VALIDATE (commands; default the ~/bin tools), MINI_FINISH_API (http://127.0.0.1:7684),
+MINI_FINISH_DELIVER (queue-events-deliver.py, for this session's identity).
+
+Exit: 0 ok, 1 refused / usage / check FAIL, 2 an action after a PASS failed (continuation, resolve or clear).
+"""
+import argparse
+import ast
+import collections
+import copy
+import datetime
+import difflib
+import fcntl
+import glob
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+FINISH_CLASSES = ("model", "timeout", "context")
+DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+DAEMON_PATH = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+CHECK_TIMEOUT = 3600
+LABEL_MAX = 48
+REPLAY_FAIL = re.compile(r"\breplay (?:RED|no-ref|test-rejected)\b")
+JOB_ID = re.compile(r"[0-9a-f]{6,64}")  # a queue job id (mini-submit prints it; the queue mints 12 hex)
+GATE_ROW = re.compile(r"^\[mini-runner\]   (\w+): (ok|FAIL) ?(.*)$")
+_MODS = {}
+
+
+class Refuse(Exception):
+    pass
+
+
+def envp(var, default):
+    return Path(os.path.expanduser(os.environ.get(var) or str(default)))
+
+
+def HOME():
+    return envp("MINI_FINISH_HOME", "~/.ollama-dispatch")
+
+
+def LOGS():
+    return envp("MINI_FINISH_LOGS", "~/bin/ollama-queue-logs")
+
+
+def LIVELOGS():
+    return envp("MINI_FINISH_LIVELOGS", "~/bin/ollama-queue-livelogs")
+
+
+def STATE():
+    return envp("MINI_FINISH_STATE", "~/bin/ollama-queue-state.json")
+
+
+def RUNNER():
+    return envp("MINI_RUNNER", HERE / "mini-swe-runner.py")
+
+
+def API():
+    return (os.environ.get("MINI_FINISH_API") or "http://127.0.0.1:7684").rstrip("/")
+
+
+def tool(var, name):
+    v = os.environ.get(var)
+    return shlex.split(v) if v else [sys.executable, str(HERE / name)]
+
+
+def load(name, path):
+    key = (name, str(path))
+    if key not in _MODS:
+        sp = importlib.util.spec_from_file_location(name, str(path))
+        m = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(m)
+        _MODS[key] = m
+    return _MODS[key]
+
+
+def R():
+    return load("mini_swe_runner", RUNNER())
+
+
+def D():
+    return load("queue_events_deliver", envp("MINI_FINISH_DELIVER", HERE / "queue-events-deliver.py"))
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sha12_bytes(b):
+    return hashlib.sha256(b).hexdigest()[:12]
+
+
+def sha12(p):
+    p = Path(p)
+    return sha12_bytes(p.read_bytes()) if p.is_file() else None
+
+
+def rd(p):
+    try:
+        return Path(p).read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def write_json(p, obj):
+    p = Path(p)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1) + "\n")
+    os.replace(tmp, p)
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+# ---- job lookup ---------------------------------------------------------------------------------
+
+def load_jobs():
+    try:
+        d = json.loads(STATE().read_text())
+        return [j for j in d.get("jobs", []) if isinstance(j, dict) and j.get("id")]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def sidecar_paths(prefix):
+    """{job id: sidecar path} for ids starting with prefix; the live dir wins over its archive."""
+    out = {}
+    for d in (LOGS() / "archive", LOGS()):
+        for p in glob.glob(str(d / (glob.escape(prefix) + "*.done.json"))):
+            jid = Path(p).name[:-len(".done.json")]
+            if re.fullmatch(r"[0-9A-Za-z_-]+", jid):
+                out[jid] = Path(p)
+    return out
+
+
+def find_job(jid, jobs):
+    if not re.fullmatch(r"[0-9A-Za-z_-]{3,64}", jid or ""):
+        raise Refuse(f"bad job id {jid!r}")
+    paths = sidecar_paths(jid)
+    cands = set(paths) | {str(j["id"]) for j in jobs if str(j["id"]).startswith(jid)}
+    if jid in cands:
+        pick = jid
+    elif len(cands) == 1:
+        pick = next(iter(cands))
+    elif not cands:
+        raise Refuse(f"no job {jid}: no sidecar in {LOGS()} (or its archive) and no live row")
+    else:
+        raise Refuse(f"ambiguous job id {jid}: {', '.join(sorted(cands)[:6])}")
+    rec = {}
+    sc = paths.get(pick)
+    if sc:
+        try:
+            rec = json.loads(sc.read_text())
+            rec = rec if isinstance(rec, dict) else {}
+        except (OSError, ValueError):
+            rec = {}
+    live = next((j for j in jobs if str(j["id"]) == pick), None)
+    if live:
+        rec.update({k: v for k, v in live.items() if v is not None})
+    rec.update(id=pick, _live=live is not None, _archived=bool(sc and sc.parent.name == "archive"), _sidecar=str(sc) if sc else None)
+    return rec
+
+
+def verdict_text(rec):
+    return " ".join(str(rec.get(k) or "") for k in ("runner_verdict", "failure_detail", "terminal_reason"))
+
+
+def cheap_refusal(rec, jobs):
+    """Why mini-finish cannot take this job (None = it can), from the sidecar/live row alone."""
+    jid = rec["id"]
+    if Path(str(rec.get("runner") or "")).name != "mini-swe-runner.py":
+        return f"job {jid} is not a mini-swe-runner job (runner {rec.get('runner')!r}); mini-finish only finishes mini jobs"
+    if rec.get("status") != "failed":
+        return f"job {jid} is {rec.get('status')!r}, not failed"
+    if REPLAY_FAIL.search(verdict_text(rec)):
+        return (f"job {jid} failed while REPLAYING saved steps: that is the continuation spec's problem, not unfinished work: "
+                f"~/bin/mini-triage {jid}")
+    cls = str(rec.get("failure_class") or "").lower()
+    if cls not in FINISH_CLASSES:
+        return (f"job {jid} failed with class {cls or '?'} (not model/timeout/context): a spec/infra/operator problem, "
+                f"not unfinished work: ~/bin/mini-triage {jid}")
+    if rec.get("superseded_by"):
+        return f"job {jid} was superseded by {rec['superseded_by']}"
+    cont = rec.get("continued_by") or next((str(j["id"]) for j in jobs if str(j.get("continues") or "") == jid), None)
+    if cont:
+        return f"job {jid} already has a continuation ({cont})"
+    cwd = rec.get("cwd")
+    if not cwd or not Path(os.path.expanduser(str(cwd))).is_dir():
+        return f"job {jid}: its work dir {cwd} is gone, so there is nothing to finish in place"
+    return None
+
+
+# ---- context --------------------------------------------------------------------------------------
+
+class Ctx:
+    pass
+
+
+def newest_livelog(jid):
+    fs = [Path(p) for p in glob.glob(str(LIVELOGS() / (glob.escape(jid) + "-*.livelog")))]
+    return max(fs, key=lambda p: p.stat().st_mtime) if fs else None
+
+
+def chain_step(rec, log, run_dir, n):
+    for k in ("runner_verdict", "failure_detail", "terminal_reason"):
+        m = re.search(r"(?<![\w/.-])step-(\d+)\b", str(rec.get(k) or ""))
+        if m:
+            return int(m.group(1))
+    ms = re.findall(r"=== step (\d+)/", log)
+    if ms:
+        return int(ms[-1])
+    i = 1
+    while (run_dir / "step-refs" / f"s{i}").is_dir():
+        i += 1
+    return i
+
+
+def frozen_sha(c):
+    """(sha12 of the test the job froze for this step, or None: not frozen, the test is part of the finish; where it was inferred
+    from, or None when the runner's log said). Without the log: a phase-B REVIEW packet (it holds the test as phase A froze it,
+    which may differ from the baseline's), then a test supplied in the baseline."""
+    if c.mode not in ("single", "chain"):
+        return None, None
+    anchor = f"=== step {c.k}/" if c.mode == "chain" else "two-phase budgets"
+    i = c.log.rfind(anchor)
+    if i >= 0:
+        hits = [m.group(2) for m in re.finditer(r"test frozen: (\S+) sha=([0-9a-f]{12})", c.log[i:]) if m.group(1) == c.tf]
+        return (hits[-1] if hits else None), None
+    sec = review_section(c)
+    rejected = re.search(r"^#{2,3} Test file \(rejected\)", sec, re.M) or re.search(r"^#{2,3} Phase A REJECTED", sec, re.M)
+    if rejected:  # the packet shows phase A rejected the test: nothing was frozen, as the log would have said
+        return None, None
+    b = review_test_block(c) if re.search(r"^#{2,3} Phase B gates", sec, re.M) else None
+    if b is not None:  # phase B ran, so phase A accepted and froze this test (it may differ from the baseline's)
+        return sha12_bytes(b), "the REVIEW packet (no runner log kept)"
+    s = sha12(c.baseline / c.tf)
+    return s, ("the baseline's supplied test (no runner log kept)" if s else "unknown")
+
+
+def build_ctx(rec):
+    c = Ctx()
+    c.rec, c.jid = rec, rec["id"]
+    c.label = str(rec.get("label") or c.jid)
+    c.cls = str(rec.get("failure_class") or "").lower()
+    c.work = Path(os.path.expanduser(str(rec["cwd"])))
+    c.run_dir = c.work.parent
+    c.fdir = c.run_dir / "finish"
+    c.spec_path = Path(os.path.expanduser(str(rec.get("task_file") or "")))
+    c.spec_dir = c.spec_path.parent
+    try:
+        c.raw = json.loads(c.spec_path.read_text())
+        assert isinstance(c.raw, dict)
+    except (OSError, ValueError, AssertionError):
+        raise Refuse(f"cannot read the job's spec {c.spec_path}")
+    raw = c.raw
+    if raw.get("remote"):  # its tests and gates are third-party code that runs only on a CPU runner, never on this Mac
+        raise Refuse(f"job {c.jid} ran on the remote lane: its project code runs only on a CPU runner, so mini-finish (which runs "
+                     f"the tests here) refuses it. Fix it directly from {c.run_dir / 'REVIEW-AUTO.md'} (the model's test and fix are "
+                     f"in {c.work}); run its tests on claude-sandbox.")
+    c.auto, c.auto_task = raw.get("mode") == "auto", None
+    if c.auto:  # mode auto: the fix stage ran as a two-phase spec the runner derived (run_dir/spec.auto.json); finish that one
+        fsp = c.run_dir / "spec.auto.json"
+        if not fsp.is_file():
+            ph = re.search(r"\bphase=(\w+)", verdict_text(rec))
+            raise Refuse(f"auto job {c.jid} failed before its fix stage (phase={ph.group(1) if ph else '?'}), so there is no test or fix "
+                         f"to finish: fix it directly from the Problem ({raw.get('task')}). If you can name the file and function, "
+                         f"`~/bin/mini-auto new --repo <repo> --name <new-name> --file <F> --fn <X> --diagnose skip --desc-file "
+                         f"{raw.get('task')} --submit` hands it back to the local model. Packet: {c.run_dir / 'REVIEW-AUTO.md'}")
+        try:
+            fs = json.loads(fsp.read_text())
+            assert isinstance(fs, dict) and fs.get("mode") == "two-phase"
+        except (OSError, ValueError, AssertionError):
+            raise Refuse(f"cannot read the auto job's derived two-phase spec {fsp}")
+        c.auto_task, c.spec_path, c.raw = raw.get("task"), fsp, fs
+        raw = fs
+    if raw.get("steps"):
+        c.mode = "chain"
+    elif raw.get("mode") == "diagnose":
+        c.mode = "diagnose"
+    elif raw.get("mode") == "two-phase":
+        c.mode = "draft" if raw.get("phase_a_only") else "single"
+    else:
+        raise Refuse(f"spec mode {raw.get('mode')!r} (verify mode) is not supported by mini-finish: ~/bin/mini-triage {c.jid}")
+    lp = newest_livelog(c.jid)
+    c.log_path, c.log = lp, (rd(lp) if lp else "")
+    c.k, c.n, c.sp = 1, 1, raw
+    if c.mode == "chain":
+        steps = R().merged_steps(raw)
+        if any(s.get("phase_a_only") for s in steps):
+            raise Refuse("a test-draft chain is not supported by mini-finish")
+        c.n = len(steps)
+        c.k = chain_step(rec, c.log, c.run_dir, c.n)
+        if not 1 <= c.k <= c.n:
+            raise Refuse(f"cannot tell which step of {c.n} failed (got {c.k}): ~/bin/mini-triage {c.jid}")
+        gone = [i for i in range(1, c.k) if not (c.run_dir / "step-refs" / f"s{i}").is_dir()]
+        if gone:
+            raise Refuse(f"step {c.k} failed, but {c.run_dir / 'step-refs'} has no saved ref for step(s) {gone}: the run predates "
+                         f"per-step refs, so the earlier steps cannot be replayed. ~/bin/mini-triage {c.jid}")
+        c.sp = steps[c.k - 1]
+    bl = c.sp.get("baseline_from") or raw.get("baseline_from")
+    c.baseline = Path(os.path.expanduser(str(bl))) if bl else None
+    if not c.baseline or not c.baseline.is_dir():
+        raise Refuse(f"the baseline_from {bl} is gone")
+    c.tf = c.sp.get("test_file")
+    c.allowed = list(c.sp.get("allowed") or [])
+    c.scope = R().edit_scope(c.sp, c.allowed) if c.mode in ("single", "chain") else []
+    if c.mode in ("single", "chain", "draft") and not c.tf:
+        raise Refuse("the spec has no test_file")
+    c.frozen, c.frozen_from = frozen_sha(c)
+    if c.mode == "diagnose":
+        c.files = ["DIAGNOSIS.md"]
+    elif c.mode == "draft":
+        c.files = [c.tf]
+    else:
+        c.files = list(dict.fromkeys(c.scope + ([] if c.frozen else [c.tf])))
+    ref = raw.get("ref")
+    if ref:
+        rp = Path(os.path.expanduser(str(ref)))
+        c.ref = rp if rp.is_absolute() else (c.spec_dir / rp)
+    else:
+        c.ref = c.spec_dir / "ref" if (c.spec_dir / "ref").is_dir() else None
+    c.ref_hint = None
+    if c.ref and c.ref.is_dir() and c.mode in ("single", "chain"):
+        if c.mode == "chain" or (c.ref / "s1").is_dir():
+            c.ref_hint = c.ref / f"s{c.k}"
+        else:
+            c.ref_hint = c.ref
+        if not c.ref_hint.is_dir():
+            c.ref_hint = None
+    return c
+
+
+def step_base(c, f):
+    """The bytes this step started from (None = absent): earlier steps' saved refs, else HEAD, else the baseline."""
+    if c.mode == "chain":
+        for i in range(c.k - 1, 0, -1):
+            sd = c.run_dir / "step-refs" / f"s{i}"
+            if f in (R().ref_manifest(sd).get("deleted") or []):
+                return None
+            if (sd / f).is_file():
+                return (sd / f).read_bytes()
+    p = subprocess.run(["git", "-C", str(c.work), "show", f"HEAD:{f}"], capture_output=True)
+    if p.returncode == 0:
+        return p.stdout
+    bp = c.baseline / f
+    return bp.read_bytes() if bp.is_file() else None
+
+
+def lines_of(b):
+    return [] if b is None else b.decode("utf-8", "replace").splitlines()
+
+
+def added_lines(a, b):
+    """Counter of the stripped, non-empty lines b adds to a."""
+    al, bl = lines_of(a), lines_of(b)
+    out = collections.Counter()
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, al, bl, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            out.update(x.strip() for x in bl[j1:j2] if x.strip())
+    return out
+
+
+def plus_minus(a, b):
+    al, bl = lines_of(a), lines_of(b)
+    add = rem = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, al, bl, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            add += j2 - j1
+        if tag in ("delete", "replace"):
+            rem += i2 - i1
+    return add, rem
+
+
+# ---- ownership and the claim ---------------------------------------------------------------------
+
+def me_bridge():
+    try:
+        return D().my_socket(), os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID")
+    except Exception:
+        return None, os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID")
+
+
+def read_claim(c):
+    try:
+        d = json.loads((c.fdir / "FINISH.json").read_text())
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def claim_is_mine(claim, me, bridge):
+    cb = D().norm_sock(claim.get("claimed_by"))
+    return bool(cb and me and cb == D().norm_sock(me) and not (bridge and claim.get("bridge") and claim["bridge"] != bridge))
+
+
+def ownership_refusal(c, claim, take):
+    me, bridge = me_bridge()
+    if claim and claim_is_mine(claim, me, bridge):
+        return None
+    if claim and not take:
+        cb = D().norm_sock(claim.get("claimed_by"))
+        if cb and os.path.exists(cb):
+            return (f"job {c.jid} is being finished by another live session ({cb}, claimed {claim.get('ts')}); "
+                    f"`~/bin/mini-finish {c.jid} --take` takes it over")
+    if not take and D().classify(c.rec, me, bridge, {}) == "other":
+        return (f"job {c.jid} was launched by another live session ({D().norm_sock(c.rec.get('launched_by'))}), which got its event "
+                f"and finishes it; `~/bin/mini-finish {c.jid} --take` takes it over here")
+    return None
+
+
+def review_test_block(c):
+    """The frozen test text as the REVIEW packet recorded it (the step's section for a chain), or None."""
+    t = rd(c.run_dir / "REVIEW.md")
+    if c.mode == "chain":
+        m = re.search(rf"^## Step {c.k}: .*?(?=^## Step \d+: |\Z)", t, re.S | re.M)
+        t = m.group(0) if m else ""
+    m = re.search(r"^#{2,3} Test file[^\n]*\n\n```\n(.*?)\n```\n\n#{2,3} ", t, re.S | re.M)
+    return m.group(1).encode() if m else None
+
+
+def restore_frozen(c):
+    """Put the frozen test back if the work dir's copy differs (phase B may have edited it). Returns a note or None."""
+    if not c.frozen:
+        return None
+    tp = c.work / c.tf
+    if sha12(tp) == c.frozen:
+        return None
+    for src, what in ((c.baseline / c.tf, "the baseline"), (None, "the REVIEW packet")):
+        b = src.read_bytes() if src is not None and src.is_file() else (review_test_block(c) if src is None else None)
+        if b is not None and sha12_bytes(b) == c.frozen:
+            tp.parent.mkdir(parents=True, exist_ok=True)
+            tp.write_bytes(b)
+            return f"restored the frozen test {c.tf} (sha {c.frozen}) from {what}: the local model had changed it"
+    return (f"WARNING: {c.tf} in the work dir is not the frozen test (sha {c.frozen}) and no copy was found to restore it; "
+            f"the check will fail until it is restored")
+
+
+def make_claim(c, claim, take):
+    me, bridge = me_bridge()
+    first = claim is None
+    note = None
+    if first:
+        c.fdir.mkdir(parents=True, exist_ok=True)
+        R().save_step_ref(c.work, c.fdir / "local", c.files)  # the local model's attempt, before any edit
+        note = restore_frozen(c)
+        claim = {"job": c.jid, "label": c.label, "mode": c.mode, "step": c.k, "steps": c.n, "frozen": c.frozen, "files": c.files,
+                 "claims": []}
+    claim.update(claimed_by=D().norm_sock(me) if me else None, bridge=bridge, ts=now_iso())
+    claim.setdefault("claims", []).append({"by": claim["claimed_by"], "bridge": bridge, "ts": claim["ts"], "take": bool(take)})
+    write_json(c.fdir / "FINISH.json", claim)
+    return claim, first, note
+
+
+# ---- the brief -------------------------------------------------------------------------------------
+
+def review_section(c):
+    t = rd(c.run_dir / "REVIEW.md")
+    if c.mode == "chain":
+        m = re.search(rf"^## Step {c.k}: .*?(?=^## Step \d+: |\Z)", t, re.S | re.M)
+        return m.group(0) if m else ""
+    return t
+
+
+def failed_items(c):
+    out = []
+    if c.mode in ("single", "chain"):
+        sec = review_section(c)
+        out += [f"{g}: {d}" for g, d in re.findall(r"^\| (\w+) \| FAIL \| (.*?) \|$", sec, re.M)]
+        m = re.search(r"Phase A REJECTED[^\n]*\n\n(?:[^\n-][^\n]*\n\n)?((?:- [^\n]*\n?)+)", sec)
+        if m:
+            out += ["phase A: " + ln[2:] for ln in m.group(1).splitlines() if ln.startswith("- ")]
+    elif c.mode == "draft":
+        dc = rd(c.run_dir / "DRAFT-CHECK.txt")
+        if dc.strip():
+            out += R().draft_feedback(dc)[0]
+    elif c.mode == "diagnose":
+        m = re.search(r"Remaining gate failures[^\n]*\n\n((?:- [^\n]*\n?)+)", rd(c.run_dir / "REVIEW.md"))
+        if m:
+            out += [ln[2:] for ln in m.group(1).splitlines() if ln.startswith("- ")]
+    if not out and c.log:
+        out += [ln.strip() for ln in c.log.splitlines() if re.search(r"\bRED\b|REJECTED|\bFAIL\b", ln)][-6:]
+    return out
+
+
+_SECRET_LIT = re.compile(r"(?i)\b(\w*(?:api_?key|token|secret|password|passkey)\w*\s*[=:]\s*)(['\"])[^'\"]{6,}\2")
+
+
+def _redact(line):
+    return _SECRET_LIT.sub(lambda m: m.group(1) + m.group(2) + "***" + m.group(2), line)
+
+
+def _numbered(L, a, b, cap):
+    out = [f"{i + 1:5d}  {_redact(L[i])}" for i in range(a, min(b, a + cap))]
+    return out + ([f"       ... ({b - a - cap} more lines)"] if b - a > cap else [])
+
+
+def fn_source(path, name, cap=120):
+    """-> numbered lines of function `name` in path ([] when not found). python: ast, at any depth (methods too); JS/TS: the
+    brace block from its declaration (braces in strings and comments count too: good enough for a brief)."""
+    text = rd(path)
+    if not text:
+        return []
+    L = text.split("\n")
+    if str(path).endswith(".py"):
+        try:
+            hits = [n for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+        except SyntaxError:
+            return []
+        if not hits:
+            return []
+        n = hits[0]
+        return _numbered(L, min([n.lineno] + [d.lineno for d in n.decorator_list]) - 1, n.end_lineno, cap)
+    q = re.escape(name)
+    pat = re.compile(rf"\bfunction\s*\*?\s*{q}\s*\(|\b{q}\s*[:=]\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)"
+                     rf"|^\s*(?:static\s+|async\s+)*{q}\s*\([^)]*\)\s*\{{")
+    a = next((i for i, ln in enumerate(L) if pat.search(ln)), None)
+    if a is None:
+        return []
+    depth, seen, b = 0, False, None
+    for i in range(a, len(L)):
+        for ch in L[i]:
+            if ch == "{":
+                depth, seen = depth + 1, True
+            elif ch == "}":
+                depth -= 1
+        if seen and depth <= 0:
+            b = i + 1
+            break
+    return _numbered(L, a, b or min(len(L), a + cap), cap)
+
+
+def auto_context(c, test_cap=320):
+    """An AUTO job's brief carries what checking the model-written test against the Problem needs, so it is one read, not
+    three: the Problem, the target function(s) as they stand in the work dir, and the test file."""
+    out = []
+    prob = rd(Path(os.path.expanduser(str(c.auto_task or "")))).strip()
+    if prob:
+        out += [f"  --- Problem ({c.auto_task})"] + ["    " + _redact(ln) for ln in prob[:2500].splitlines()]
+        out += ["    ... (cut)"] if len(prob) > 2500 else []
+    tg = c.sp.get("target_fn")
+    for name in ([tg] if isinstance(tg, str) else list(tg or []))[:3]:
+        for f in [f for f in c.files if f != c.tf]:
+            got = fn_source(c.work / f, name)
+            if got:
+                out += [f"  --- {f}: {name} (work dir, as the check sees it)"] + got
+                break
+    t = c.work / c.tf
+    if c.tf and t.is_file():
+        L = rd(t).split("\n")
+        out += [f"  --- test {c.tf} ({len(L)} lines, " + ("frozen" if c.frozen else "part of the finish") + ")"]
+        out += _numbered(L, 0, len(L), test_cap)
+    return out
+
+
+def brief(c, claim, first, note):
+    rec = c.rec
+    step = f", step {c.k}/{c.n}" if c.mode == "chain" else ""
+    say(f"mini-finish: job {c.jid} {c.label} [{c.mode}{step}]" + ("" if first else " (already claimed by this session: brief again)"))
+    say(f"  failed: {(rec.get('runner_verdict') or rec.get('failure_detail') or rec.get('terminal_reason') or '?')[:400]} "
+        f"(class {c.cls})")
+    say(f"  work dir: {c.work}")
+    say("    finish IN PLACE: the local model's attempt is kept there. Edit it; do not start over.")
+    say(f"  spec: {c.spec_path}")
+    if note:
+        say(f"  {note}")
+    items = failed_items(c)
+    if items:
+        say("  what failed:")
+        for it in items:
+            say(textwrap_indent(it[:1800], "    - ", "      "))
+    say("  files to finish (changes vs where this step started):")
+    for f in c.files:
+        cur = (c.work / f).read_bytes() if (c.work / f).is_file() else None
+        base = step_base(c, f)
+        if cur is None:
+            st = "missing (not written)" if base is None else "DELETED"
+        elif base is None:
+            st = f"new, {len(lines_of(cur))} lines"
+        elif cur == base:
+            st = "unchanged"
+        else:
+            a, r = plus_minus(base, cur)
+            st = f"+{a} -{r}"
+        say(f"    {f}  ({st})")
+    if c.frozen:
+        say(f"  frozen test: {c.tf} sha={c.frozen}: not yours to change; the check fails if it differs"
+            + (f" (inferred from {c.frozen_from})" if c.frozen_from else ""))
+        prop = c.run_dir / (f"s{c.k}-test-proposal.diff" if c.mode == "chain" else "test-proposal.diff")
+        if prop.is_file():
+            say(f"    the local model proposed a test change ({prop}). If the test itself is wrong, that is mini-triage, not a finish")
+    elif c.mode in ("single", "chain") and c.frozen_from:
+        say(f"  WARNING: test {c.tf}: no runner log or phase-B REVIEW packet was kept and the baseline has no such test, so "
+            f"whether phase A froze one is unknown. The check treats it as part of the finish, so nothing holds it fixed: "
+            f"do not weaken it; if it needs changing, that is mini-triage")
+    elif c.mode in ("single", "chain"):
+        say(f"  test: {c.tf} was never frozen (phase A did not accept one), so it is part of the finish")
+    if c.auto:
+        say(f"  AUTO job: the local model diagnosed the bug ({c.run_dir / 'DIAGNOSIS.md'}) and wrote the test {c.tf} itself from the "
+            f"Problem ({c.auto_task}). Check the test's assertions against the Problem FIRST: a wrong test is not finishable "
+            f"(fix the bug directly instead). Packet: {c.run_dir / 'REVIEW-AUTO.md'}")
+    sp = c.sp
+    for k in ("target_fn", "fn_scope", "test_cmd", "suite_cmd", "typecheck_cmd", "draft_accept_cmd", "must_mention"):
+        if sp.get(k):
+            say(f"  {k}: {sp[k] if isinstance(sp[k], str) else json.dumps(sp[k])}")
+    tm = c.work / "TASK.md"
+    musts = R().parse_must_contain(rd(tm)) if tm.is_file() else []
+    if musts:
+        say("  must contain: " + "; ".join(f"`{lit}`" + (f" in {f}" if f else "") for f, lit in musts)[:600])
+    say(f"  task: {tm}")
+    if (c.run_dir / "REVIEW.md").is_file():
+        say(f"  review packet: {c.run_dir / 'REVIEW.md'}" + (f" (section `## Step {c.k}`)" if c.mode == "chain" else ""))
+    if c.mode == "draft" and (c.run_dir / "DRAFT-CHECK.txt").is_file():
+        say(f"  last acceptance check: {c.run_dir / 'DRAFT-CHECK.txt'}")
+    if c.ref_hint:
+        fs = [f for f in c.files if (c.ref_hint / f).is_file()]
+        if fs:
+            say(f"  validated reference fix: {c.ref_hint}. Compare: "
+                + "; ".join(f"diff -u {shlex.quote(str(c.ref_hint / f))} {shlex.quote(str(c.work / f))}" for f in fs[:3]))
+            say("    using it is allowed; the local share (how much of the local attempt survives) is recorded either way")
+    elif c.mode == "chain" and c.k < c.n:
+        say("  WARNING: no validated ref for this chain, so a continuation cannot be validated (mini-validate needs ref/s<N>)")
+    say(f"  local attempt snapshot: {c.fdir / 'local'}")
+    if c.mode in ("single", "chain") and sp.get("mutation_gate"):
+        mg = sp["mutation_gate"] if isinstance(sp["mutation_gate"], dict) else {}
+        say(f"  mutation_gate: the check runs it on the finished function too, as phase B would (fail_below={mg.get('fail_below')}, "
+            f"warn_below={mg.get('warn_below', 0.6)}): keep the fix to what the frozen test pins; a test too weak to judge is mini-triage")
+    after = {"chain": (f"steps {c.k + 1}..{c.n} go back to the local model as a continuation, then " if c.k < c.n else ""),
+             }.get(c.mode, "")
+    say("  next: edit the files above in THIS session (no subagent, no API, no `claude -p`), then run")
+    say(f"    ~/bin/mini-finish {c.jid} --check     # the job's own gates, no model: minutes, so run it in the background")
+    say(f"    on PASS: {after}the job is resolved and its card cleared; FAIL lists the red gates and keeps the claim")
+    if c.auto:
+        for ln in auto_context(c):
+            say(ln)
+
+
+def textwrap_indent(text, first, rest):
+    ls = text.splitlines() or [""]
+    return "\n".join([first + ls[0]] + [rest + ln for ln in ls[1:]])
+
+
+# ---- --check ----------------------------------------------------------------------------------------
+
+def run_runner(chk, spec_path, extra):
+    work2 = chk / "work"
+    work2.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(RUNNER()), "--check-only", "--cwd", str(work2), "--task-file", str(spec_path), *extra]
+    log = chk / "check.log"
+    with open(log, "w") as fh:
+        fh.write("$ " + shlex.join(cmd) + "\n")
+        fh.flush()
+        p = subprocess.Popen(cmd, cwd=str(chk), env={**os.environ, "PATH": DAEMON_PATH}, stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        try:
+            rc = p.wait(timeout=CHECK_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+            rc = 124
+            fh.write(f"\n[mini-finish] check timed out after {CHECK_TIMEOUT}s\n")
+    return rc, rd(log)
+
+
+def gates_after(out, marker):
+    """{gate: (ok, detail)} from the indented rows that follow the last line containing marker."""
+    i = out.rfind(marker)
+    gates = {}
+    if i < 0:
+        return gates
+    for ln in out[i:].splitlines()[1:]:
+        m = GATE_ROW.match(ln)
+        if not m:
+            if gates:
+                break
+            continue
+        gates[m.group(1)] = (m.group(2) == "ok", m.group(3).strip())
+    return gates
+
+
+def stray_files(c):
+    """Files changed in the work dir that the finish will neither check nor land (warning only)."""
+    R_ = R()
+    names = set(R_.changed_files(c.work))
+    st = R_.git(c.work, "status", "--short", "--untracked-files=all").splitlines()
+    names |= {x.strip() for x in R_.untracked_violations(st)}
+    out = []
+    for f in sorted(names):
+        if f in c.files or f == "TASK.md" or f == c.tf:
+            continue
+        cur = (c.work / f).read_bytes() if (c.work / f).is_file() else None
+        bp = c.baseline / f
+        if cur is not None and bp.is_file() and bp.read_bytes() == cur:
+            continue
+        if c.mode == "chain":
+            prior = None
+            for i in range(c.k - 1, 0, -1):
+                sd = c.run_dir / "step-refs" / f"s{i}"
+                if (sd / f).is_file() or f in (R_.ref_manifest(sd).get("deleted") or []):
+                    prior = (sd / f).read_bytes() if (sd / f).is_file() else None
+                    break
+            if prior == cur and (prior is not None or f in names):
+                continue
+        out.append(f)
+    return out
+
+
+def result_of(out):
+    """The runner's last RESULT line, as ' (RESULT ...)', so a setup failure names its cause, not just the log."""
+    m = re.findall(r"^RESULT (?:PASS|FAIL)[^\n]*", out or "", re.M)
+    return f" ({m[-1][:300]})" if m else ""
+
+
+def take_lock(c):
+    """The finish dir's lock, held until the process ends (keep the returned handle): a claim, a --take and a check never run
+    while a check of the same job runs. Refuses instead of waiting."""
+    c.fdir.mkdir(parents=True, exist_ok=True)
+    fh = open(c.fdir / ".check.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise Refuse(f"a check of job {c.jid} is already running (lock {c.fdir / '.check.lock'}): wait for it to end")
+    return fh
+
+
+def check(c, dry, lockf=None):
+    R_ = R()
+    lockf = lockf or take_lock(c)  # noqa: F841 (held for the whole check)
+    for old in c.fdir.glob("check-*"):
+        shutil.rmtree(old, ignore_errors=True)
+    chk = c.fdir / f"check-{time.strftime('%Y%m%dT%H%M%S')}"
+    cand = chk / "cand"
+    cand.mkdir(parents=True)
+    fails, warns = [], []
+    need = list(dict.fromkeys(c.files + ([c.tf] if c.mode in ("single", "draft", "chain") else [])))
+    for f in need:
+        src = c.work / f
+        if src.is_file():
+            (cand / f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, cand / f)
+        elif c.mode != "chain" and step_base(c, f) is not None:
+            fails.append(f"{f} was deleted in the work dir; the check cannot express a deletion here: restore it")
+    if c.mode in ("single", "draft", "chain") and not (c.work / c.tf).is_file():
+        fails.append(f"the test {c.tf} is missing from the work dir")
+    if c.mode == "diagnose" and not (c.work / "DIAGNOSIS.md").is_file():
+        fails.append("DIAGNOSIS.md is missing from the work dir")
+    if c.frozen and (c.work / c.tf).is_file() and sha12(c.work / c.tf) != c.frozen:
+        fails.append(f"the frozen test {c.tf} changed (sha {sha12(c.work / c.tf)}, frozen {c.frozen}): restore it; "
+                     f"if the test is wrong, that is mini-triage")
+    if fails:
+        return finish_fail(c, chk, fails, None)
+    rc, out, gates, verdict, touched = None, "", {}, "FAIL", []
+    if c.mode == "single":
+        extra = ["--try-test", str(cand / c.tf), "--mutation"]  # --mutation: the spec's mutation_gate on a green fix, as phase B
+        for f in c.scope:
+            if (cand / f).is_file():
+                extra += ["--try-fix", f"{f}={cand / f}"]
+        rc, out = run_runner(chk, c.spec_path, extra)
+        m = re.search(r"try-test \S+: (ACCEPTED|REJECTED: [^\n]*)", out)
+        if not m:
+            fails.append(f"the runner gave no try-test result (precheck or setup failed){result_of(out)}: see the log")
+        elif m.group(1) != "ACCEPTED":
+            fails.append("test " + m.group(1))
+        elif "] try-fix: " not in out:
+            fails.append(f"the runner gave no try-fix result{result_of(out)}: see the log")
+        else:
+            gates = gates_after(out, "] try-fix: ")
+            v, failing = R_.gate_verdict(gates) if gates else ("FAIL", ["no gate rows"])
+            if v == "FAIL":
+                fails += [f"{g}: {gates[g][1]}" if g in gates else g for g in failing]
+            else:
+                verdict = "PASS" if v == "PASS" else f"PASS needs-review soft={','.join(failing)}"
+                if v != "PASS":
+                    warns.append(f"only soft gates failed ({', '.join(failing)}): the runner would pass this as needs-review; "
+                                 "look at them before landing")
+    elif c.mode == "draft":
+        rc, out = run_runner(chk, c.spec_path, ["--try-test", str(cand / c.tf), "--draft-check"])
+        m = re.search(r"try-test \S+: (ACCEPTED|REJECTED: [^\n]*)", out)
+        if m and m.group(1) != "ACCEPTED":
+            fails.append("test " + m.group(1))
+        elif rc == 0 and "draft-check: PASS" in out:
+            verdict = "PASS"
+            dname = "draft_" + Path(c.tf).name
+            if (chk / dname).is_file():
+                shutil.copy2(chk / dname, c.fdir / dname)
+        else:
+            dc = rd(chk / "DRAFT-CHECK.txt")
+            fails += (R_.draft_feedback(dc)[0] if dc.strip() else []) or [f"the acceptance check failed (rc {rc})"
+                                                                          f"{result_of(out)}: see the log"]
+    elif c.mode == "chain":
+        refs = chk / "refs"
+        for i in range(1, c.k):
+            shutil.copytree(c.run_dir / "step-refs" / f"s{i}", refs / f"s{i}")
+        R_.save_step_ref(c.work, refs / f"s{c.k}", list(dict.fromkeys(c.scope + [c.tf])))
+        if c.frozen and sha12(refs / f"s{c.k}" / c.tf) != c.frozen:
+            return finish_fail(c, chk, [f"the frozen test {c.tf} changed: restore it"], None)
+        spec2 = copy.deepcopy(c.raw)
+        spec2["steps"] = list(c.raw["steps"])[:c.k]
+        spec2["replay"] = {"refs": str(refs), "through": c.k}
+        if c.ref:
+            spec2["ref"] = str(c.ref)
+        sp2 = chk / "spec.json"
+        write_json(sp2, spec2)
+        rc, out = run_runner(chk, sp2, ["--mutation"])  # the mutation_gate runs on step k, the finished one
+        for i in range(1, c.k):
+            m = re.search(rf"replay step {i}: (RED: [^\n]*|test REJECTED: [^\n]*)", out)
+            if m:
+                fails.append(f"saved step {i} no longer passes ({m.group(1)[:300]}): the baseline or environment moved; ~/bin/mini-triage {c.jid}")
+        if re.search(r"replay step \d+: no reference", out):
+            fails.append("a saved step ref is incomplete: " + re.search(r"replay step \d+: no reference[^\n]*", out).group(0))
+        mk = re.search(rf"replay step {c.k}: (GREEN|RED: [^\n]*|test REJECTED: [^\n]*)", out)
+        if mk:
+            gates = gates_after(out, f"replay step {c.k}: ")
+        if not fails:
+            if not mk:
+                fails.append(f"the runner never reached step {c.k} (precheck or setup failed){result_of(out)}: see the log")
+            elif mk.group(1) != "GREEN":
+                bad = [f"{g}: {d}" for g, (ok, d) in gates.items() if not ok]
+                fails += bad or [mk.group(1)]
+            elif rc == 0:
+                verdict = "PASS"
+            else:
+                fails.append(f"the runner exited rc={rc} after step {c.k} went green{result_of(out)}: see the log")
+    elif c.mode == "diagnose":
+        rc, out = run_runner(chk, c.spec_path, ["--try-diagnosis", str(cand / "DIAGNOSIS.md")])
+        m = re.search(r"try-diagnosis \S+: (ACCEPTED|REJECTED: [^\n]*)", out)
+        touched = [ln[3:].strip() for ln in R_.git(c.work, "status", "--porcelain", "--untracked-files=no").splitlines()
+                   if ln.strip() and ln[3:].strip() not in ("TASK.md", "DIAGNOSIS.md")]
+        if touched:
+            fails.append(f"a diagnosis is read-only, but tracked files changed in the work dir: {touched[:8]}: restore them "
+                         f"(git -C {c.work} checkout -- <file>)")
+        if not m:
+            fails.append(f"the runner gave no try-diagnosis result{result_of(out)}: see the log")
+        elif m.group(1) != "ACCEPTED":
+            fails.append(m.group(1))
+        elif rc == 0 and not touched:
+            verdict = "PASS"
+    stray = [f for f in stray_files(c) if f not in touched]  # a touched file is already a failure above
+    if stray:
+        warns.append(f"changed in the work dir but not part of this finish (not checked, not landed): {stray[:10]}")
+    if verdict == "FAIL" or fails:
+        return finish_fail(c, chk, fails or ["the check failed: see the log"], gates, warns)
+    return finish_pass(c, chk, verdict, gates, warns, dry)
+
+
+def finish_fail(c, chk, fails, gates, warns=()):
+    say(f"mini-finish: check FAIL job {c.jid} {c.label}")
+    for f in fails:
+        say(textwrap_indent(str(f)[:1500], "  - ", "    "))
+    if gates:
+        say("  gates: " + " ".join(f"{g}={'ok' if ok else 'FAIL'}" for g, (ok, _d) in gates.items()))
+    for w in warns:
+        say(f"  note: {w}")
+    if (chk / "check.log").is_file():
+        say(f"  log: {chk / 'check.log'}")
+    say(f"  the claim is kept: fix and rerun `~/bin/mini-finish {c.jid} --check`")
+    return 1
+
+
+# ---- after a PASS ----------------------------------------------------------------------------------
+
+def local_share(c):
+    """Fraction of the lines the finish added (vs the step's start) that the local attempt had already written."""
+    snap = c.fdir / "local"
+    gone = set(R().ref_manifest(snap).get("deleted") or [])
+    fin_tot = loc_tot = shared = 0
+    for f in c.files:
+        base = step_base(c, f)
+        fin = (c.work / f).read_bytes() if (c.work / f).is_file() else None
+        loc = None if f in gone or not (snap / f).is_file() else (snap / f).read_bytes()
+        fa, la = added_lines(base, fin), added_lines(base, loc)
+        fin_tot += sum(fa.values())
+        loc_tot += sum(la.values())
+        shared += sum((fa & la).values())
+    return (round(shared / fin_tot, 3) if fin_tot else None), shared, fin_tot
+
+
+def cont_label(label, j):
+    base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    base = re.sub(r"-c\d+$", "", base) or "finish-cont"
+    suf = f"-c{j}"
+    toks = base.split("-")
+    while len("-".join(toks)) + len(suf) > LABEL_MAX and len(toks) > 2:
+        toks.pop()
+    out = "-".join(toks)[:LABEL_MAX - len(suf)].strip("-") + suf
+    return out
+
+
+def continuation(c, chk):
+    """Write <spec dir>-c<j>/ (spec + replay refs + TRIAGE.md), validate it, submit it. Returns (job id, dir) or raises RuntimeError."""
+    stem = re.sub(r"-c\d+$", "", c.spec_dir.name)
+    j = 1
+    while (c.spec_dir.parent / f"{stem}-c{j}").exists():
+        j += 1
+    cont = c.spec_dir.parent / f"{stem}-c{j}"
+    try:
+        cont.mkdir(parents=True)  # not exist_ok: a dir that appeared since the scan is someone else's
+    except OSError as e:
+        raise RuntimeError(f"cannot create the continuation dir {cont}: {e}") from e
+    label = cont_label(c.label, j)
+    enqueued = submitted = None
+    try:
+        shutil.copytree(chk / "refs", cont / "replay")
+        spec = copy.deepcopy(c.raw)
+        if c.ref:
+            spec["ref"] = str(c.ref)
+        spec["replay"] = {"refs": str(cont / "replay"), "through": c.k, "job": c.jid, "by": "mini-finish"}
+        sp = cont / c.spec_path.name
+        write_json(sp, spec)
+        (cont / "TRIAGE.md").write_text(
+            f"# TRIAGE\n\nContinuation written by mini-finish ({now_iso()}).\n\n"
+            f"- Job {c.jid} (`{c.label}`, spec {c.spec_path}) failed at step {c.k}/{c.n}: class {c.cls}, "
+            f"{(c.rec.get('runner_verdict') or c.rec.get('failure_detail') or '?')[:300]}\n"
+            f"- Claude finished step {c.k} in place in {c.work}; `mini-finish --check` replayed steps 1..{c.k} green "
+            f"({chk / 'check.log'}).\n"
+            f"- This spec replays steps 1..{c.k} from {cont / 'replay'} with the real gates and no model call; "
+            f"the local model does steps {c.k + 1}..{c.n}.\n"
+            f"- Not a spec or infra failure: the earlier failure was the model's (or its budget), so the task family is unchanged.\n")
+        say(f"mini-finish: continuation spec {sp}: validating (mini-validate, minutes)")
+        v = subprocess.run([*tool("MINI_FINISH_VALIDATE", "mini-validate"), str(sp)], capture_output=True, text=True, cwd=str(cont),
+                           timeout=CHECK_TIMEOUT)
+        (cont / "validate.log").write_text(v.stdout + v.stderr)
+        if v.returncode != 0:
+            raise RuntimeError(f"mini-validate rc={v.returncode}: {(v.stdout + v.stderr).strip()[-600:]}")
+        model = c.rec.get("model") or DEFAULT_MODEL
+        bundle = c.rec.get("bundle") or re.sub(r"-c\d+$", "", c.label)
+        cmd = [*tool("MINI_FINISH_SUBMIT", "mini-submit"), str(sp), "--label", label, "--model", str(model),
+               "--bundle", str(bundle), "--continues", c.jid]
+        say(f"mini-finish: submitting {label} (mini-submit runs its checks C0-C8, minutes)")
+        s = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cont), timeout=CHECK_TIMEOUT)
+        submitted = s.returncode == 0  # mini-submit exits 0 only after the queue took the row: the dir is the job's now
+        (cont / "submit.log").write_text("$ " + shlex.join(cmd) + "\n" + s.stdout + s.stderr)
+        m = re.search(r"^job_id: (\S+)", s.stdout, re.M)  # printed only after the enqueue succeeded
+        enqueued = m.group(1) if m and JOB_ID.fullmatch(m.group(1)) else None
+        if not enqueued and submitted:
+            enqueued = queued_continuation(c.jid)  # the queue's own row: mini-submit printed no usable id
+            if not enqueued:
+                say(f"mini-finish: note: mini-submit exited 0 (enqueued) but printed no usable job_id ({cont / 'submit.log'}); "
+                    f"the continuation is queued as {label}, id unknown: `python3 ~/bin/ollama-queue.py status | grep {label}`")
+                return None, cont, label
+        if not enqueued:
+            raise RuntimeError(f"mini-submit rc={s.returncode}: {(s.stdout + s.stderr).strip()[-800:]}")
+        if s.returncode != 0:
+            say(f"mini-finish: note: mini-submit exited rc={s.returncode} after enqueueing {enqueued} ({cont / 'submit.log'})")
+        return enqueued, cont, label
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        for n in ("validate.log", "submit.log"):
+            if (cont / n).is_file():
+                shutil.copy2(cont / n, chk / n)
+        late = None if enqueued else queued_continuation(c.jid)
+        if late:  # the submit step broke (a timeout, an unwritable log) after the queue took the row: the continuation stands
+            say(f"mini-finish: note: {str(e)[-300:]}; the queue has the continuation {late} all the same")
+            return late, cont, label
+        if not enqueued and not submitted:
+            shutil.rmtree(cont, ignore_errors=True)
+        elif not enqueued:
+            say(f"mini-finish: kept {cont}: mini-submit exited 0, so a queued row may run from it")
+        raise RuntimeError(str(e)) from e
+
+
+def queued_continuation(jid):
+    """Id of the newest queue row that continues jid (mini-submit --continues), or None."""
+    rows = [j for j in load_jobs() if str(j.get("continues") or "") == jid and JOB_ID.fullmatch(str(j["id"]))]
+    return str(rows[-1]["id"]) if rows else None
+
+
+def resolve_and_clear(jid):
+    """queue resolve + POST /api/runs/<id>/clear (never with override). Returns a list of problems (empty = done)."""
+    probs = []
+    try:
+        p = subprocess.run([*tool("MINI_FINISH_QUEUE", "ollama-queue.py"), "resolve", jid], capture_output=True, text=True, timeout=120)
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode != 0 and "not found" not in out:
+            probs.append(f"queue resolve rc={p.returncode}: {out[-300:]}")
+        else:
+            say(f"mini-finish: resolved {jid}" + (" (no live row)" if p.returncode != 0 else ""))
+    except (OSError, subprocess.SubprocessError) as e:
+        probs.append(f"queue resolve: {type(e).__name__}: {e}")
+    try:
+        rq = urllib.request.Request(f"{API()}/api/runs/{jid}/clear", data=b"{}", method="POST",
+                                    headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(rq, timeout=30) as r:
+            say(f"mini-finish: cleared {jid} (HTTP {r.status})")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 404:
+            say(f"mini-finish: clear {jid}: nothing to clear (HTTP 404)")
+        elif e.code == 409:
+            probs.append(f"clear refused (HTTP 409: {body}); a sign-off is pending or a run is live. Not overridden: look at the "
+                         f"card, then rerun `~/bin/mini-finish {jid} --check`")
+        else:
+            probs.append(f"clear HTTP {e.code}: {body}")
+    except (OSError, urllib.error.URLError) as e:
+        probs.append(f"clear: {type(e).__name__}: {e} (is the queue API up at {API()}?)")
+    return probs
+
+
+def land_steps(c, share):
+    try:
+        gd = subprocess.run(["git", "-C", str(c.baseline), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, timeout=30).stdout.strip()
+        repo = str(Path(gd).parent) if gd else str(c.baseline)
+        br = subprocess.run(["git", "-C", str(c.baseline), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True,
+                            timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        repo, br = str(c.baseline), ""
+    fam = re.sub(r"(?<=\d)[a-z]$", "", re.sub(r"-c\d+$", "", c.spec_dir.name))
+    pct = f"{round(share * 100)}%" if share is not None else "n/a"
+    if getattr(c, "auto", False):
+        say(f"  land: ~/bin/mini-auto land {c.jid}   (copies the checked {', '.join(dict.fromkeys([*c.files, c.tf]))} into the checkout "
+            f"the job came from, nothing committed; it prints the ledger line)")
+        return
+    if c.mode == "draft":
+        say(f"  land: the accepted draft is {c.fdir / ('draft_' + Path(c.tf).name)}; copy it into the baseline {c.baseline} "
+            f"as {c.tf} and land it with the validated ref, as after any accepted draft")
+    elif c.mode == "diagnose":
+        say(f"  report: {c.work / 'DIAGNOSIS.md'} is accepted; nothing to land")
+        return
+    else:
+        fs = list(c.files) if c.mode != "chain" else list(dict.fromkeys(
+            [f for i in range(1, c.k) for f in (R().ref_manifest(c.run_dir / "step-refs" / f"s{i}").get("files") or [])] + c.files))
+        tests = [s.get("test_file") for s in R().merged_steps(c.raw)[:c.k]] if c.mode == "chain" else [c.tf]
+        for t in tests:  # a test the job wrote (not in the baseline as it stands) lands with the fix
+            wp, bp = c.work / str(t), c.baseline / str(t)
+            if t and t not in fs and wp.is_file() and not (bp.is_file() and bp.read_bytes() == wp.read_bytes()):
+                fs.append(t)
+        say(f"  land: the finished files are in {c.work} (a copy of {c.baseline}{', branch ' + br if br else ''}): {', '.join(fs)}")
+        say(f"    review `git -C {shlex.quote(str(c.work))} diff`, copy them into the baseline worktree, commit there and land it in "
+            f"{repo} as you would a passed job")
+    say(f"  then: ~/bin/mini-scorecard ledger add --job {c.jid} --commit <sha> --repo {shlex.quote(repo)} --family {fam} "
+        f"--note \"finished by Claude (mini-finish), local share {pct}\"")
+
+
+def finish_pass(c, chk, verdict, gates, warns, dry):
+    share, shared, total = local_share(c)
+    pct = f"{round(share * 100)}%" if share is not None else "n/a (no added lines)"
+    say(f"mini-finish: check {verdict} job {c.jid} {c.label} [{c.mode}{f', step {c.k}/{c.n}' if c.mode == 'chain' else ''}]")
+    if gates:
+        say("  gates: " + " ".join(f"{g}={'ok' if ok else 'FAIL'}" for g, (ok, _d) in gates.items()))
+    say(f"  local share: {pct} of the added lines were already in the local attempt ({shared}/{total})")
+    for w in warns:
+        say(f"  note: {w}")
+    say(f"  log: {chk / 'check.log'}")
+    if dry:
+        say("  --dry-run: nothing queued, resolved or cleared; the claim is kept")
+        return 0
+    cont = None
+    if c.mode == "chain" and c.k < c.n:
+        if not c.ref or not c.ref.is_dir():
+            say(f"mini-finish: cannot queue steps {c.k + 1}..{c.n}: the spec has no validated ref dir, which mini-validate needs. "
+                f"The finish is checked; write the ref (ref/s<N>/...) and rerun `~/bin/mini-finish {c.jid} --check`")
+            return 2
+        try:
+            cid, cdir, clabel = continuation(c, chk)
+            cont = {"job": cid, "dir": str(cdir), "label": clabel}
+            say(f"mini-finish: queued continuation {cid or '(id unknown)'} {clabel}: replays steps 1..{c.k}, "
+                f"the local model does {c.k + 1}..{c.n}")
+        except RuntimeError as e:
+            say(f"mini-finish: the continuation failed, so nothing was resolved: {str(e)[-900:]}")
+            say(f"  logs: {chk}; the claim is kept: fix and rerun `~/bin/mini-finish {c.jid} --check`")
+            return 2
+    me, bridge = me_bridge()
+    fin = {"job": c.jid, "label": c.label, "mode": c.mode, "step": c.k, "steps": c.n, "verdict": verdict, "files": c.files,
+           "local_share": share, "local_lines": shared, "final_lines": total, "ts": now_iso(),
+           "finished_by": D().norm_sock(me) if me else None, "bridge": bridge, "check_dir": str(chk), "continuation": cont,
+           "draft": str(c.fdir / ("draft_" + Path(c.tf).name)) if c.mode == "draft" else None}
+    write_json(c.fdir / "FINISHED.json", fin)
+    try:
+        HOME().mkdir(parents=True, exist_ok=True)
+        with open(HOME() / "mini-finish.jsonl", "a") as fh:
+            fh.write(json.dumps(fin) + "\n")
+    except OSError as e:
+        say(f"mini-finish: could not append {HOME() / 'mini-finish.jsonl'}: {e}")
+    probs = resolve_and_clear(c.jid)
+    for p in probs:
+        say(f"mini-finish: {p}")
+    if not cont:
+        land_steps(c, share)
+    return 2 if probs else 0
+
+
+def finished_ctx(rec):
+    """Just enough context for a job mini-finish already finished: its record and its finish dir."""
+    c = Ctx()
+    c.rec, c.jid = rec, rec["id"]
+    c.label = str(rec.get("label") or c.jid)
+    c.work = Path(os.path.expanduser(str(rec["cwd"])))
+    c.run_dir = c.work.parent
+    c.fdir = c.run_dir / "finish"
+    return c
+
+
+def finished_refusal(c):
+    return (f"job {c.jid} was already finished: {c.fdir / 'FINISHED.json'} (`~/bin/mini-finish {c.jid} --check` retries "
+            f"the resolve + clear if they failed)")
+
+
+def retry_finished(c):
+    try:
+        fin = json.loads((c.fdir / "FINISHED.json").read_text())
+        fin = fin if isinstance(fin, dict) else {}
+    except (OSError, ValueError):
+        fin = {}
+    cont = fin.get("continuation") if isinstance(fin.get("continuation"), dict) else None
+    say(f"mini-finish: job {c.jid} was already finished ({fin.get('ts', '?')}, {fin.get('verdict', '?')}"
+        + (f", continuation {cont.get('job') or '(id unknown)'}" if cont else "") + "): retrying resolve + clear")
+    probs = resolve_and_clear(c.jid)
+    for p in probs:
+        say(f"mini-finish: {p}")
+    return 2 if probs else 0
+
+
+# ---- --list -------------------------------------------------------------------------------------------
+
+def list_jobs():
+    jobs = load_jobs()
+    ids = {Path(p).name[:-len(".done.json")] for p in glob.glob(str(LOGS() / "*.done.json"))}
+    ids |= {str(j["id"]) for j in jobs if j.get("status") == "failed"}
+    me, bridge = me_bridge()
+    rows, skipped = [], 0
+    for jid in sorted(ids):
+        if not re.fullmatch(r"[0-9A-Za-z_-]{3,64}", jid):
+            continue
+        try:
+            rec = find_job(jid, jobs)
+        except Refuse:
+            continue
+        if rec.get("status") != "failed" or Path(str(rec.get("runner") or "")).name != "mini-swe-runner.py":
+            continue
+        why = cheap_refusal(rec, jobs)
+        if why is None and (finished_ctx(rec).fdir / "FINISHED.json").exists():
+            why = "finished"
+        if why is None:
+            try:
+                c = build_ctx(rec)
+            except Refuse as e:
+                why = str(e)
+        if why:
+            skipped += 1
+            continue
+        who = D().classify(rec, me, bridge, {})
+        claim = read_claim(c)
+        rows.append(f"  {jid}  {c.label}  class={c.cls}  mode={c.mode}{f' step={c.k}/{c.n}' if c.mode == 'chain' else ''}  "
+                    f"launcher={who}" + ("  claimed" if claim else ""))
+    say(f"mini-finish: {len(rows)} finishable failed job(s)" + (f" ({skipped} failed mini job(s) not finishable)" if skipped else ""))
+    for r in rows:
+        say(r)
+    return 0
+
+
+# ---- main ---------------------------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mini-finish", description=__doc__.split("\n\n")[0])
+    ap.add_argument("job", nargs="?")
+    ap.add_argument("--check", action="store_true", help="run the job's gates on the finished files")
+    ap.add_argument("--dry-run", action="store_true", help="with --check: gates only, nothing queued/resolved/cleared")
+    ap.add_argument("--take", action="store_true", help="claim a job another live session launched or claimed")
+    ap.add_argument("--list", action="store_true", help="failed jobs mini-finish can take")
+    a = ap.parse_args(argv)
+    if a.list:
+        return list_jobs()
+    if not a.job:
+        ap.print_usage()
+        return 1
+    if a.dry_run and not a.check:
+        say("mini-finish: --dry-run goes with --check")
+        return 1
+    try:
+        jobs = load_jobs()
+        rec = find_job(a.job, jobs)
+        if rec.get("cwd") and (finished_ctx(rec).fdir / "FINISHED.json").is_file():
+            c = finished_ctx(rec)  # not build_ctx: the spec or baseline may be gone by now; the retry needs neither
+            claim = read_claim(c)
+            why = ownership_refusal(c, claim, a.take)
+            if why:
+                raise Refuse(why)
+            if a.check and not a.dry_run:
+                lk = take_lock(c)  # noqa: F841 (not while the check that wrote FINISHED.json is still resolving)
+                return retry_finished(c)
+            raise Refuse(finished_refusal(c))
+        why = cheap_refusal(rec, jobs)
+        if why:
+            raise Refuse(why)
+        c = build_ctx(rec)
+        claim = read_claim(c)
+        why = ownership_refusal(c, claim, a.take)
+        if why:
+            raise Refuse(why)
+        if a.check and not claim:
+            raise Refuse(f"job {c.jid} is not claimed yet: run `~/bin/mini-finish {c.jid}` first (it snapshots the local attempt)")
+        lk = take_lock(c)  # before the claim is written: a --take never rewrites it under a running check
+        if (c.fdir / "FINISHED.json").is_file():  # a check finished it between the first look and the lock
+            raise Refuse(finished_refusal(c))
+        claim = read_claim(c)  # as it stands now that the lock is held
+        why = ownership_refusal(c, claim, a.take)
+        if why:
+            raise Refuse(why)
+        if a.check:
+            if not claim_is_mine(claim, *me_bridge()):
+                claim, _first, _note = make_claim(c, claim, a.take)
+            return check(c, a.dry_run, lk)
+        claim, first, note = make_claim(c, claim, a.take)
+        brief(c, claim, first, note)
+        return 0
+    except Refuse as e:
+        say(f"mini-finish: refused: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

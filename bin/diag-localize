@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""diag-localize: CPU-first fault localization for offloaded diagnosis (python3, stdlib only).
+
+  diag-localize slice  --repo DIR --replay-cmd CMD [--passing-cmd CMD] [--file F ...] [--json OUT] [--md OUT]
+      Run the failing replay under a call tracer, record executed functions + traceback frames; with --passing-cmd
+      also per-test sets and function-level Ochiai. Ranked functions (file, name, first-last, score, reason).
+      Python only (JS mode skipped: V8 coverage is function-range data that needs a mapper, not trivial; use the
+      runner's NODE_V8_COVERAGE gate for JS reach). coverage.py is NOT used: a sys.settrace call recorder gives
+      exactly function-level data and works where coverage is not installed.
+  diag-localize locate --repo DIR --file F ... --symptoms FILE [--slice JSON] [--live | --dry-run | --stub-model [JSON]]
+      CoSIL-style two calls to the local endpoint (same machinery/sampling as mini-swe-runner single-shot):
+      L1 symptoms + slice + ALL signatures -> top-5 suspects; L2 suspect bodies + callers/callees -> top-2 functions
+      + a diagnosis stating a condition at function:line. A third short call only repairs malformed JSON.
+      The model is called ONLY with --live (refused otherwise unless --dry-run/--stub-model). Never prints the endpoint key.
+      Each completion is hard-capped (max_tokens) by what --budget-tokens leaves and --max-completion-tokens.
+  diag-localize --self-test     offline (stub model, toy repo, no network)
+"""
+import argparse, ast, glob, importlib.util, json, math, os, re, shlex, shutil, signal, subprocess, sys, tempfile, textwrap, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_MODEL = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+_RUNNER = []
+
+
+def runner():
+    """The mini-swe-runner module (functions(), ss_call(), LOCAL_JSON). Importing it has no side effects beyond PATH."""
+    if not _RUNNER:
+        spec = importlib.util.spec_from_file_location("mini_swe_runner", HERE / "mini-swe-runner.py")
+        m = importlib.util.module_from_spec(spec)
+        sys.modules["mini_swe_runner"] = m
+        spec.loader.exec_module(m)
+        _RUNNER.append(m)
+    return _RUNNER[0]
+
+
+# ---------------------------------------------------------------- function index
+
+SRC_EXT = (".py", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx")
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache", ".tox", "site-packages", "build", "dist"}
+JS_KW = {"if", "for", "while", "switch", "catch", "function", "return", "typeof", "new", "await", "async", "super", "import", "require"}
+
+
+def is_test_path(rel):
+    b = os.path.basename(rel)
+    return b.startswith("test_") or b.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts")) or b == "conftest.py" or "/tests/" in "/" + rel
+
+
+def py_defs(text):
+    """[(qualname, name, first(with decorators), last, def_line)] for every def, duplicates and methods included."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out = []
+
+    def walk(node, stack):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = min([ch.lineno] + [d.lineno for d in ch.decorator_list])
+                out.append((".".join(stack + [ch.name]), ch.name, first, getattr(ch, "end_lineno", ch.lineno), ch.lineno))
+                walk(ch, stack + [ch.name])
+            elif isinstance(ch, ast.ClassDef):
+                walk(ch, stack + [ch.name])
+            else:
+                walk(ch, stack)
+    walk(tree, [])
+    return out
+
+
+def file_funcs(path, text):
+    """[{qual,name,first,last,sig}] for a file. Spans come from the runner's functions() (uniquely-named functions and all JS);
+    the ast pass supplies class-qualified names and the spans of duplicate names, which functions() collapses."""
+    lines = text.splitlines()
+    rfn = runner().functions(path, text)
+    res = []
+    if path.endswith(".py"):
+        defs = py_defs(text)
+        counts = {}
+        for d in defs:
+            counts[d[1]] = counts.get(d[1], 0) + 1
+        for qual, name, first, last, dl in defs:
+            if counts[name] == 1 and name in rfn and rfn[name][1]:
+                first, last = rfn[name][0], rfn[name][1]
+            res.append({"qual": qual, "name": name, "first": first, "last": last, "sig": lines[dl - 1].strip()[:140] if dl <= len(lines) else name})
+    else:
+        for name, (first, last) in rfn.items():
+            res.append({"qual": name, "name": name, "first": first, "last": last or first,
+                        "sig": lines[first - 1].strip()[:140] if first <= len(lines) else name})
+    return res
+
+
+def source_files(repo, only=()):
+    if only:
+        return [str(Path(f)) if Path(f).is_absolute() else f for f in only]
+    out = []
+    for dp, dns, fns in os.walk(repo):
+        dns[:] = sorted(d for d in dns if d not in SKIP_DIRS)
+        for fn in sorted(fns):
+            if fn.endswith(SRC_EXT):
+                out.append(os.path.relpath(os.path.join(dp, fn), repo))
+    return out
+
+
+def build_index(repo, files):
+    """{rel_file: {"text", "lines", "funcs": [..]}} for the given files."""
+    idx = {}
+    for f in files:
+        p = Path(f) if os.path.isabs(f) else Path(repo, f)
+        if not p.is_file():
+            continue
+        rel = os.path.relpath(p, repo)
+        text = p.read_text(errors="replace")
+        idx[rel] = {"text": text, "lines": text.splitlines(), "funcs": file_funcs(str(p), text)}
+    return idx
+
+
+def call_index(idx):
+    """{(file, qual): {"callees": [(file, qual)], "callers": [...]}} by name matching (ast for Python, regex for JS)."""
+    by_name = {}
+    for f, d in idx.items():
+        for fn in d["funcs"]:
+            by_name.setdefault(fn["name"], []).append((f, fn["qual"]))
+    res = {(f, fn["qual"]): {"callees": set(), "callers": set()} for f, d in idx.items() for fn in d["funcs"]}
+    for f, d in idx.items():
+        tree = None
+        if f.endswith(".py"):
+            try:
+                tree = ast.parse(d["text"])
+            except SyntaxError:
+                tree = None
+        nodes = {}
+        if tree is not None:
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    nodes[n.lineno] = n
+        for fn in d["funcs"]:
+            names = set()
+            if tree is not None:
+                node = next((n for ln, n in nodes.items() if n.name == fn["name"] and fn["first"] <= ln <= fn["last"]), None)
+                if node is not None:
+                    for c in ast.walk(node):
+                        if isinstance(c, ast.Call):
+                            nm = c.func.id if isinstance(c.func, ast.Name) else c.func.attr if isinstance(c.func, ast.Attribute) else None
+                            if nm:
+                                names.add(nm)
+            else:
+                body = "\n".join(d["lines"][fn["first"]:fn["last"]])  # skip the definition line itself
+                names = {m for m in re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", body) if m not in JS_KW}
+            me = (f, fn["qual"])
+            for nm in names:
+                for tgt in by_name.get(nm, []):
+                    if tgt != me:
+                        res[me]["callees"].add(tgt)
+                        res[tgt]["callers"].add(me)
+    return res
+
+
+# ---------------------------------------------------------------- slice (dynamic trace)
+
+TRACER_SRC = r'''
+import atexit, json, os, sys, threading
+ROOT = os.path.realpath(os.environ["DIAG_ROOT"]) + os.sep
+OUT = os.environ["DIAG_OUT"]
+CUR = ["<session>"]
+TESTS = {"<session>": {}}
+ORDER = {}
+OUTCOME = {}
+FRAMES = []
+BAD = (os.path.dirname(os.path.realpath(__file__)) + os.sep, "/site-packages/", "/.venv/", "/venv/", "/node_modules/", "/__pycache__/")
+_cache = {}
+
+def _ok(fn):
+    r = _cache.get(fn)
+    if r is None:
+        rp = os.path.realpath(fn) if fn and not fn.startswith("<") else ""
+        r = rp.startswith(ROOT) and not any(b in rp for b in BAD)
+        _cache[fn] = (rp if r else False)
+        r = _cache[fn]
+    return r
+
+def gtrace(frame, event, arg):
+    # global trace function: called once per new frame ('call'); returning None means no per-line/return tracing of that frame
+    co = frame.f_code
+    rp = _ok(co.co_filename)
+    if rp:
+        k = (rp, co.co_name, co.co_firstlineno)
+        t = TESTS[CUR[0]]
+        t[k] = t.get(k, 0) + 1
+        if k not in ORDER:
+            ORDER[k] = len(ORDER)
+    return None
+
+def dump():
+    sys.settrace(None); threading.settrace(None)
+    # one file per process (a wrapper that spawns pytest, xdist workers): OUT.<pid>.json, written atomically
+    path = "%s.%d.json" % (OUT, os.getpid())
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"tests": {t: {"funcs": [[a, b, c, n] for (a, b, c), n in fs.items()], "outcome": OUTCOME.get(t)} for t, fs in TESTS.items()},
+                   "order": [[a, b, c] for (a, b, c), _ in sorted(ORDER.items(), key=lambda kv: kv[1])], "frames": FRAMES}, fh)
+    os.replace(tmp, path)
+
+def start():
+    sys.settrace(gtrace); threading.settrace(gtrace); atexit.register(dump)
+'''
+
+# The pytest hooks live in a SEPARATE module: sitecustomize imports diag_trace before pytest starts, and `-p diag_trace` on an
+# already-imported module raises PytestAssertRewriteWarning (fatal under filterwarnings=error). diag_plugin is first imported by pytest.
+PLUGIN_SRC = r'''
+import os
+import diag_trace as T
+
+def pytest_runtest_protocol(item, nextitem):
+    T.CUR[0] = item.nodeid
+    T.TESTS.setdefault(item.nodeid, {})
+    return None
+
+def pytest_runtest_logreport(report):
+    if report.failed:
+        T.OUTCOME[report.nodeid] = "failed"
+    elif report.when == "call" and report.nodeid not in T.OUTCOME:
+        # skipped and xfail/xpass are not evidence of passing behaviour
+        T.OUTCOME[report.nodeid] = "skipped" if (report.skipped or getattr(report, "wasxfail", None) is not None) else "passed"
+
+def pytest_runtest_makereport(item, call):
+    ei = getattr(call, "excinfo", None)
+    if ei is not None:
+        try:
+            for e in ei.traceback:
+                rp = os.path.realpath(str(e.path))
+                if rp.startswith(T.ROOT) and not any(b in rp for b in T.BAD):
+                    T.FRAMES.append([item.nodeid, rp, e.lineno + 1, e.name])
+        except Exception:
+            pass
+
+def pytest_sessionfinish(session):
+    T.CUR[0] = "<session>"
+'''
+
+SITECUSTOMIZE_SRC = r"""
+import os, sys, importlib.machinery, importlib.util
+_here = os.path.dirname(os.path.realpath(__file__))
+try:  # chain the interpreter's own sitecustomize (Homebrew's adds its site-packages dir)
+    _rest = [p for p in sys.path if os.path.realpath(p or ".") != _here]
+    _spec = importlib.machinery.PathFinder.find_spec("sitecustomize", _rest)
+    if _spec and _spec.origin and os.path.realpath(_spec.origin) != os.path.realpath(__file__):
+        _m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)
+except Exception:
+    pass
+if _here not in [os.path.realpath(p or ".") for p in sys.path]:
+    sys.path.insert(0, _here)
+import diag_trace
+diag_trace.start()
+"""
+
+
+def merge_traces(paths):
+    """Union the per-process trace files (OUT.<pid>.json). Outcome precedence failed > passed > skipped. None if nothing readable."""
+    prec = {"failed": 3, "passed": 2, "skipped": 1, None: 0}
+    tests, order, frames, seen_fr, got = {}, {}, [], set(), False
+    for pth in sorted(paths):
+        try:
+            d = json.loads(Path(pth).read_text())
+        except (OSError, ValueError):
+            continue
+        got = True
+        for t, rec in d.get("tests", {}).items():
+            cur = tests.setdefault(t, {"funcs": {}, "outcome": None})
+            for a_, b_, c_, n in rec.get("funcs", []):
+                cur["funcs"][(a_, b_, c_)] = cur["funcs"].get((a_, b_, c_), 0) + n
+            if prec.get(rec.get("outcome"), 0) > prec[cur["outcome"]]:
+                cur["outcome"] = rec.get("outcome")
+        for k in d.get("order", []):
+            order.setdefault(tuple(k), len(order))
+        for f in d.get("frames", []):
+            if tuple(f) not in seen_fr:
+                seen_fr.add(tuple(f))
+                frames.append(f)
+    if not got:
+        return None
+    return {"tests": {t: {"funcs": [[a_, b_, c_, n] for (a_, b_, c_), n in r["funcs"].items()], "outcome": r["outcome"]} for t, r in tests.items()},
+            "order": [list(k) for k in order], "frames": frames}
+
+
+def run_traced(repo, cmd, timeout, workdir):
+    """Run `cmd` (shell) in repo under the tracer. Returns (rc, output, trace_dict_or_None).
+    Every Python process writes its own trace file; all of them are merged. Stale trace files are removed first."""
+    tdir = Path(workdir)
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "diag_trace.py").write_text(TRACER_SRC)
+    (tdir / "diag_plugin.py").write_text(PLUGIN_SRC)
+    (tdir / "sitecustomize.py").write_text(SITECUSTOMIZE_SRC)
+    out = tdir / f"trace-{abs(hash(cmd)) % 10**8}.json"
+    for old in list(tdir.glob(out.name + ".*")):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    env = dict(os.environ)
+    env.update({"PYTHONPATH": str(tdir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
+                "DIAG_ROOT": str(Path(repo).resolve()), "DIAG_OUT": str(out), "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTEST_ADDOPTS": (env.get("PYTEST_ADDOPTS", "") + " -p diag_plugin -p no:cacheprovider").strip()})
+    env.pop("OPENAI_API_KEY", None)
+    # own session so a timeout can kill the whole process group (shell, wrapper, pytest, workers)
+    proc = subprocess.Popen(cmd, shell=True, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+                            env=env, start_new_session=True)
+    try:
+        so, se = proc.communicate(timeout=timeout)
+        rc, text = proc.returncode, (so or "") + (se or "")
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            so, se = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:  # a grandchild escaped the group and still holds the pipes
+            so, se = e.stdout, e.stderr
+        dec = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        rc, text = 124, f"TIMEOUT after {timeout}s\n" + (dec(so) + dec(se))[-2000:]
+    tr = merge_traces(glob.glob(glob.escape(str(out)) + ".*.json"))
+    return rc, text, tr
+
+
+TB_RE = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
+
+
+def text_frames(text, root):
+    root = os.path.realpath(root) + os.sep
+    out = []
+    for m in TB_RE.finditer(text):
+        rp = os.path.realpath(m.group(1)) if not m.group(1).startswith("<") else ""
+        if rp.startswith(root) and not any(b in rp for b in ("/site-packages/", "/.venv/")):
+            out.append(["<output>", rp, int(m.group(2)), m.group(3)])
+    return out
+
+
+def ochiai(ef, ep, F):
+    den = math.sqrt(F * (ef + ep))
+    return ef / den if den else 0.0
+
+
+def do_slice(repo, replay, passing=None, files=(), timeout=300, include_tests=False, top=30, keep_dir=None):
+    repo = str(Path(repo).resolve())
+    warn = []
+    work = keep_dir or tempfile.mkdtemp(prefix="diag-slice-")
+    try:
+        rc, out, tr = run_traced(repo, replay, timeout, work)
+        info = {"replay_rc": rc, "replay_tail": out[-1200:]}
+        if "diag_trace" in out or "diag_plugin" in out:
+            warn.append("the replay output mentions diag_trace/diag_plugin (the tracer itself may have broken the run, e.g. a warnings filter); results unreliable")
+        if tr is None:
+            warn.append("no trace data written (the command may not be Python, or it crashed before start)")
+            tr = {"tests": {}, "order": [], "frames": []}
+        # tests: nodeid -> (funcs set, failed?)
+        tests = {}
+        for t, rec in tr["tests"].items():
+            if t == "<session>" and len(tr["tests"]) > 1:
+                continue
+            failed = rec.get("outcome") == "failed" or (t == "<session>" and rc != 0)
+            if t != "<session>" and rec.get("outcome") in (None, "skipped"):
+                continue
+            tests[t] = ({tuple(f[:3]) for f in rec["funcs"]}, failed)
+        frames = [tuple(f) for f in tr["frames"]] or [tuple(f) for f in text_frames(out, repo)]
+        order = {tuple(k): i for i, k in enumerate(tr["order"])}
+        if passing:
+            rc2, out2, tr2 = run_traced(repo, passing, timeout, work)
+            info["passing_rc"] = rc2
+            if "diag_trace" in out2 or "diag_plugin" in out2:
+                warn.append("the passing-cmd output mentions diag_trace/diag_plugin; results unreliable")
+            if tr2:
+                for t, rec in tr2["tests"].items():
+                    name = t if t != "<session>" else "<passing-cmd>"
+                    if (t == "<session>" and len(tr2["tests"]) > 1) or name in tests or (t != "<session>" and rec.get("outcome") in (None, "skipped")):
+                        continue
+                    tests[name] = ({tuple(f[:3]) for f in rec["funcs"]}, rec.get("outcome") == "failed" or (t == "<session>" and rc2 != 0))
+                for k in tr2["order"]:
+                    order.setdefault(tuple(k), len(order))
+            else:
+                warn.append("passing-cmd produced no trace data; Ochiai skipped")
+        F = sum(1 for _, f in tests.values() if f)
+        P = len(tests) - F
+        info["tests"] = {"failed": F, "passed": P}
+        if F == 0:
+            warn.append("the replay did not fail (rc=%d); executed-only ranking, check the replay command" % rc)
+        # spans per file
+        spans, rel = {}, lambda p: os.path.relpath(p, repo)
+        want = {os.path.realpath(Path(f) if os.path.isabs(f) else Path(repo, f)) for f in files}
+        seen_files = {k[0] for s, _ in tests.values() for k in s} | {f[1] for f in frames}
+        for rp in seen_files:
+            if want and rp not in want:
+                continue
+            if not include_tests and is_test_path(rel(rp)):
+                continue
+            try:
+                text = Path(rp).read_text(errors="replace")
+            except OSError:
+                continue
+            spans[rp] = file_funcs(rp, text)
+
+        def span_for(rp, name, line):
+            c = [s for s in spans.get(rp, []) if s["name"] == name and s["first"] <= line <= s["last"]]
+            return min(c, key=lambda s: s["last"] - s["first"]) if c else None
+        cand = {}  # (rp, qual) -> record
+
+        def rec(rp, s):
+            return cand.setdefault((rp, s["qual"]), {"file": rel(rp), "name": s["qual"], "first": s["first"], "last": s["last"],
+                                                     "ef": 0, "ep": 0, "tb": None, "order": None, "reasons": []})
+        for (t, (fs, failed)) in tests.items():
+            for (rp, name, first) in fs:
+                s = span_for(rp, name, first)
+                if s is None or (rp, s["qual"]) not in cand and rp not in spans:
+                    continue
+                r = rec(rp, s)
+                r["ef" if failed else "ep"] += 1
+        for k, i in order.items():
+            s = span_for(k[0], k[1], k[2])
+            if s and (k[0], s["qual"]) in cand:
+                cand[(k[0], s["qual"])]["order"] = i
+        # traceback frames: the frame list is outermost-first; depth 0 = innermost failure frame
+        fr = [f for f in frames if f[0] != "<session>"]
+        info["traceback"] = []
+        seen_tb = set()
+        for f in reversed(fr):
+            s = span_for(f[1], f[3], f[2]) if f[1] in spans or not want else None
+            info["traceback"].append({"file": rel(f[1]), "line": f[2], "name": f[3]})
+            if s is None:
+                continue
+            key = (f[1], s["qual"])
+            if key in seen_tb:
+                continue
+            seen_tb.add(key)
+            r = rec(f[1], s)
+            r["tb"] = len(seen_tb) - 1
+        ranked = []
+        maxo = max([c["order"] for c in cand.values() if c["order"] is not None] or [1]) or 1
+        for r in cand.values():
+            oc = ochiai(r["ef"], r["ep"], F) if F else None
+            reasons = []
+            tbs = 0.0
+            if r["tb"] is not None:
+                tbs = max(0.5, 1.0 - 0.1 * r["tb"])
+                reasons.append("in traceback" + (" (failure frame)" if r["tb"] == 0 else f" (depth {r['tb']})"))
+            if r["ef"]:
+                reasons.append(f"executed in {r['ef']} failing test(s)")
+            elif r["ep"]:
+                reasons.append(f"executed only in {r['ep']} passing test(s)")
+            if oc is not None and P and r["ef"]:
+                reasons.append(f"Ochiai {oc:.2f} (ef={r['ef']} ep={r['ep']})")
+            if oc is not None and P:
+                score = 0.6 * oc + 0.4 * tbs
+            else:  # no passing runs: traceback proximity, then executed-in-failure, later call order = nearer the failure
+                score = (0.5 * tbs + 0.3 * (1 if r["ef"] else 0) + 0.2 * ((r["order"] or 0) / maxo) * (1 if r["ef"] else 0)) if F else 0.1
+            if not r["ef"] and r["tb"] is None:
+                score *= 0.3
+            ranked.append({"file": r["file"], "name": r["name"], "first": r["first"], "last": r["last"],
+                           "score": round(score, 4), "ochiai": None if oc is None or not P else round(oc, 4),
+                           "reason": "; ".join(reasons) or "executed"})
+        ranked.sort(key=lambda x: (-x["score"], x["file"], x["first"]))
+        res = {"repo": repo, "replay_cmd": replay, "passing_cmd": passing, "tracer": "sys.settrace call recorder (function level; coverage.py not used)",
+               "language": "python", "ranked": ranked[:top], "total_candidates": len(ranked), "warnings": warn, **info}
+        return res
+    finally:
+        if not keep_dir:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def slice_md(res, n=10):
+    L = [f"## Suspects (dynamic slice, ranked; python tracer, replay rc={res.get('replay_rc')})"]
+    t = res.get("tests") or {}
+    L.append(f"Tests seen: {t.get('failed', 0)} failing, {t.get('passed', 0)} passing. Ranked by traceback proximity / Ochiai / executed in the failing replay.\n")
+    for i, r in enumerate(res["ranked"][:n], 1):
+        L.append(f"{i}. `{r['name']}` {r['file']}:{r['first']}-{r['last']} score={r['score']} -- {r['reason']}")
+    for w in res.get("warnings", []):
+        L.append(f"WARNING: {w}")
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- locate (two calls + repair)
+
+def tok_est(s):
+    return int(len(s) / 3.2) + 1
+
+
+def signatures_block(idx, max_chars):
+    parts, total = [], 0
+    for f, d in idx.items():
+        head = f"### {f} ({len(d['lines'])} lines, {len(d['funcs'])} functions)"
+        rows = [f"{fn['first']}-{fn['last']}\t{fn['sig']}" if fn["qual"] == fn["name"] else f"{fn['first']}-{fn['last']}\t[{fn['qual']}] {fn['sig']}" for fn in d["funcs"]]
+        parts.append((head, rows))
+        total += len(head) + sum(len(r) + 1 for r in rows)
+    note = ""
+    if total > max_chars:  # shrink: drop the signature text beyond the name, keep every name and its range
+        parts = [(h, [f"{fn['first']}-{fn['last']}\t{fn['qual']}" for fn in d["funcs"]]) for (h, _), d in zip(parts, idx.values())]
+        note = "\n(signatures shortened to names to fit the budget)"
+    return "\n".join(h + "\n" + "\n".join(r) for h, r in parts) + note
+
+
+SCHEMA1 = '{"suspects": [{"name": "<function name exactly as listed>", "file": "<file>", "reason": "<one line>"}]}'
+SCHEMA2 = ('{"top": [{"name": "<function>", "file": "<file>"}], "diagnosis": "<short: cause, then a condition written as '
+           '`at <function>:<line> expect <python or JS expression>` that is violated in the failing run>", '
+           '"condition": {"function": "<function>", "line": <int>, "expr": "<expression>"}}')
+
+
+def prompt_l1(symptoms, slice_res, idx, max_sig_chars):
+    sl = ""
+    if slice_res and slice_res.get("ranked"):
+        sl = "## Dynamic slice (functions that ran in the failing replay, ranked by traceback / Ochiai)\n" + "\n".join(
+            f"- {r['name']} ({r['file']}:{r['first']}-{r['last']}) score {r['score']}: {r['reason']}" for r in slice_res["ranked"][:15]) + "\n\n"
+    return (f"You are localizing a bug. Do not fix it.\n\n## Symptoms\n{symptoms.strip()[:4000]}\n\n{sl}"
+            f"## All functions (line range, signature)\n{signatures_block(idx, max_sig_chars)}\n\n"
+            f"Pick the 5 functions most likely to contain the defect, most likely first. Use only function names from the list above. "
+            f"Reply with ONLY one JSON object, no prose, no markdown: {SCHEMA1}")
+
+
+def body_text(idx, f, fn, cap):
+    lines = idx[f]["lines"]
+    a, b = fn["first"], fn["last"]
+    shown = min(b, a + cap - 1)
+    s = "\n".join(f"{n:>5}\t{lines[n - 1]}" for n in range(a, shown + 1))
+    return s + (f"\n      ... ({b - shown} more lines not shown)" if shown < b else "")
+
+
+def find_fn(idx, name, file=None):
+    nm = name.split("(")[0].strip()
+    hits = [(f, fn) for f, d in idx.items() for fn in d["funcs"] if nm in (fn["qual"], fn["name"]) and (not file or os.path.basename(f) == os.path.basename(file))]
+    if not hits and file:
+        hits = [(f, fn) for f, d in idx.items() for fn in d["funcs"] if nm in (fn["qual"], fn["name"])]
+    return hits[0] if hits else None
+
+
+def prompt_l2(symptoms, slice_res, idx, cidx, suspects, cap, notes=""):
+    blocks, neigh = [], {}
+    for s in suspects:
+        f, fn = s["_hit"]
+        blocks.append(f"### {fn['qual']}  ({f}:{fn['first']}-{fn['last']})  suspected because: {s.get('reason', '')[:200]}\n{body_text(idx, f, fn, cap)}")
+        c = cidx.get((f, fn["qual"]), {})
+        for kind in ("callers", "callees"):
+            for (f2, q2) in sorted(c.get(kind, [])):
+                neigh.setdefault((f2, q2), set()).add(f"{kind[:-1]} of {fn['qual']}")
+    nl = []
+    for (f2, q2), why in sorted(neigh.items())[:30]:
+        fn2 = next((x for x in idx[f2]["funcs"] if x["qual"] == q2), None)
+        if fn2:
+            nl.append(f"- {q2} {f2}:{fn2['first']}-{fn2['last']} ({'; '.join(sorted(why))}): {fn2['sig']}")
+    return (f"You are diagnosing a bug. Do not fix it.\n\n## Symptoms\n{symptoms.strip()[:4000]}\n\n"
+            f"## Candidate functions (line-numbered bodies){notes}\n" + "\n\n".join(blocks) +
+            "\n\n## Callers and callees of the candidates (signatures only)\n" + ("\n".join(nl) or "(none found)") +
+            f"\n\nDecide which 1-2 functions contain the defect (most likely first) and state the diagnosis. The diagnosis must include a "
+            f"concrete condition at a line, e.g. `at apply_discount:42 expect pct <= 1` that holds for correct behaviour and is violated in "
+            f"the failing run. Reply with ONLY one JSON object, no prose, no markdown: {SCHEMA2}")
+
+
+def prompt_repair(bad, schema):
+    return (f"The text below was meant to be ONE JSON object matching this shape: {schema}\n"
+            f"Re-emit it as valid JSON only (no prose, no markdown fences). Keep the content; fix syntax; do not add facts.\n\n"
+            f"TEXT:\n{bad[:3500]}")
+
+
+def strip_think(s):
+    s = re.sub(r"<think>.*?</think>", "", s or "", flags=re.S)
+    return s.split("</think>")[-1].strip()
+
+
+def parse_json_strict(content):
+    """The reply must be a single JSON object (optionally inside one ``` fence). Returns (obj, err)."""
+    s = strip_think(content).strip()
+    m = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", s, re.S)
+    if m:
+        s = m.group(1)
+    try:
+        o = json.loads(s)
+    except ValueError as e:
+        return None, f"not valid JSON: {str(e)[:80]}"
+    return (o, None) if isinstance(o, dict) else (None, "JSON is not an object")
+
+
+def check_l1(o, idx):
+    sus, bad = [], []
+    for s in (o.get("suspects") if isinstance(o.get("suspects"), list) else []):
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str):
+            continue
+        hit = find_fn(idx, s["name"], s.get("file") if isinstance(s.get("file"), str) else None)
+        if hit:
+            if all(x["_hit"] != hit for x in sus):
+                sus.append({"name": s["name"], "file": hit[0], "reason": str(s.get("reason", ""))[:300], "_hit": hit})
+        else:
+            bad.append(s["name"])
+    return sus[:5], bad
+
+
+def check_l2(o, idx):
+    top = []
+    for s in (o.get("top") if isinstance(o.get("top"), list) else []):
+        if isinstance(s, dict) and isinstance(s.get("name"), str):
+            hit = find_fn(idx, s["name"], s.get("file") if isinstance(s.get("file"), str) else None)
+            if hit and all(t[1] != hit for t in top):
+                top.append((s, hit))
+    diag = o.get("diagnosis")
+    return top[:2], (diag if isinstance(diag, str) and diag.strip() else None)
+
+
+class Stub:
+    """Offline model. With a JSON list file: canned replies in order (strings; may be malformed on purpose).
+    Without: deterministic replies built from the real prompts' own data via ctx (slice order / signature order)."""
+    def __init__(self, path=None):
+        self.canned = json.loads(Path(path).read_text()) if path else None
+        self.i = 0
+        self.ctx = {}
+        self.max_tokens = []
+
+    def __call__(self, stage, messages, max_tokens=None):
+        self.max_tokens.append(max_tokens)
+        if self.canned is not None:
+            r = self.canned[self.i] if self.i < len(self.canned) else ""
+            self.i += 1
+            c = r if isinstance(r, str) else json.dumps(r)
+        elif stage == "l1":
+            names = self.ctx["l1_names"]
+            c = json.dumps({"suspects": [{"name": n, "file": f, "reason": "stub: slice/signature order"} for f, n in names[:5]]})
+        elif stage == "l2":
+            sus = self.ctx["suspects"]
+            f, fn = sus[0]["_hit"]
+            c = json.dumps({"top": [{"name": s["_hit"][1]["qual"], "file": s["_hit"][0]} for s in sus[:2]],
+                            "diagnosis": f"stub diagnosis: at {fn['qual']}:{min(fn['first'] + 1, fn['last'])} expect True",
+                            "condition": {"function": fn["qual"], "line": min(fn["first"] + 1, fn["last"]), "expr": "True"}})
+        else:
+            c = "{}"
+        return {"content": c, "finish_reason": "stop", "usage": {"prompt_tokens": tok_est(json.dumps(messages)), "completion_tokens": tok_est(c)}, "secs": 0.0}
+
+
+def real_call(model, messages, no_think, timeout, max_tokens=None):
+    r = runner()
+    try:
+        local = json.loads(r.LOCAL_JSON.read_text())
+    except (OSError, ValueError):
+        return {"error": "cannot read the endpoint config (~/.darkbloom/local.json)"}
+    return r.ss_call(model, local, messages, no_think, timeout, max_tokens=max_tokens)
+
+
+def do_locate(a, caller=None):
+    if not (a.dry_run or isinstance(caller, Stub) or getattr(a, "live", False)):
+        return {"error": "locate calls the real model endpoint; pass --live to allow it (or --dry-run / --stub-model)"}
+    repo = str(Path(a.repo).resolve())
+    files = source_files(repo, a.file) if a.file else None
+    slice_res = json.loads(Path(a.slice).read_text()) if a.slice else None
+    if not files:
+        fs = []
+        for r in (slice_res or {}).get("ranked", [])[:15]:
+            if r["file"] not in fs:
+                fs.append(r["file"])
+        files = fs or [f for f in source_files(repo) if not is_test_path(f)]
+    idx = build_index(repo, files)
+    if not idx or not any(d["funcs"] for d in idx.values()):
+        return {"error": "no functions found in the target files"}
+    cidx = call_index(idx)
+    symptoms = Path(a.symptoms).read_text()
+    stub = caller if isinstance(caller, Stub) else None
+    nt = {"all": (True, True, True), "none": (False, False, False), "auto": (True, False, True)}[a.no_think]  # L1, L2, repair
+    used = {"prompt": 0, "completion": 0}
+    log = {"calls": [], "repairs": 0}
+    cap = a.budget_tokens
+    RESERVE = 1500  # completion room that must remain in the budget for a call to be made at all
+
+    def call(stage, content, no_think):
+        est = tok_est(content)
+        if used["prompt"] + used["completion"] + est + RESERVE > cap:
+            return None, f"token budget {cap} would be exceeded before the {stage} call (est prompt {est})"
+        msgs = [{"role": "user", "content": content}]
+        if a.dry_run:
+            return None, "dry-run"
+        # the completion is hard-capped by max_tokens: whatever the budget leaves after the (estimated) prompt, at most --max-completion-tokens
+        # (repair replies are short: at most 2000)
+        room = cap - used["prompt"] - used["completion"] - est
+        mt = max(RESERVE, min(room, getattr(a, "max_completion_tokens", 16000)))
+        if stage.endswith("repair"):
+            mt = min(mt, 2000)
+        r = caller(stage, msgs, max_tokens=mt) if stub else real_call(a.model, msgs, no_think, a.timeout, max_tokens=mt)
+        if r.get("error"):
+            return None, str(r["error"])[:300]
+        u = r.get("usage") or {}
+        used["prompt"] += int(u.get("prompt_tokens", 0) or est)
+        used["completion"] += int(u.get("completion_tokens", 0))
+        log["calls"].append({"stage": stage, "prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens"),
+                             "secs": r.get("secs"), "finish": r.get("finish_reason"), "max_tokens": mt})
+        return r.get("content", ""), None
+
+    def ask(stage, content, no_think, schema, check):
+        txt, err = call(stage, content, no_think)
+        if err:
+            return None, err
+        o, perr = parse_json_strict(txt)
+        if o is None:  # one repair call per stage, short, no_think
+            log["repairs"] += 1
+            txt2, err2 = call(stage + "-repair", prompt_repair(txt, schema), nt[2])
+            if err2:
+                return None, f"{stage}: {perr}; repair call failed: {err2}"
+            o, perr = parse_json_strict(txt2)
+            if o is None:
+                return None, f"{stage}: {perr} (after repair)"
+        return o, None
+
+    res = {"repo": repo, "files": list(idx), "model": ("stub" if stub else a.model), "no_think": a.no_think}
+    p1 = prompt_l1(symptoms, slice_res, idx, a.max_sig_chars)
+    if a.dry_run:
+        # build a representative L2 from the slice (or first functions) so the whole flow can be inspected
+        pre = []
+        names = [(r["file"], r["name"]) for r in (slice_res or {}).get("ranked", [])] or [(f, fn["qual"]) for f, d in idx.items() for fn in d["funcs"]]
+        for f, n in names:
+            h = find_fn(idx, n, f)
+            if h and all(x["_hit"] != h for x in pre):
+                pre.append({"name": n, "file": h[0], "reason": "(dry-run: from slice/order)", "_hit": h})
+        res.update({"dry_run": True, "prompt_l1": p1, "prompt_l2_preview": prompt_l2(symptoms, slice_res, idx, cidx, pre[:5], a.body_cap),
+                    "est_tokens": {"l1": tok_est(p1)}})
+        return res
+    if stub and stub.canned is None:
+        names = [(r["file"], r["name"]) for r in (slice_res or {}).get("ranked", [])] or [(f, fn["qual"]) for f, d in idx.items() for fn in d["funcs"]]
+        stub.ctx["l1_names"] = names
+    o1, err = ask("l1", p1, nt[0], SCHEMA1, None)
+    if o1 is None:
+        res["error"] = err
+        res["usage"] = {**used, **log}
+        return res
+    sus, bad = check_l1(o1, idx)
+    if bad:
+        res.setdefault("notes", []).append("L1 named functions not in the index (dropped): " + ", ".join(bad[:5]))
+    if not sus:  # fall back to the slice order so L2 can still run
+        res.setdefault("notes", []).append("L1 gave no valid suspects; using the slice order")
+        for r in (slice_res or {}).get("ranked", [])[:5]:
+            h = find_fn(idx, r["name"], r["file"])
+            if h and all(x["_hit"] != h for x in sus):
+                sus.append({"name": r["name"], "file": h[0], "reason": "slice", "_hit": h})
+        if not sus:
+            res["error"] = "L1 produced no usable suspects and there is no slice"
+            res["usage"] = {**used, **log}
+            return res
+    res["suspects"] = [{k: v for k, v in s.items() if k != "_hit"} | {"lines": f"{s['_hit'][1]['first']}-{s['_hit'][1]['last']}"} for s in sus]
+    if stub and stub.canned is None:
+        stub.ctx["suspects"] = sus
+    capn, p2 = a.body_cap, None
+    while capn >= 10:  # shrink bodies until L2 fits the remaining budget
+        p2 = prompt_l2(symptoms, slice_res, idx, cidx, sus, capn)
+        if used["prompt"] + used["completion"] + tok_est(p2) + RESERVE <= cap:
+            break
+        capn //= 2
+    o2, err = ask("l2", p2, nt[1], SCHEMA2, None)
+    if o2 is None:
+        res["error"] = err
+        res["usage"] = {**used, **log}
+        return res
+    top, diag = check_l2(o2, idx)
+    if not top or not diag:
+        res["error"] = "L2 reply lacked a valid top function or a diagnosis"
+        res["raw_l2"] = o2
+    else:
+        res["top"] = [{"name": h[1]["qual"], "file": h[0], "lines": f"{h[1]['first']}-{h[1]['last']}"} for _, h in top]
+        res["diagnosis"] = diag.strip()
+        cond = o2.get("condition") if isinstance(o2.get("condition"), dict) else None
+        if cond is not None:  # the line must lie inside the named function (else it is a hallucinated location)
+            ln = cond.get("line")
+            hit = find_fn(idx, str(cond.get("function", "")), None) if cond.get("function") else None
+            fn_ = hit[1] if hit else None
+            if fn_ is None:
+                res.setdefault("notes", []).append(f"condition function {cond.get('function')!r} is not in the index; condition dropped")
+                res["condition_rejected"] = cond
+                cond = None
+            elif isinstance(ln, bool) or not isinstance(ln, int) or not (fn_["first"] <= ln <= fn_["last"]):
+                res.setdefault("notes", []).append(f"condition line {ln!r} is outside {fn_['qual']} ({fn_['first']}-{fn_['last']}); condition dropped")
+                res["condition_rejected"] = cond
+                cond = None
+        res["condition"] = cond
+        if cond is None and not re.search(r"\bat\s+\S+:\d+", diag):
+            res.setdefault("notes", []).append("diagnosis does not state a condition `at function:line ...`")
+    res["usage"] = {**used, **log}
+    return res
+
+
+def human_summary(res):
+    if res.get("dry_run"):
+        return f"[dry-run] L1 prompt ~{res['est_tokens']['l1']} tokens; no model call made."
+    L = []
+    if res.get("error"):
+        L.append("ERROR: " + res["error"])
+    for i, s in enumerate(res.get("suspects", []), 1):
+        L.append(f"suspect {i}: {s['name']} {s['file']}:{s['lines']} - {s['reason']}")
+    for i, t in enumerate(res.get("top", []), 1):
+        L.append(f"TOP {i}: {t['name']} {t['file']}:{t['lines']}")
+    if res.get("diagnosis"):
+        L.append("DIAGNOSIS: " + res["diagnosis"])
+    u = res.get("usage")
+    if u:
+        L.append(f"tokens: prompt {u['prompt']} + completion {u['completion']}; calls {len(u['calls'])}, repairs {u['repairs']}")
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------- CLI
+
+def cmd_slice(a):
+    res = do_slice(a.repo, a.replay_cmd, a.passing_cmd, a.file, a.timeout, a.include_tests, a.top)
+    if a.json:
+        Path(a.json).write_text(json.dumps(res, indent=1))
+    if a.md:
+        Path(a.md).write_text(slice_md(res))
+    print(json.dumps(res, indent=1) if not a.md_only else slice_md(res))
+    return 0
+
+
+def cmd_locate(a):
+    stub = Stub(a.stub_model or None) if a.stub_model is not None else None
+    if not (a.dry_run or stub or a.live):
+        print("locate calls the real model endpoint: pass --live to allow it (or use --dry-run / --stub-model)", file=sys.stderr)
+        return 2
+    res = do_locate(a, stub)
+    if a.out:
+        Path(a.out).write_text(json.dumps(res, indent=1))
+    if a.dry_run:
+        print("=== PROMPT L1 ===\n" + res.get("prompt_l1", "") + "\n=== PROMPT L2 (preview, from slice order) ===\n" + res.get("prompt_l2_preview", ""))
+        print(human_summary(res))
+        return 0
+    print(json.dumps(res, indent=1, default=str))
+    print("\n" + human_summary(res), file=sys.stderr)
+    return 1 if res.get("error") else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--self-test", action="store_true")
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("slice")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--replay-cmd", required=True, help="the failing reproduction (shell), run in --repo")
+    s.add_argument("--passing-cmd", help="passing tests (shell); enables per-test Ochiai")
+    s.add_argument("--file", action="append", default=[], help="restrict ranking to this file (repeatable)")
+    s.add_argument("--timeout", type=int, default=300)
+    s.add_argument("--top", type=int, default=30)
+    s.add_argument("--include-tests", action="store_true")
+    s.add_argument("--json")
+    s.add_argument("--md")
+    s.add_argument("--md-only", action="store_true", help="print the markdown summary instead of JSON")
+    s.set_defaults(fn=cmd_slice)
+    l = sub.add_parser("locate")
+    l.add_argument("--repo", required=True)
+    l.add_argument("--file", action="append", default=[])
+    l.add_argument("--symptoms", required=True)
+    l.add_argument("--slice", help="JSON written by `slice --json`")
+    l.add_argument("--model", default=DEFAULT_MODEL)
+    l.add_argument("--no-think", choices=["auto", "all", "none"], default="auto", help="auto: L1 + repair no_think, L2 thinking (default)")
+    l.add_argument("--timeout", type=int, default=900)
+    l.add_argument("--budget-tokens", type=int, default=60000, help="cap on total prompt+completion tokens over all calls (prompt is estimated, completion is hard-capped via max_tokens)")
+    l.add_argument("--max-sig-chars", type=int, default=28000)
+    l.add_argument("--body-cap", type=int, default=80, help="max lines shown per suspect body in L2")
+    l.add_argument("--live", action="store_true", help="REQUIRED to call the real endpoint (without --dry-run/--stub-model, locate refuses)")
+    l.add_argument("--max-completion-tokens", type=int, default=16000, help="hard max_tokens per call (also limited by what --budget-tokens leaves; repair <= 2000)")
+    l.add_argument("--dry-run", action="store_true", help="print prompts, no model call")
+    l.add_argument("--stub-model", nargs="?", const="", default=None, metavar="JSON", help="offline stub (optional JSON list of canned replies)")
+    l.add_argument("--out")
+    l.set_defaults(fn=cmd_locate)
+    a = ap.parse_args(argv)
+    if a.self_test:
+        return self_test()
+    if not a.cmd:
+        ap.error("subcommand required")
+    return a.fn(a)
+
+
+# ---------------------------------------------------------------- self-test
+
+TOY_CALC = '''\
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def tax(amount, rate):
+    return amount * rate
+
+
+def apply_discount(price, pct):
+    """pct is a percentage 0-100."""
+    factor = 1 - pct
+    return price * factor
+
+
+def total(price, pct, rate):
+    discounted = apply_discount(price, pct)
+    return clamp(discounted + tax(discounted, rate), 0, 10**9)
+
+
+def unused_helper():
+    return 1
+'''
+TOY_TESTS = '''\
+import calc
+
+
+def test_tax():
+    assert calc.tax(100, 0.1) == 10
+
+
+def test_clamp():
+    assert calc.clamp(5, 0, 3) == 3
+
+
+def test_tax_zero():
+    assert calc.tax(0, 0.5) == 0
+
+
+def test_clamp_low():
+    assert calc.clamp(-5, 0, 3) == 0
+
+
+def test_zero_discount():
+    assert calc.apply_discount(50, 0) == 50
+'''
+TOY_REPLAY = '''\
+import calc
+
+
+def test_replay_discount():
+    assert calc.total(200, 25, 0.0) == 150
+'''
+TOY_SYMPTOMS = "total(200, 25, 0.0) returns a negative or wrong amount; a 25% discount should give 150.\n"
+
+
+def self_test():
+    d = Path(tempfile.mkdtemp(prefix="diag-localize-st-"))
+    flag = d / "model_called"
+    old_env = os.environ.get("MINI_SINGLE_BIN")
+    try:
+        repo = d / "toy"
+        repo.mkdir()
+        (repo / "calc.py").write_text(TOY_CALC)
+        (repo / "test_calc.py").write_text(TOY_TESTS)
+        (repo / "test_replay.py").write_text(TOY_REPLAY)
+        (d / "symptoms.txt").write_text(TOY_SYMPTOMS)
+        # any real model call would run this and leave the flag
+        os.environ["MINI_SINGLE_BIN"] = f"{shlex.quote(sys.executable)} -c \"open('{flag}','w').write('x')\""
+        py = shutil.which("python3") or sys.executable
+        pyt = f"{shlex.quote(py)} -m pytest -q"
+        if subprocess.run([py, "-c", "import pytest"], capture_output=True).returncode:
+            print("diag-localize self-test: pytest not importable, using plain-python replay only")
+            pyt = None
+        # --- slice with pytest, with and without passing tests
+        r1 = do_slice(repo, f"{pyt} test_replay.py", None, (), 120)
+        names1 = [x["name"] for x in r1["ranked"]]
+        assert "apply_discount" in names1[:3], names1
+        assert r1["tests"]["failed"] == 1 and r1["tests"]["passed"] == 0, r1["tests"]
+        assert "unused_helper" not in names1
+        assert all(not x["file"].startswith("test_") for x in r1["ranked"])
+        r2 = do_slice(repo, f"{pyt} test_replay.py", f"{pyt} test_calc.py", (), 120)
+        names2 = [x["name"] for x in r2["ranked"]]
+        assert "apply_discount" in names2[:3] and r2["tests"] == {"failed": 1, "passed": 5}, (names2, r2["tests"])
+        ad = next(x for x in r2["ranked"] if x["name"] == "apply_discount")
+        assert ad["ochiai"] is not None and ad["ochiai"] > 0 and "Ochiai" in ad["reason"], ad
+        assert (ad["first"], ad["last"]) == (9, 12), ad
+        # --- plain python script replay (no pytest): traceback frames from the output
+        (repo / "replay.py").write_text("import calc\nassert calc.total(200, 25, 0.0) == 150, 'bad total'\n")
+        r3 = do_slice(repo, f"{shlex.quote(sys.executable)} replay.py", None, (), 60)
+        assert r3["replay_rc"] != 0 and "apply_discount" in [x["name"] for x in r3["ranked"]][:3], r3["ranked"]
+        # --- passing replay -> warning, no crash
+        r4 = do_slice(repo, f"{pyt} test_calc.py", None, (), 60)
+        assert any("did not fail" in w for w in r4["warnings"])
+        # --- fix 1: repo with filterwarnings=error must not abort (tracer imported before pytest)
+        werr = d / "werr"
+        werr.mkdir()
+        (werr / "calc.py").write_text(TOY_CALC)
+        (werr / "test_replay.py").write_text(TOY_REPLAY)
+        (werr / "pytest.ini").write_text("[pytest]\nfilterwarnings = error\n")
+        rw = do_slice(werr, f"{pyt} test_replay.py", None, (), 120)
+        assert rw["tests"] == {"failed": 1, "passed": 0} and not any("diag_" in w for w in rw["warnings"]), rw
+        assert "apply_discount" in [x["name"] for x in rw["ranked"]][:3], rw["ranked"]
+        # warn if the replay tail names the tracer
+        (werr / "boom.py").write_text("raise RuntimeError('x diag_trace y')\n")
+        rb = do_slice(werr, f"{shlex.quote(sys.executable)} boom.py", None, (), 60)
+        assert any("diag_trace" in w for w in rb["warnings"]), rb["warnings"]
+        # --- fix 2: plain-python replay + plain-python passing command keeps the passing session
+        (repo / "ok.py").write_text("import calc\nassert calc.apply_discount(50, 0) == 50\n")
+        r5 = do_slice(repo, f"{shlex.quote(sys.executable)} replay.py", f"{shlex.quote(sys.executable)} ok.py", (), 60)
+        assert r5["tests"] == {"failed": 1, "passed": 1}, r5["tests"]
+        ad5 = next(x for x in r5["ranked"] if x["name"] == "apply_discount")
+        assert ad5["ochiai"] is not None and ad5["ochiai"] < 1.0, ad5
+        # --- fix 3: wrapper process spawning pytest (and the wrapper's own trace file) are both merged
+        if pyt:
+            (repo / "wrap.py").write_text("import subprocess, sys\nr = subprocess.run([sys.executable, '-m', 'pytest', '-q', 'test_replay.py'])\nsys.exit(r.returncode)\n")
+            r6 = do_slice(repo, f"{shlex.quote(sys.executable)} wrap.py", None, (), 120)
+            assert r6["tests"] == {"failed": 1, "passed": 0} and "apply_discount" in [x["name"] for x in r6["ranked"]][:3], (r6["tests"], r6["ranked"])
+            # --- fix 4: skipped and xfail tests are not passing evidence
+            (repo / "test_skip.py").write_text("import calc, pytest\n\n\n@pytest.mark.skip\ndef test_s():\n    calc.unused_helper()\n\n\n"
+                                               "@pytest.mark.xfail\ndef test_x():\n    calc.unused_helper()\n    assert False\n\n\ndef test_ok():\n    assert calc.tax(1, 1) == 1\n")
+            r7 = do_slice(repo, f"{pyt} test_replay.py", f"{pyt} test_skip.py", (), 120)
+            assert r7["tests"] == {"failed": 1, "passed": 1}, r7["tests"]
+            assert "unused_helper" not in [x["name"] for x in r7["ranked"]], r7["ranked"]
+        # --- minor: timeout kills the process group (grandchild would hold the pipes 25s), output decoded
+        t0 = time.time()
+        rt, txt, _ = run_traced(str(repo), f"{shlex.quote(sys.executable)} -c \"import subprocess,time;print('hi',flush=True);subprocess.Popen(['sleep','25']);time.sleep(25)\"", 2, d / "tw")
+        assert rt == 124 and "TIMEOUT" in txt and "b'" not in txt and time.time() - t0 < 15, (rt, txt, time.time() - t0)
+        sj = d / "slice.json"
+        sj.write_text(json.dumps(r2))
+        assert "apply_discount" in slice_md(r2)
+
+        # --- locate: dry run prints prompts, no model call
+        base = ["locate", "--repo", str(repo), "--file", "calc.py", "--symptoms", str(d / "symptoms.txt"), "--slice", str(sj)]
+        ns = main_ns(base + ["--dry-run"])
+        res = do_locate(ns)
+        assert res["dry_run"] and "unused_helper" in res["prompt_l1"] and "9-12" in res["prompt_l1"] and "apply_discount" in res["prompt_l1"]
+        assert "Dynamic slice" in res["prompt_l1"] and "apply_discount" in res["prompt_l2_preview"]
+        assert "factor = 1 - pct" in res["prompt_l2_preview"] and "total" in res["prompt_l2_preview"]
+        assert not flag.exists()
+        # --- locate with the deterministic stub
+        ns = main_ns(base + ["--stub-model"])
+        res = do_locate(ns, Stub())
+        assert not res.get("error"), res
+        assert "apply_discount" in [x["name"] for x in res["suspects"]] and len(res["top"]) == 2
+        assert re.search(r"at \w+:\d+", res["diagnosis"]) and res["usage"]["repairs"] == 0
+        # --- canned replies: fenced JSON ok; malformed first reply -> exactly one repair call; hallucinated names dropped
+        good1 = json.dumps({"suspects": [{"name": "nonexistent_fn", "file": "calc.py", "reason": "x"}, {"name": "apply_discount", "file": "calc.py", "reason": "r"}]})
+        good2 = json.dumps({"top": [{"name": "apply_discount", "file": "calc.py"}], "diagnosis": "pct is 0-100 but used as a fraction: at apply_discount:11 expect pct <= 1 (violated: 25)",
+                            "condition": {"function": "apply_discount", "line": 11, "expr": "pct <= 1"}})
+        cf = d / "canned.json"
+        cf.write_text(json.dumps(["```json\n" + good1 + "\n```", good2[:-3], good2]))
+        res = do_locate(main_ns(base + ["--stub-model", str(cf)]), Stub(str(cf)))
+        assert not res.get("error") and res["usage"]["repairs"] == 1 and len(res["usage"]["calls"]) == 3, res
+        assert [s["name"] for s in res["suspects"]] == ["apply_discount"] and any("nonexistent_fn" in n for n in res["notes"])
+        assert res["condition"]["line"] == 11
+        # --- unrepairable output -> error, still no crash; budget exceeded -> error
+        cf.write_text(json.dumps(["not json", "still not json"]))
+        res = do_locate(main_ns(base + ["--stub-model", str(cf)]), Stub(str(cf)))
+        assert "after repair" in res["error"]
+        res = do_locate(main_ns(base + ["--stub-model", "--budget-tokens", "100"]), Stub())
+        assert "budget" in res["error"]
+        # --- fix 6: no --live, no --dry-run/--stub -> refused (CLI exit 2, do_locate error), no model call
+        rl = do_locate(main_ns(base))
+        assert "--live" in rl["error"] and not flag.exists(), rl
+        assert subprocess.run([sys.executable, __file__] + base, capture_output=True, text=True, timeout=60).returncode == 2
+        # --- fix 5: every call carries a hard max_tokens consistent with the budget (stub records it)
+        stb = Stub()
+        res = do_locate(main_ns(base + ["--stub-model", "--budget-tokens", "20000", "--max-completion-tokens", "3000"]), stb)
+        assert not res.get("error") and stb.max_tokens and all(m and 1500 <= m <= 3000 for m in stb.max_tokens), stb.max_tokens
+        assert all(c["max_tokens"] for c in res["usage"]["calls"])
+        stb = Stub()
+        res = do_locate(main_ns(base + ["--stub-model", "--budget-tokens", "3000"]), stb)
+        assert not res.get("error") and all(m <= 3000 for m in stb.max_tokens), (res.get("error"), stb.max_tokens)
+        # --- minor: condition line outside the function is dropped and flagged
+        cf.write_text(json.dumps([good1, json.dumps({"top": [{"name": "apply_discount", "file": "calc.py"}], "diagnosis": "d at apply_discount:99 expect x",
+                                                      "condition": {"function": "apply_discount", "line": 99, "expr": "x"}})]))
+        res = do_locate(main_ns(base + ["--stub-model", str(cf)]), Stub(str(cf)))
+        assert res["condition"] is None and any("outside apply_discount" in n for n in res["notes"]) and res["condition_rejected"]["line"] == 99, res
+        # --- minor: usage is recorded when L1 fails
+        cf.write_text(json.dumps(["not json", "still not json"]))
+        res = do_locate(main_ns(base + ["--stub-model", str(cf)]), Stub(str(cf)))
+        assert res["usage"]["repairs"] == 1 and len(res["usage"]["calls"]) == 2 and res["usage"]["prompt"] > 0, res
+        # --- strict parser unit cases
+        assert parse_json_strict('<think>x</think>\n{"a": 1}')[0] == {"a": 1}
+        assert parse_json_strict('Here: {"a": 1}')[0] is None and parse_json_strict("[1]")[0] is None
+        # --- JS: function index + regex call index work without the slice (Python-only slice)
+        (repo / "m.js").write_text("function a(x) {\n  return b(x) + 1;\n}\nfunction b(y) {\n  return y * 2;\n}\n")
+        jx = build_index(str(repo), ["m.js"])
+        assert [f["name"] for f in jx["m.js"]["funcs"]] == ["a", "b"]
+        assert ("m.js", "b") in call_index(jx)[("m.js", "a")]["callees"]
+        # --- real-call plumbing against a FAKE helper (never the endpoint): ss_call protocol, key never in the output
+        fake = d / "fake_helper.py"
+        replies = [good1, good2]
+        fake.write_text("import json,sys\nreq=json.load(sys.stdin)\nn=len(json.load(open(%r)))\nopen(%r,'a').write('x')\n"
+                        "import os\nopen(%r,'a').write(str(req.get('max_tokens'))+' ')\nreplies=json.load(open(%r))\ni=len(open(%r).read())-1\n"
+                        "print('@@SS@@ '+json.dumps({'content':replies[i],'finish_reason':'stop','usage':{'prompt_tokens':50,'completion_tokens':9},'secs':0.1,'nt':req['no_think']}))\n"
+                        % (str(d / "r.json"), str(d / "fake_calls"), str(d / "fake_mt"), str(d / "r.json"), str(d / "fake_calls")))
+        (d / "r.json").write_text(json.dumps(replies))
+        lj = d / "local.json"
+        lj.write_text(json.dumps({"base_url": "http://127.0.0.1:9", "api_key": "k-SECRET-xyz"}))
+        r_ = runner()
+        old_lj, r_.LOCAL_JSON = r_.LOCAL_JSON, lj
+        os.environ["MINI_SINGLE_BIN"] = f"{shlex.quote(sys.executable)} {fake}"
+        try:
+            res = do_locate(main_ns(base + ["--live", "--budget-tokens", "20000"]))
+        finally:
+            r_.LOCAL_JSON = old_lj
+        assert not res.get("error") and res["top"][0]["name"] == "apply_discount" and "k-SECRET" not in json.dumps(res), res
+        assert (d / "fake_calls").read_text() == "xx"
+        mts = [int(x) for x in (d / "fake_mt").read_text().split()]
+        assert len(mts) == 2 and all(1500 <= m <= 16000 for m in mts) and mts == [c["max_tokens"] for c in res["usage"]["calls"]], mts
+        os.environ["MINI_SINGLE_BIN"] = f"{shlex.quote(sys.executable)} -c \"open('{flag}','w').write('x')\""
+        # --- the model path is untouched by every test above
+        assert not flag.exists(), "a real model call was attempted"
+        # --- diagnose-submit --localize (dry-run; no queue): EXCERPTS.md gets the suspects
+        wd = d / "wd"
+        p = subprocess.run([str(HERE / "diagnose-submit"), "--name", "toy", "--workdir", str(wd), "--symptoms", str(d / "symptoms.txt"),
+                            "--code", str(repo / "calc.py"), "--localize", "--replay-cmd", f"{pyt} test_replay.py",
+                            "--replay-cwd", str(repo), "--passing-cmd", f"{pyt} test_calc.py", "--dry-run"], capture_output=True, text=True, timeout=300)
+        assert p.returncode == 0, p.stdout + p.stderr
+        ex = (wd / "EXCERPTS.md").read_text()
+        assert "Suspects (dynamic slice" in ex and "apply_discount" in ex, ex
+        assert "EXCERPTS.md" in (wd / "TASK.md").read_text()
+        # slice.json in the model's workdir carries no commands/paths/output; the full copy is local-only, beside the workdir
+        sjw = json.loads((wd / "slice.json").read_text())
+        assert not {"replay_cmd", "passing_cmd", "replay_tail", "repo"} & set(sjw) and sjw["ranked"], sorted(sjw)
+        assert "pytest" not in (wd / "slice.json").read_text() and str(repo) not in (wd / "slice.json").read_text()
+        full = json.loads((d / "wd.local" / "slice.full.json").read_text())
+        assert full["replay_cmd"] and "replay_tail" in full
+        # fix 8: no --replay-cwd and no git root -> skipped; with a git root above the code file it is the default
+        p3 = subprocess.run([str(HERE / "diagnose-submit"), "--name", "toy", "--workdir", str(d / "wd3"), "--symptoms", str(d / "symptoms.txt"),
+                             "--code", str(repo / "calc.py"), "--localize", "--replay-cmd", f"{pyt} test_replay.py", "--dry-run"], capture_output=True, text=True, timeout=120)
+        assert p3.returncode == 0 and "pass --replay-cwd" in p3.stderr and not (d / "wd3" / "EXCERPTS.md").exists(), p3.stderr
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+        p4 = subprocess.run([str(HERE / "diagnose-submit"), "--name", "toy", "--workdir", str(d / "wd4"), "--symptoms", str(d / "symptoms.txt"),
+                             "--code", str(repo / "calc.py"), "--localize", "--replay-cmd", f"{pyt} test_replay.py", "--dry-run"], capture_output=True, text=True, timeout=300)
+        assert p4.returncode == 0 and "apply_discount" in (d / "wd4" / "EXCERPTS.md").read_text(), p4.stderr
+        p2 = subprocess.run([str(HERE / "diagnose-submit"), "--name", "toy", "--workdir", str(d / "wd2"), "--symptoms", str(d / "symptoms.txt"),
+                             "--code", str(repo / "calc.py"), "--dry-run"], capture_output=True, text=True, timeout=60)
+        assert p2.returncode == 0 and not (d / "wd2" / "EXCERPTS.md").exists(), "default behaviour changed"
+        print("diag-localize self-test ok")
+        return 0
+    finally:
+        if old_env is None:
+            os.environ.pop("MINI_SINGLE_BIN", None)
+        else:
+            os.environ["MINI_SINGLE_BIN"] = old_env
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def main_ns(argv):
+    """Parse locate args into a namespace (self-test helper)."""
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    l = sub.add_parser("locate")
+    for opt, kw in (("--repo", {}), ("--symptoms", {}), ("--slice", {}), ("--model", {"default": DEFAULT_MODEL}), ("--no-think", {"default": "auto"}),
+                    ("--timeout", {"type": int, "default": 900}), ("--budget-tokens", {"type": int, "default": 60000}),
+                    ("--max-sig-chars", {"type": int, "default": 28000}), ("--body-cap", {"type": int, "default": 80}), ("--out", {})):
+        l.add_argument(opt, **kw)
+    l.add_argument("--file", action="append", default=[])
+    l.add_argument("--dry-run", action="store_true")
+    l.add_argument("--live", action="store_true")
+    l.add_argument("--max-completion-tokens", type=int, default=16000)
+    l.add_argument("--stub-model", nargs="?", const="", default=None)
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

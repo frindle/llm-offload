@@ -1,0 +1,96 @@
+# agent-dispatch-mcp example configuration.
+#
+# Copy to config.toml (gitignored) and edit. Nothing host-specific belongs
+# anywhere else in this repository.
+#
+# Every value here can also be set by environment variable, which is the right
+# channel for anything you do not want written to disk:
+#   AGENT_DISPATCH_ENDPOINT, AGENT_DISPATCH_WORKSPACE,
+#   AGENT_DISPATCH_KV_MB_PER_1K, AGENT_DISPATCH_WEIGHTS_HEADROOM,
+#   AGENT_DISPATCH_PHYSICAL_CAP, AGENT_DISPATCH_WAIT_TIMEOUT_S,
+#   AGENT_DISPATCH_POLL_INTERVAL_S, AGENT_DISPATCH_DEFAULT_NUM_CTX
+# Environment variables win over this file.
+
+[dispatch]
+# Your inference endpoint (Ollama-compatible /api/chat).
+# Use a placeholder here; put the real one in config.toml or the environment.
+endpoint = "http://127.0.0.1:11434"
+
+default_num_ctx = 32768
+request_timeout_s = 1800
+
+# Directory verifier commands run in. Must be set before any verifier will run;
+# the server refuses rather than guessing a working directory.
+# workspace = "/path/to/your/checkout"
+
+[gate]
+# resident_mb * weights_headroom covers weights plus load-time headroom.
+weights_headroom = 1.2
+
+# MB of KV cache per 1k tokens of configured context.
+#
+# READ THIS BEFORE LOWERING IT. This constant was once 2, and 2 was wrong by
+# roughly 75x. 2 MB/1k tokens is 2 KB per token; the real figure for a ~64-layer,
+# 8-GQA-KV-head, head_dim-128 model with q8_0 K/V cache is ~128 KB per token,
+# i.e. ~128 MB per 1k tokens (~8.4 GB at 65536 context). The old value allotted
+# 128 MB for that entire 8.4 GB.
+#
+# The consequence was not a rounding error. The gate exists to predict whether
+# the next model load fits WITHOUT PAGING, and a 75x-short KV term meant the gate
+# stamped "host ready" on runs that were about to page -- certifying clean the
+# exact confound it was built to detect.
+#
+# 150 rather than 128 deliberately errs safe: head counts and cache
+# quantisation vary across a roster, and a too-generous gate costs a wait while
+# a too-tight one costs a silently invalid measurement.
+kv_mb_per_1k = 150.0
+
+# Never demand more than this fraction of physical memory. A threshold the host
+# can never reach makes every run wait out the timeout and report "not ready"
+# universally, which destroys the signal rather than protecting anything.
+physical_cap_fraction = 0.85
+
+# The wait is bounded on purpose. An unbounded wait hangs a whole batch on one
+# bad host.
+wait_timeout_s = 240
+poll_interval_s = 5
+
+# Used for any model absent from [resident_mb]. Conservative on purpose:
+# over-demanding costs a wait, under-demanding costs a paging run whose timings
+# look like data but are not.
+unknown_model_resident_mb = 20000
+
+[resident_mb]
+# Resident-set size in MB per model tag.
+#
+# THE SHIPPED DEFAULTS WERE MEASURED ON ONE SPECIFIC MACHINE, under one runtime
+# and one quantisation. They are a starting table, not facts about the models.
+# Resident size varies with runtime, quantisation, KV cache type, memory-mapping
+# behaviour and offload settings. If your numbers differ, yours are right.
+#
+# To measure your own: load the model, let it settle, and read the resident size
+# your inference runtime reports for it (e.g. `ollama ps`). Round up.
+#
+# Providing this section REPLACES the built-in table wholesale rather than
+# merging with it, so measurements from one machine are never silently mixed
+# with numbers from another.
+"qwen3.8:27b-q8_0" = 30000
+"qwen3-coder:30b" = 18600
+"qwen3-coder-next:q4_K_M" = 51700
+"deepseek-r1:32b" = 19900
+"qwen3-14b-agentic" = 9300
+"qwen2.5-coder:14b" = 9000
+
+[verifiers]
+# Extra command fragments that count as the model verifying its own work.
+# Appended to the built-in list.
+#
+# The built-in list is a WHITELIST and therefore a systematic under-counter by
+# construction. `tsc --noEmit` and `swift test` were both missing from it for
+# most of its life, which silently cost models credit for self-verification they
+# had genuinely performed. Add your toolchain's commands here rather than
+# accepting a quiet undercount.
+extra = [
+  # "bazel test",
+  # "./gradlew test",
+]

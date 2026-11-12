@@ -1,0 +1,79 @@
+#!/bin/zsh
+# graphify-all [--force] [--quiet] [--log FILE] [root]
+# Build/refresh a per-project CODE graph (<project>/graphify-out/graph.json) for every project
+# folder under <root> (default: ~/Desktop/GitHub Projects.nosync). Skips _archive, _repo-backups,
+# dotdirs and symlinks (the hidden X.nosync -> X links and claude-offload -> ~/bin would otherwise
+# graph the same tree twice).
+#   (default)  incremental: only changed files are re-extracted; unchanged projects take <1 s.
+#   --force    full re-extract (also lets a graph shrink after deleted code).
+#   --quiet    print only rebuilt/failed projects plus the summary line (for the launchd job).
+#   --log FILE append all output to FILE (trimmed to its last 3000 lines when it passes 1 MB).
+# Code-only (AST): no LLM, no API key, no cost. Semantic doc/image nodes from earlier /graphify runs
+# are kept. For the doc/image layer, run /graphify --update inside a repo.
+# In git repos it makes sure graphify-out/ is ignored (local .git/info/exclude, never a commit).
+# Scheduled by ~/Library/LaunchAgents/com.example.graphify-all.plist (every 2 h, incremental, quiet).
+set -o pipefail
+zmodload zsh/system
+force=(); quiet=0; log=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) force=(--force); shift;;
+    --quiet) quiet=1; shift;;
+    --log) log="$2"; shift 2;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0;;
+    *) break;;
+  esac
+done
+ROOT="${1:-$HOME/Desktop/GitHub Projects.nosync}"
+if [ -n "$log" ]; then
+  if [ -f "$log" ] && [ "$(stat -f %z "$log")" -gt 1048576 ]; then
+    tail -n 3000 "$log" > "$log.tmp" && mv "$log.tmp" "$log"
+  fi
+  exec >>"$log" 2>&1
+fi
+lock="$HOME/Library/Caches/graphify-all.lock"
+[ -e "$lock" ] || : > "$lock"
+if ! zsystem flock -t 0 "$lock" 2>/dev/null; then
+  print "$(date '+%F %T') graphify-all: another run holds $lock, skipping"; exit 0
+fi
+command -v graphify >/dev/null || { print "$(date '+%F %T') graphify-all: graphify not on PATH"; exit 1; }
+cd -P "$ROOT" || exit 1
+export GRAPHIFY_NO_TIPS=1
+print "$(date '+%F %T') graphify-all: $PWD ${force[*]} ($(graphify --version 2>/dev/null | head -1))"
+built=0; same=0; nocode=0; failed=0; t0=$SECONDS
+projects=( */(N) )
+if [ ${#projects} -eq 0 ]; then
+  print "$(date '+%F %T') graphify-all: no folders listed under $PWD -- if run from launchd, macOS privacy (TCC) probably blocked Desktop access; the plist must start it via /opt/homebrew/bin/python3, which has Desktop access"
+  exit 1
+fi
+for d in "${projects[@]}"; do
+  d="${d%/}"
+  case "$d" in _archive|_repo-backups|graphify-out|.*) continue;; esac
+  [ -L "$d" ] && continue
+  [ -d "$d" ] || continue
+  had_out=0; [ -d "$d/graphify-out" ] && had_out=1
+  # keep graphify-out/ out of git status (only for a repo whose top level is this folder)
+  if [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "${d:A}" ] \
+     && ! git -C "$d" check-ignore -q graphify-out/ 2>/dev/null; then
+    ex=$(git -C "$d" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null)
+    [ -n "$ex" ] && mkdir -p "${ex:h}" && print 'graphify-out/' >> "$ex" && print "  $d: added graphify-out/ to .git/info/exclude"
+  fi
+  out=$(nice -n 10 graphify update "$d" "${force[@]}" 2>&1); rc=$?
+  line=$(print -r -- "$out" | grep -oE 'Rebuilt: [0-9]+ nodes, [0-9]+ edges, [0-9]+ communities' | head -1)
+  if [ -n "$line" ] || print -r -- "$out" | grep -q 'GRAPH_REPORT.md updated'; then
+    printf '  %-34s %s\n' "$d" "${line:-rebuilt}"; built=$((built+1))
+  elif print -r -- "$out" | grep -qE 'No relevant changes|No code-graph topology changes|left untouched|skipping rebuild'; then
+    [ $quiet -eq 0 ] && printf '  %-34s unchanged\n' "$d"; same=$((same+1))
+  elif print -r -- "$out" | grep -q 'No code files found'; then
+    [ $quiet -eq 0 ] && printf '  %-34s (no code)\n' "$d"; nocode=$((nocode+1))
+    [ $had_out -eq 0 ] && rmdir "$d/graphify-out" 2>/dev/null
+  elif [ $rc -eq 0 ]; then
+    printf '  %-34s ok (unrecognized output): %s\n' "$d" "$(print -r -- "$out" | grep -vE 'not classified|^Code graph updated' | tail -1 | cut -c1-120)"
+    same=$((same+1))
+  else
+    printf '  %-34s FAILED rc=%s: %s\n' "$d" "$rc" "$(print -r -- "$out" | grep -vE 'not classified|^Code graph updated' | tail -2 | tr '\n' ' ' | cut -c1-160)"
+    failed=$((failed+1))
+  fi
+done
+print "$(date '+%F %T') graphify-all done in $((SECONDS-t0))s: $built rebuilt, $same unchanged, $nocode no code, $failed failed"
+[ $failed -eq 0 ]

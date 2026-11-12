@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Scheduled escalation watcher. Detects a stuck dispatch slice/job, records a
+  durable context file, runs a STANDALONE headless `claude -p` review on it, and
+  surfaces the verdict (ESCALATIONS.md -> SessionStart hook, plus a desktop
+  notification). Works with zero open Claude sessions, which is the overnight
+  case this exists for. StartInterval matches the com.example.dispatch-ack-reconcile
+  precedent; launchd will not start a second instance while one is still running,
+  so a slow review cannot pile up.
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.dispatch-escalation-watcher.plist
+    launchctl bootout   gui/$(id -u)/com.example.dispatch-escalation-watcher
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.dispatch-escalation-watcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/user/bin/dispatch-escalation-watcher.py</string>
+    <string>--once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/user/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/user/bin/ollama-queue-logs/dispatch-escalation-watcher.log</string>
+  <key>StandardErrorPath</key><string>/Users/user/bin/ollama-queue-logs/dispatch-escalation-watcher.log</string>
+</dict>
+</plist>

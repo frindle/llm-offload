@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""graphify-lane -- keep every project's code graph (<project>/graphify-out/graph.json) fresh.
+
+For each project whose CODE changed since its last refresh, run `graphify update <name>` (AST only, no LLM:
+GRAPHIFY_BACKEND=none) on the Unraid CPU runner through the queue (dispatch-cpu-runner). The Mac is the backup: it
+builds the project itself when the runner is down or stale, nobody claims the job in time, the job or its setup fails,
+the result fails the checks, a shipped file looks like it holds a secret, or the payload is too big.
+
+  graphify-lane [--quiet] [--log FILE] [--only a,b] [--mac-only] [--dry-run] [--force] [--list]
+
+  --only      just these projects (folder names)
+  --mac-only  never use the runner
+  --dry-run   show what is stale and where it would go; build nothing
+  --force     treat every project as changed (still an incremental `graphify update`)
+  --list      print the project list and exit
+
+Projects: ~/bin/configs/graphify-lane.json (each child folder of "parents" + the "extra" roots).
+Change test: graphify's own file list (scan.py runs detect() under graphify's python) against
+<project>/graphify-out/.lane-stamp {"snapshot_ns", "code_sha", "via", "version"}. Without a stamp, graph.json's mtime
+is the snapshot. Doc-only changes don't count: `graphify update` only redoes the code layer.
+Runner jobs: payload = graphify's file list + the graphify-out state files under <name>/ (a temp git repo, archive
+mode); the job restores the Mac mtimes so manifest.json stays valid here; results are checked (valid JSON, no
+absolute or runner paths, semantic nodes kept) and the Mac's graphify backs up a protected graph before it is replaced.
+Lock: ~/Library/Caches/graphify-all.lock (shared with the old graphify-all). Log: --log FILE (trimmed past 1 MB).
+CPU_RUNNER_API (env) points at the queue; default from the config.
+"""
+import argparse
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+HERE = HOME / "bin" / "graphify_lane"
+CFG_PATH = HOME / "bin" / "configs" / "graphify-lane.json"
+LOCK = HOME / "Library" / "Caches" / "graphify-all.lock"
+SCAN_CACHE = HOME / "Library" / "Caches" / "graphify-lane"
+STAMP = ".lane-stamp"
+# graphify-out files that go to the runner (state the update builds on) and that come back (what it rewrites)
+SHIP_STATE = ["graph.json", "manifest.json", ".graphify_labels.json", ".graphify_labels.json.sig",
+              ".graphify_labels.pending.json", ".graphify_analysis.json", ".graphify_semantic_marker", "cost.json",
+              ".graphify_root"]
+BRING_BACK = ["graph.json", "manifest.json", "GRAPH_REPORT.md", "graph.html", ".graphify_labels.json",
+              ".graphify_labels.json.sig", ".graphify_labels.pending.json", ".graphify_analysis.json",
+              ".graphify_semantic_marker", "cost.json"]
+ROOT_FILES = [".graphifyignore", ".graphifyrc"]
+SEMANTIC_TYPES = {"document", "concept", "rationale", "image", "paper", "video"}
+SECRET_RES = [re.compile(p) for p in (
+    rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY-----",
+    rb"\bgh[pousr]_[A-Za-z0-9]{36,}", rb"\bgithub_pat_[A-Za-z0-9_]{40,}",
+    rb"\bsk-ant-[A-Za-z0-9_\-]{20,}", rb"\bsk-(?:proj-)?[A-Za-z0-9]{32,}",
+    rb"\bxox[abprs]-[A-Za-z0-9-]{10,}", rb"\bAKIA[0-9A-Z]{16}\b", rb"\bAIza[0-9A-Za-z_\-]{35}\b",
+    rb"\bhf_[A-Za-z0-9]{30,}",
+    rb"(?i)(?:api[_-]?key|secret|token|passw(?:or)?d)[\"']?\s*[:=]\s*[\"'][A-Za-z0-9_\-+/=]{24,}[\"']")]
+RE_REBUILT = re.compile(r"Rebuilt: \d+ nodes, \d+ edges, \d+ communities")
+RE_SAME = re.compile(r"No relevant changes|No code-graph topology changes|left untouched|skipping rebuild")
+RE_NOCODE = re.compile(r"No code files found")
+RUNNER_PATH_RE = re.compile(r"(?:^|[\"'\s(])(?:/work/|/tmp/graphify-lane|/state/|/cache/)")
+GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "graphify-lane",
+           "GIT_AUTHOR_EMAIL": "graphify-lane@localhost", "GIT_COMMITTER_NAME": "graphify-lane",
+           "GIT_COMMITTER_EMAIL": "graphify-lane@localhost"}
+
+QUIET = False
+
+
+def log(msg, always=True):
+    if always or not QUIET:
+        print(msg, flush=True)
+
+
+def now_s():
+    return time.strftime("%F %T")
+
+
+def xp(p):
+    return Path(os.path.expanduser(p))
+
+
+def load_cfg():
+    c = json.loads(CFG_PATH.read_text())
+    for k in ("graphify_bin", "graphify_python", "uv"):
+        c[k] = str(xp(c[k]))
+    return c
+
+
+def projects(cfg):
+    out, seen = [], set()
+    for par in cfg["parents"]:
+        par = xp(par)
+        try:
+            kids = sorted(par.iterdir(), key=lambda p: p.name.lower())
+        except OSError as e:
+            log(f"{now_s()} graphify-lane: cannot list {par}: {e} -- if run from launchd, macOS privacy (TCC) "
+                "probably blocked Desktop access; start it via /opt/homebrew/bin/python3")
+            raise SystemExit(1)
+        for d in kids:
+            if d.name.startswith(".") or d.name in cfg["skip_names"] or d.is_symlink() or not d.is_dir():
+                continue
+            out.append(d)
+    for e in cfg.get("extra", []):
+        d = xp(e)
+        if d.is_dir():
+            out.append(d)
+    res = []
+    for d in out:
+        real = d.resolve()
+        if real in seen:
+            continue
+        seen.add(real)
+        res.append({"path": real, "name": real.name, "parent": real.parent})
+    return res
+
+
+def scan(cfg, proj):
+    """graphify's own file list for the project, via scan.py under graphify's python."""
+    cache = SCAN_CACHE / "scan" / hashlib.sha1(str(proj["path"]).encode()).hexdigest()[:12]
+    r = subprocess.run([cfg["graphify_python"], "-I", str(HERE / "scan.py"), str(proj["path"]), str(cache)],
+                       capture_output=True, text=True, timeout=600, env=graphify_env())
+    if r.returncode:
+        raise RuntimeError("scan failed: " + (r.stderr or r.stdout).strip()[-300:])
+    return json.loads(r.stdout)
+
+
+def graphify_env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHIFY_") and k not in GIT_ENV}
+    env.update(GRAPHIFY_BACKEND="none", GRAPHIFY_NO_TIPS="1")
+    env["PATH"] = os.pathsep.join([str(HOME / ".local" / "bin"), "/opt/homebrew/bin", "/usr/bin", "/bin",
+                                   "/usr/sbin", "/sbin", env.get("PATH", "")])
+    return env
+
+
+def code_sha(files):
+    h = hashlib.sha256()
+    for rel in sorted(k for k, v in files.items() if v[0] == "code"):
+        h.update(rel.encode() + b"\0")
+    return h.hexdigest()[:20]
+
+
+def read_stamp(out):
+    try:
+        return json.loads((out / STAMP).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def staleness(proj, sc, force):
+    """-> (state, why): state in fresh | stale | nocode."""
+    files = sc["files"]
+    code = {k: v for k, v in files.items() if v[0] == "code"}
+    if not code:
+        return "nocode", "no code files"
+    out = proj["path"] / "graphify-out"
+    graph = out / "graph.json"
+    if not graph.is_file():
+        return "stale", "no graph yet"
+    if force:
+        return "stale", "--force"
+    st = read_stamp(out)
+    if st and isinstance(st.get("snapshot_ns"), int):
+        snap = st["snapshot_ns"]
+        if st.get("code_sha") and st["code_sha"] != code_sha(files):
+            return "stale", "code file set changed"
+        if st.get("version") and st["version"] != sc.get("version"):
+            return "stale", "graphify version changed"
+    else:
+        snap = graph.stat().st_mtime_ns
+    newer = [k for k, v in files.items() if v[0] in ("code", "resolution") and v[1] > snap]
+    if newer:
+        return "stale", f"{len(newer)} code file(s) changed, e.g. {newer[0]}"
+    return "fresh", ""
+
+
+def write_stamp(proj, sc, snap_ns, via):
+    out = proj["path"] / "graphify-out"
+    if not out.is_dir():
+        return
+    tmp = out / (STAMP + ".tmp")
+    tmp.write_text(json.dumps({"snapshot_ns": snap_ns, "code_sha": code_sha(sc["files"]), "via": via,
+                               "version": sc.get("version"), "at": now_s()}))
+    os.replace(tmp, out / STAMP)
+
+
+def ensure_git_exclude(proj):
+    d = proj["path"]
+    try:
+        top = subprocess.run(["git", "-C", str(d), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=30)
+        if top.returncode or Path(top.stdout.strip()).resolve() != d:
+            return
+        if subprocess.run(["git", "-C", str(d), "check-ignore", "-q", "graphify-out/"], timeout=30).returncode == 0:
+            return
+        ex = subprocess.run(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-path",
+                             "info/exclude"], capture_output=True, text=True, timeout=30).stdout.strip()
+        if ex:
+            Path(ex).parent.mkdir(parents=True, exist_ok=True)
+            with open(ex, "a") as f:
+                f.write("graphify-out/\n")
+            log(f"  {proj['name']}: added graphify-out/ to .git/info/exclude")
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def classify(text, rc):
+    m = RE_REBUILT.search(text)
+    if m or "GRAPH_REPORT.md updated" in text:
+        return "rebuilt", m.group(0) if m else "rebuilt"
+    if RE_SAME.search(text):
+        return "unchanged", ""
+    if RE_NOCODE.search(text):
+        return "nocode", ""
+    if rc == 0:
+        tail = [ln for ln in text.splitlines() if ln.strip() and "not classified" not in ln]
+        return "unchanged", "ok (unrecognized output): " + (tail[-1][:120] if tail else "")
+    tail = [ln for ln in text.splitlines() if ln.strip() and "not classified" not in ln][-2:]
+    return "failed", f"rc={rc}: " + " ".join(tail)[:200]
+
+
+# ---------------- Mac path ----------------
+def build_mac(cfg, proj):
+    cmd = ["/usr/sbin/taskpolicy", "-b", "/usr/bin/nice", "-n", "10", cfg["graphify_bin"], "update", proj["name"]]
+    try:
+        r = subprocess.run(cmd, cwd=proj["parent"], capture_output=True, text=True, timeout=7200, env=graphify_env())
+        text, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+    except subprocess.TimeoutExpired:
+        return "failed", "mac build timed out"
+    return classify(text, rc)
+
+
+# ---------------- runner path ----------------
+def cpu_job_lib():
+    spec = importlib.util.spec_from_file_location("cpu_job", HOME / "bin" / "cpu_job.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class Runner:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lib = cpu_job_lib()
+        self.api = os.environ.get("CPU_RUNNER_API") or cfg["api_default"]
+        self.req_path = self.req_sha = None
+        self.tmp_root = Path(tempfile.mkdtemp(prefix="graphify-lane-"))
+
+    def runner_age(self):
+        try:
+            tok = self.lib._token(None)
+            code, body = self.lib._http(self.api, tok, "GET", "/api/cpu/runners", timeout=10)
+            if code != 200:
+                return None
+            for r in body.get("runners", []):
+                if r.get("runner") == self.cfg["runner"]:
+                    return float(r.get("seen_s_ago"))
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def up(self):
+        a = self.runner_age()
+        return a is not None and a < self.cfg["runner_fresh_s"], a
+
+    def requirements(self):
+        """The Mac's exact graphify pins, so the runner builds with the same code."""
+        if self.req_path:
+            return
+        r = subprocess.run([self.cfg["uv"], "pip", "freeze", "--python", self.cfg["graphify_python"]],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode or "graphifyy==" not in r.stdout:
+            raise RuntimeError("uv pip freeze failed: " + r.stderr[-200:])
+        lines = sorted(ln.strip() for ln in r.stdout.splitlines() if re.match(r"^[A-Za-z0-9_.\-]+==\S+$", ln.strip()))
+        txt = "\n".join(lines) + "\n"
+        self.req_path = self.tmp_root / "requirements.txt"
+        self.req_path.write_text(txt)
+        self.req_sha = hashlib.sha256(txt.encode()).hexdigest()[:16]
+
+    def payload(self, proj, sc, work):
+        """Temp git repo holding <name>/<files> + <name>/graphify-out/<state>. -> (repo, mtimes_path, MB) or
+        raises Skip(reason) when the project must build on the Mac."""
+        name, src = proj["name"], proj["path"]
+        repo = work / "repo"
+        base = repo / name
+        mt, total = {}, 0
+        limit = self.cfg["max_payload_mb"] << 20
+        rels = list(sc["files"].keys()) + [r for r in ROOT_FILES if (src / r).is_file()]
+        rels += ["graphify-out/" + f for f in SHIP_STATE if (src / "graphify-out" / f).is_file()]
+        for rel in rels:
+            p = src / rel
+            if p.is_symlink() and not p.resolve().is_relative_to(src):
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            total += st.st_size
+            if total > limit:
+                raise Skip(f"payload over {self.cfg['max_payload_mb']} MB")
+            if not rel.startswith("graphify-out/") and st.st_size < (4 << 20):
+                data = p.read_bytes()
+                for rx in SECRET_RES:
+                    if rx.search(data):
+                        raise Skip(f"possible secret in {rel}")
+            dst = base / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, dst)
+            mt[rel] = st.st_mtime_ns
+        env = dict(os.environ, **GIT_ENV)
+        for args in (["init", "-q"], ["add", "-f", "-A"], ["commit", "-q", "--no-verify", "-m", "snapshot"]):
+            r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                                "-c", "core.autocrlf=false", "-c", "core.excludesFile=/dev/null"] + args,
+                               cwd=repo, capture_output=True, text=True, env=env, timeout=600)
+            if r.returncode:
+                raise RuntimeError(f"git {args[0]}: {r.stderr[-200:]}")
+        mpath = work / "mtimes.json"
+        mpath.write_text(json.dumps(mt))
+        return repo, mpath, round(total / 1e6, 1)
+
+    def build(self, proj, sc):
+        """-> (state, detail, installed_files) ; raises Fallback(reason) when the Mac should build it."""
+        self.requirements()
+        work = Path(tempfile.mkdtemp(prefix=proj["name"][:20] + "-", dir=self.tmp_root))
+        try:
+            try:
+                repo, mpath, mb = self.payload(proj, sc, work)
+            except Skip as e:
+                raise Fallback(str(e))
+            art = work / "art.tgz"
+            last = [0.0]
+
+            def stale_runner():
+                if time.time() - last[0] < 20:
+                    return None
+                last[0] = time.time()
+                ok, age = self.up()
+                return None if ok else f"runner heartbeat stale ({age}s)"
+
+            def submit(with_setup):
+                # a plain job first: one WITH setup counts against the runner's lane limit (2), which other work
+                # (localizer, venv jobs) often fills; the runner keeps the venv in /tmp/graphify-lane between jobs
+                saved = {k: os.environ.get(k) for k in GIT_ENV}
+                os.environ.update(GIT_ENV)   # cpu_job's git archive/diff run with this process's env
+                try:
+                    return self.lib.submit_cpu_job(
+                        str(repo), 'bash "$JOB_TOOLS/graphify_job.sh" run', self.cfg["run_timeout_s"],
+                        mode="archive", label=f"graphify {proj['name']}{' +setup' if with_setup else ''}",
+                        owner="graphify-lane",
+                        tools={"graphify_job.sh": str(HERE / "graphify_job.sh"),
+                               "requirements.txt": str(self.req_path), "mtimes.json": str(mpath)},
+                        env={"DISPATCH_GL_NAME": proj["name"], "DISPATCH_GL_REQ_SHA": self.req_sha},
+                        setup=({"cmd": 'bash "$JOB_TOOLS/graphify_job.sh" setup',
+                                "timeout_s": self.cfg["setup_timeout_s"]} if with_setup else None),
+                        artifacts=True, artifacts_dest=str(art), fallback=False,
+                        claim_timeout_s=self.cfg["claim_timeout_s"], should_abort=stale_runner, api=self.api)
+                except RuntimeError as e:
+                    raise Fallback(str(e)[:200])
+                finally:
+                    for k, v in saved.items():
+                        if v is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = v
+
+            res = submit(False)
+            if res.exit_code == 75 and "GL_NEED_SETUP" in (res.stdout_tail or ""):
+                art.unlink(missing_ok=True)
+                res = submit(True)
+            if res.infra_error:
+                raise Fallback(f"runner: {res.infra_error}"[:200])
+            if not res.artifacts_path or not Path(res.artifacts_path).is_file():
+                err = (res.artifacts or {}).get("error") if isinstance(res.artifacts, dict) else None
+                raise Fallback(f"no artifacts (exit {res.exit_code}{', ' + err if err else ''})")
+            x = work / "x"
+            x.mkdir()
+            with tarfile.open(res.artifacts_path) as tf:
+                tf.extractall(x, filter="data")          # job output is untrusted
+            text = (x / "update.log").read_text("utf-8", "replace") if (x / "update.log").is_file() else ""
+            rc = res.exit_code
+            state, detail = classify(text, rc if rc is not None else 1)
+            if state == "failed":
+                raise Fallback(f"runner job failed {detail}"[:200])
+            installed = install(self.cfg, proj, x / "out", state, mb)
+            return state, detail, installed, res
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def close(self):
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+
+class Skip(Exception):
+    pass
+
+
+class Fallback(Exception):
+    pass
+
+
+def check_graph(proj, new_graph, old_graph):
+    """Raise Fallback when the runner's graph.json is not safe to install."""
+    try:
+        data = json.loads(new_graph.read_text("utf-8"))
+    except (OSError, ValueError) as e:
+        raise Fallback(f"bad graph.json from runner: {e}"[:200])
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise Fallback("runner graph.json has no nodes")
+    own = 0
+    for n in nodes:
+        sf = str(n.get("source_file") or "")
+        if sf.startswith("/") or RUNNER_PATH_RE.search(sf):
+            raise Fallback(f"runner graph.json has a non-relative source_file: {sf[:80]}")
+        if sf.startswith(proj["name"] + "/"):
+            own += 1
+    if not own:
+        raise Fallback("runner graph.json has no node under " + proj["name"] + "/")
+    if old_graph.is_file():
+        try:
+            old = json.loads(old_graph.read_text("utf-8"))
+            sem_old = sum(1 for n in old.get("nodes", []) if n.get("file_type") in SEMANTIC_TYPES)
+            sem_new = sum(1 for n in nodes if n.get("file_type") in SEMANTIC_TYPES)
+            if sem_old >= 20 and sem_new < sem_old * 0.5:
+                raise Fallback(f"runner graph lost semantic nodes ({sem_old} -> {sem_new})")
+        except (OSError, ValueError):
+            pass
+
+
+def check_manifest(path):
+    try:
+        m = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as e:
+        raise Fallback(f"bad manifest.json from runner: {e}"[:200])
+    if not isinstance(m, dict):
+        raise Fallback("runner manifest.json is not an object")
+    for k in m:
+        if str(k).startswith("/") or RUNNER_PATH_RE.search(str(k)):
+            raise Fallback(f"runner manifest.json has a non-relative key: {str(k)[:80]}")
+
+
+def backup_protected(cfg, out):
+    """graphify's own dated backup of a semantic/curated graph, as a Mac-side rebuild would have taken."""
+    code = ("import sys; from pathlib import Path; from graphify.export import backup_if_protected; "
+            "b = backup_if_protected(Path(sys.argv[1])); print(b or '')")
+    subprocess.run([cfg["graphify_python"], "-I", "-c", code, str(out)], capture_output=True, text=True,
+                   timeout=600, env=graphify_env())
+
+
+def install(cfg, proj, got, state, mb):
+    """Check the runner's files in `got` and swap them into <project>/graphify-out. -> list of installed names."""
+    out = proj["path"] / "graphify-out"
+    if not got.is_dir():
+        raise Fallback("runner returned no graphify-out files")
+    for f in got.iterdir():
+        if f.name not in BRING_BACK or f.is_symlink() or not f.is_file():
+            raise Fallback(f"unexpected file from runner: {f.name}"[:120])
+    if (got / "manifest.json").is_file():
+        check_manifest(got / "manifest.json")
+    for f in ("GRAPH_REPORT.md", ".graphify_labels.json", ".graphify_labels.pending.json"):
+        if (got / f).is_file() and RUNNER_PATH_RE.search((got / f).read_text("utf-8", "replace")):
+            raise Fallback(f"runner {f} mentions a runner path")
+    changed = []
+    for f in BRING_BACK:
+        g = got / f
+        if not g.is_file():
+            continue
+        cur = out / f
+        if cur.is_file() and cur.read_bytes() == g.read_bytes():
+            continue
+        changed.append(f)
+    if not changed:
+        return []
+    if state != "rebuilt":
+        # graphify said nothing changed: only bookkeeping files may differ
+        changed = [f for f in changed if f in ("manifest.json", ".graphify_labels.pending.json")]
+        if not changed:
+            return []
+    if "graph.json" in changed:
+        check_graph(proj, got / "graph.json", out / "graph.json")
+    out.mkdir(exist_ok=True)
+    if "graph.json" in changed:
+        backup_protected(cfg, out)
+    # graph.json last, so a reader never sees a new graph next to an old manifest/report
+    order = [f for f in changed if f != "graph.json"] + (["graph.json"] if "graph.json" in changed else [])
+    for f in order:
+        tmp = out / (f + ".lane-tmp")
+        shutil.copyfile(got / f, tmp)
+        os.replace(tmp, out / f)
+    if "graph.json" in changed:
+        try:
+            (out / ".graphify_build_state.json").unlink()   # describes the old graph.json; graphify re-derives it
+        except FileNotFoundError:
+            pass
+    return order
+
+
+# ---------------- main ----------------
+def main():
+    global QUIET
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--log")
+    ap.add_argument("--only", default="")
+    ap.add_argument("--mac-only", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    a = ap.parse_args()
+    QUIET = a.quiet
+    if a.log:
+        lp = xp(a.log)
+        try:
+            if lp.is_file() and lp.stat().st_size > (1 << 20):
+                lines = lp.read_text("utf-8", "replace").splitlines()[-3000:]
+                lp.write_text("\n".join(lines) + "\n")
+        except OSError:
+            pass
+        fh = open(lp, "a", buffering=1)
+        os.dup2(fh.fileno(), 1)
+        os.dup2(fh.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1)
+        sys.stderr = sys.stdout
+    cfg = load_cfg()
+    plist = projects(cfg)
+    if a.only:
+        want = set(a.only.split(","))
+        plist = [p for p in plist if p["name"] in want]
+    if a.list:
+        for p in plist:
+            print(p["path"])
+        return 0
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lockf = open(LOCK, "a")
+    try:
+        fcntl.lockf(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log(f"{now_s()} graphify-lane: another run holds {LOCK}, skipping")
+        return 0
+    if not Path(cfg["graphify_bin"]).exists() or not Path(cfg["graphify_python"]).exists():
+        log(f"{now_s()} graphify-lane: graphify not found ({cfg['graphify_bin']})")
+        return 1
+    t0 = time.time()
+    runner = None if a.mac_only else Runner(cfg)
+    rup, rage = (runner.up() if runner else (False, None))
+    log(f"{now_s()} graphify-lane: {len(plist)} projects, runner {cfg['runner']} "
+        f"{'up' if rup else 'DOWN' if runner else 'off'}{f' (seen {rage}s ago)' if rage is not None else ''}")
+    n = dict(runner=0, mac=0, unchanged=0, fresh=0, nocode=0, failed=0)
+    try:
+        for proj in plist:
+            name = proj["name"]
+            snap = time.time_ns()
+            try:
+                sc = scan(cfg, proj)
+            except Exception as e:  # noqa: BLE001
+                log(f"  {name:<34} FAILED scan: {e}"[:300])
+                n["failed"] += 1
+                continue
+            st, why = staleness(proj, sc, a.force)
+            if st == "nocode":
+                n["nocode"] += 1
+                log(f"  {name:<34} (no code)", always=False)
+                continue
+            if st == "fresh":
+                n["fresh"] += 1
+                log(f"  {name:<34} fresh", always=False)
+                continue
+            if a.dry_run:
+                log(f"  {name:<34} stale: {why} -> {'runner' if rup else 'mac'}")
+                continue
+            ensure_git_exclude(proj)
+            via, fb_why = "mac", None
+            t1 = time.time()
+            if runner and rup:
+                try:
+                    state, detail, installed, res = runner.build(proj, sc)
+                    via = "runner"
+                except Fallback as e:
+                    fb_why = str(e)
+                except Exception as e:  # noqa: BLE001
+                    fb_why = f"lane error {type(e).__name__}: {e}"[:200]
+                if fb_why and ("unavailable" in fb_why or "stale" in fb_why or "no runner" in fb_why):
+                    rup, rage = runner.up()      # don't keep trying a runner that went away
+            if via == "mac":
+                state, detail = build_mac(cfg, proj)
+            dt = round(time.time() - t1)
+            tag = f"[{via}{', fallback: ' + fb_why if fb_why else ''}] {dt}s"
+            if state == "failed":
+                n["failed"] += 1
+                log(f"  {name:<34} FAILED {detail} {tag}")
+                continue
+            write_stamp(proj, sc, snap, via)
+            if state == "rebuilt":
+                n[via] += 1
+                log(f"  {name:<34} {detail} {tag}")
+            elif state == "nocode":
+                n["nocode"] += 1
+                log(f"  {name:<34} (no code) {tag}", always=False)
+            else:
+                n["unchanged"] += 1
+                log(f"  {name:<34} unchanged{' ' + detail if detail else ''} {tag}", always=bool(fb_why))
+    finally:
+        if runner:
+            runner.close()
+    log(f"{now_s()} graphify-lane done in {round(time.time() - t0)}s: {n['runner']} rebuilt on runner, "
+        f"{n['mac']} rebuilt on mac, {n['unchanged']} unchanged, {n['fresh']} fresh, {n['nocode']} no code, "
+        f"{n['failed']} failed")
+    return 0 if n["failed"] == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

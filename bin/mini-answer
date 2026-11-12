@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""mini-answer: answer a mini-swe job that parked itself with a question (queue status paused, pause_reason needs_info) and resume it.
+
+  mini-answer <job> "text"           append `### Q<n>: <question>` + your answer to the job's answers sidecar, then `ollama-queue.py resume <job>`
+  mini-answer <job> --show           print the question, what the model tried, and the two branches it offered
+  mini-answer <job> --decline "why"  answer "not available: proceed without it" (the job resumes and must decide on its own)
+  mini-answer <job> --cancel         drop the parked job (ollama-queue.py cancel)
+
+The rerun is a full fresh run: the runner folds the sidecar into TASK.md under "## Answers to your earlier questions". The frozen test is never
+touched (its sha is recorded in the sidecar and re-checked). Only this tool writes the sidecar; no model output is ever copied into it.
+Job id may be a unique prefix. Env (tests): MINI_ANSWER_STATE (queue state json), MINI_ANSWER_QUEUE (queue CLI to run instead of ollama-queue.py).
+Exit: 0 ok, 1 usage/refused, 2 resume failed (the answer is rolled back).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load_jobs():
+    p = Path(os.environ.get("MINI_ANSWER_STATE") or Path.home() / "bin" / "ollama-queue-state.json")
+    return json.loads(p.read_text()).get("jobs", [])
+
+
+def find_job(jobs, jid):
+    exact = [j for j in jobs if j.get("id") == jid]
+    hits = exact or [j for j in jobs if str(j.get("id", "")).startswith(jid)]
+    return hits[0] if len(hits) == 1 else None if not hits else "ambiguous"
+
+
+def clean(text):
+    """Keep the answer from forging structure the runner parses: a `### Q<n>` entry header or an HTML comment (the recorded test sha)."""
+    text = text.replace("<!--", "< !--")
+    return re.sub(r"^(\s*)###\s*Q(\d+)", r"\1\\### Q\2", text.strip(), flags=re.M)
+
+
+def queue_cmd(*args):
+    q = os.environ.get("MINI_ANSWER_QUEUE")
+    argv = [q, *args] if q else [sys.executable, str(HERE / "ollama-queue.py"), *args]
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("job")
+    ap.add_argument("text", nargs="?")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--show", action="store_true")
+    g.add_argument("--cancel", action="store_true")
+    g.add_argument("--decline", metavar="WHY")
+    a = ap.parse_args(argv)
+    try:
+        job = find_job(load_jobs(), a.job)
+    except (OSError, ValueError) as e:
+        print(f"mini-answer: cannot read the queue state: {e}", file=sys.stderr)
+        return 1
+    if job is None or job == "ambiguous":
+        print(f"mini-answer: {'no job' if job is None else 'more than one job'} matches {a.job!r}", file=sys.stderr)
+        return 1
+    if job.get("status") != "paused" or job.get("pause_reason") != "needs_info":
+        print(f"mini-answer: {job['id']} is not waiting on an answer (status={job.get('status')!r}, pause_reason={job.get('pause_reason')!r})", file=sys.stderr)
+        return 1
+    meta = job.get("pause_meta") or {}
+    if a.show:
+        br = meta.get("branches") or {}
+        print(f"{job['id']} ({job.get('label')}) asks (ask {meta.get('ask_n', '?')}):\n\n{meta.get('question', '?')}\n\nTried:\n{meta.get('tried', '?')}\n\n"
+              f"If answer is A: {br.get('A', '?')}\nIf answer is B: {br.get('B', '?')}\n\nAnswer with: mini-answer {job['id']} \"text\"")
+        return 0
+    if a.cancel:
+        r = queue_cmd("cancel", job["id"])
+        print((r.stdout + r.stderr).strip())
+        return 0 if r.returncode == 0 else 2
+    text = f"Not available: {a.decline.strip()}. Proceed without it and decide on your own." if a.decline else a.text
+    if not text or not text.strip():
+        print("mini-answer: give the answer text (or --show / --decline WHY / --cancel)", file=sys.stderr)
+        return 1
+    ap_ = meta.get("answers") or (meta.get("task") and meta["task"] + ".answers.md")
+    if not ap_ or not str(ap_).endswith(".answers.md"):
+        print("mini-answer: the pause carries no answers-sidecar path; cannot answer this job", file=sys.stderr)
+        return 1
+    ans = Path(ap_)
+    prior = ans.read_text() if ans.is_file() else None
+    n = len(re.findall(r"^### Q\d+", prior or "", re.M)) + 1
+    entry = f"### Q{n}: {' '.join(str(meta.get('question', '?')).split())}\n{clean(text)}\n" + (f"<!-- test-sha: {meta['test_sha']} -->\n" if meta.get("test_sha") else "")
+    ans.write_text((prior.rstrip("\n") + "\n\n" if prior and prior.strip() else "") + entry)
+    r = queue_cmd("resume", job["id"])
+    if r.returncode != 0:
+        if prior is None:
+            ans.unlink(missing_ok=True)
+        else:
+            ans.write_text(prior)
+        print(f"mini-answer: resume failed, answer rolled back: {(r.stdout + r.stderr).strip()[:400]}", file=sys.stderr)
+        return 2
+    print(f"mini-answer: answered Q{n} for {job['id']} and resumed it (sidecar {ans})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,94 @@
+# Overlay for the read-only diagnose stage, on top of mini-local.yaml: `mini -c mini.yaml -c mini-local.yaml -c mini-diagnose.yaml`.
+# Only the instance template changes. mini-local.yaml's template is the fix workflow ("Please solve this issue", "Edit the source
+# code to resolve the issue"), which made the 35B apply its fix during diagnosis (bench-notset ca52c9841b08: D2 and D3 both
+# planned "fix the code" in their first reasoning and edited ingest/bloom_accounting_summary.py).
+agent:
+  instance_template: |
+    Please DIAGNOSE this issue. This is a READ-ONLY investigation: find the cause and write DIAGNOSIS.md; a later stage writes the fix from your report. {{task}}
+
+    ## Project rules (these override everything else)
+
+    - The only file you may create or change is DIAGNOSIS.md in the working directory (or NEEDS.md, only when the task text allows a question).
+    - Never edit, create, move or delete any other file: no `sed -i`, no python or shell that writes a source or test file, no patches. Do NOT apply or try the fix here: an edited source file is detected and put back, and a report that quotes your edited code is rejected.
+    - To check an idea by running code, copy the repository first (cp -r . /tmp/tryfix && cd /tmp/tryfix) and edit or run the copy. DIAGNOSIS.md quotes the ORIGINAL files in the working directory.
+    - If a file, module or function that the task says already exists is MISSING, say so in DIAGNOSIS.md. Do NOT create or stub it.
+    - Never run git add, git commit, git stash, git checkout or git reset.
+
+    You can execute bash commands to find, read and run the code. The one file you write is DIAGNOSIS.md.
+
+    ## Recommended Workflow
+
+    This workflow should be done step-by-step.
+
+    1. Find the relevant files and functions (`git ls-files | grep NAME`, `grep -n`) and read them by line range
+    2. Follow the failing path from the entry point the Problem names to the line that decides wrongly
+    3. Optionally confirm the current behaviour by running the ORIGINAL code without changing it (or run a changed copy in /tmp/tryfix)
+    4. Write DIAGNOSIS.md with one cat command, and append verbatim quotes with `sed -n 'N,Mp' FILE >> DIAGNOSIS.md`
+    5. Read DIAGNOSIS.md back, then submit by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+    - Submit your report and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+      Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    Example of a CORRECT response:
+    <example_response>
+    I need to find where the function the Problem names is defined. Let me search the tracked files for it.
+
+    [Makes bash tool call with {"command": "git ls-files | head -50"} as arguments]
+    </example_response>
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+
+    ## Useful command examples
+
+    ### Write the report:
+
+    ```bash
+    cat <<'EOF' > DIAGNOSIS.md
+    ## Code path
+    ...
+    EOF
+    ```
+
+    ### Append lines 57-66 of a file to the report, verbatim, with its fence lines:
+
+    ```bash
+    printf '```python path/to/file.py:57-66\n' >> DIAGNOSIS.md
+    sed -n '57,66p' path/to/file.py >> DIAGNOSIS.md
+    printf '```\n\n' >> DIAGNOSIS.md
+    ```
+
+    ### View file content:
+
+    ```bash
+    # View specific lines with numbers
+    nl -ba filename.py | sed -n '10,20p'
+    ```
+
+    ### Any other command you want to run
+
+    ```bash
+    anything
+    ```

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""offload-test-gate: run every test of the committed ~/bin tree (plus the dashboard tests) on claude-sandbox and
+compare the pass/fail list with the last green baseline. Called by offload-repo-sync before it pushes.
+
+Steps: (1) the sandbox holds no `hidden` benchmark data (else exit 3, nothing run); (2) `git archive <commit>` of ~/bin and
+HEAD of the dashboard repo are unpacked into ~/work/test-gate on the sandbox; (3) every test-*.py and
+`ollama-queue.py --self-test` runs there with ~/venv314/bin/python (python 3.14 + PyYAML), 8 at a time, 300 s each, in a temp
+HOME whose `bin` links to the shipped tree; (4) the result list is compared with ~/.ollama-dispatch/test-gate-baseline.json.
+
+Exit: 0 pass (no newly failing test) | 1 a test newly fails | 2 no baseline (run --take-baseline) or bad usage |
+3 hidden data on the sandbox | 4 the sandbox could not be reached or the run broke.
+A test that failed in the baseline and still fails is listed but does not block. A test that now passes is moved to
+passing in the baseline (only on an overall pass). A test missing from the baseline that fails blocks like a new fail.
+
+Usage: offload-test-gate [--take-baseline] [--commit SHA] [--json] [--keep]
+Env (tests): OFFLOAD_GATE_BIN, OFFLOAD_GATE_DASH, OFFLOAD_GATE_BASELINE, OFFLOAD_GATE_HOST (default claude-sandbox).
+The tests themselves run only on the sandbox; here we only run ssh and git archive.
+"""
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+BIN = Path(os.environ.get("OFFLOAD_GATE_BIN") or HOME / "bin")
+DASH = Path(os.environ.get("OFFLOAD_GATE_DASH") or HOME / "Desktop/GitHub Projects/ollama-queue-dashboard")
+BASELINE = Path(os.environ.get("OFFLOAD_GATE_BASELINE") or HOME / ".ollama-dispatch/test-gate-baseline.json")
+HOST = os.environ.get("OFFLOAD_GATE_HOST") or "claude-sandbox"
+WORK = "work/test-gate"          # relative to the sandbox HOME
+HIDDEN_CMD = "ls -d ~/work/rb/bench/*/hidden 2>/dev/null | wc -l"
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+PY = "venv314/bin/python"        # relative to the sandbox HOME
+TIMEOUT = 300
+JOBS = 8
+TAIL = 20
+
+# Runs on the sandbox (stdlib only, python3 >= 3.9). Prints one JSON object: {name: [rc, tail-lines]}.
+RUNNER = r'''
+import json, os, subprocess, sys, tempfile, shutil, signal
+from concurrent.futures import ThreadPoolExecutor
+home = os.path.expanduser("~"); base = os.path.join(home, %(work)r); py = os.path.join(home, %(py)r)
+B = os.path.join(base, "bin"); D = os.path.join(base, "dash", "tests"); out = os.path.join(base, "out")
+os.makedirs(out, exist_ok=True)
+# ~/bin links into the dashboard repo name the Mac's checkout, which the sandbox lacks: point them at the dash/ copy.
+for n in os.listdir(B):
+    p = os.path.join(B, n)
+    if os.path.islink(p) and not os.path.exists(p):
+        t = os.readlink(p); k = t.find("/ollama-queue-dashboard/")
+        q = os.path.join(base, "dash", t[k + len("/ollama-queue-dashboard/"):]) if k >= 0 else ""
+        if q and os.path.exists(q):
+            os.unlink(p); os.symlink(q, p)
+def reg(d):
+    if not os.path.isdir(d): return []
+    return sorted(n for n in os.listdir(d) if n.startswith("test") and n.endswith(".py")
+                  and os.path.isfile(os.path.join(d, n)) and not os.path.islink(os.path.join(d, n)))
+jobs = [("bin", n, [n]) for n in reg(B) if n.startswith("test-")]
+jobs += [("dash/tests", n, [n]) for n in reg(D)]
+if os.path.isfile(os.path.join(B, "ollama-queue.py")):
+    jobs.append(("bin", "ollama-queue.py --self-test", ["ollama-queue.py", "--self-test"]))
+def run(j):
+    sub, name, argv = j
+    cwd = B if sub == "bin" else D
+    h = tempfile.mkdtemp(prefix="gate-home-")
+    os.symlink(B, os.path.join(h, "bin"))
+    env = dict(os.environ, HOME=h, OLLAMA_PIPELINE_BIN=B)
+    log = os.path.join(out, (sub + "_" + name).replace("/", "_").replace(" ", "_") + ".out")
+    try:
+        with open(log, "wb") as f:
+            p = subprocess.Popen([py] + argv, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+            try: rc = p.wait(timeout=%(timeout)d)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL); p.wait(); rc = 124
+        tail = open(log, "rb").read().decode("utf-8", "replace").splitlines()[-%(tail)d:]
+        if rc == 124: tail.append("[gate] timed out after %(timeout)d s")
+    except Exception as e:
+        rc, tail = 125, ["[gate] runner error: %%r" %% (e,)]
+    finally:
+        shutil.rmtree(h, ignore_errors=True)
+    return (name if sub == "bin" else sub + "/" + name), rc, tail
+with ThreadPoolExecutor(%(jobs)d) as ex:
+    res = list(ex.map(run, jobs))
+print("GATE-RESULT " + json.dumps({n: [rc, t] for n, rc, t in res}))
+''' % {"work": WORK, "py": PY, "timeout": TIMEOUT, "tail": TAIL, "jobs": JOBS}
+
+
+class GateError(Exception):
+    pass
+
+
+def ssh(cmd, data=None, timeout=None):
+    r = subprocess.run(["ssh"] + SSH_OPTS + [HOST, cmd], input=data, capture_output=True, timeout=timeout)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def hidden_count(out):
+    """Parse the `wc -l` output of the hidden check. None when it is not a plain number."""
+    s = (out or "").strip()
+    return int(s) if s.isdigit() else None
+
+
+def parse_results(out):
+    """{name: (rc, [tail lines])} from the runner's stdout."""
+    for line in reversed((out or "").splitlines()):
+        if line.startswith("GATE-RESULT "):
+            return {n: (int(v[0]), list(v[1])) for n, v in json.loads(line[len("GATE-RESULT "):]).items()}
+    raise GateError("the runner printed no result line")
+
+
+def compare(baseline, results):
+    """baseline {name: 'pass'|'fail'}, results {name: rc}. Pure.
+    -> dict(new_fail, still_fail, fixed, new_pass, removed, passing, failing)"""
+    new_fail, still, fixed, new_pass = [], [], [], []
+    for n in sorted(results):
+        ok = results[n] == 0
+        was = baseline.get(n)
+        if ok:
+            if was == "fail":
+                fixed.append(n)
+            elif was is None:
+                new_pass.append(n)
+        elif was == "fail":
+            still.append(n)
+        else:
+            new_fail.append(n)     # passed before, or not in the baseline at all
+    return {"new_fail": new_fail, "still_fail": still, "fixed": fixed, "new_pass": new_pass,
+            "removed": sorted(set(baseline) - set(results)),
+            "passing": sum(1 for v in results.values() if v == 0),
+            "failing": sum(1 for v in results.values() if v != 0)}
+
+
+def updated_baseline(baseline, results):
+    """The baseline after an overall pass: every test as now observed (fixed tests become passing)."""
+    return {n: ("pass" if rc == 0 else "fail") for n, rc in sorted(results.items())}
+
+
+def load_baseline(path):
+    try:
+        d = json.loads(Path(path).read_text())
+        t = d["tests"]
+        if isinstance(t, dict):
+            return t
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def save_baseline(path, tests, commit):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"taken": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "commit": commit, "tests": tests},
+                              indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, p)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", str(repo)] + list(args), capture_output=True)
+    if r.returncode:
+        raise GateError("git %s failed in %s: %s" % (args[0], repo, r.stderr.decode(errors="replace")[-200:]))
+    return r
+
+
+def ship(repo, rev, sub):
+    """git archive <rev> of repo -> <sandbox>/<WORK>/<sub>."""
+    tar = git(repo, "archive", "--format=tar", rev).stdout
+    rc, _, err = ssh("mkdir -p %s/%s && tar -x -C %s/%s" % (WORK, sub, WORK, sub), data=tar, timeout=600)
+    if rc:
+        raise GateError("shipping %s failed (ssh %d): %s" % (sub, rc, err.strip()[-200:]))
+
+
+def run_gate(commit, keep):
+    """-> (state, results); state 'ok' | 'hidden'. Raises GateError."""
+    rc, out, err = ssh(HIDDEN_CMD, timeout=60)
+    n = hidden_count(out) if rc == 0 else None
+    if n is None:
+        raise GateError("hidden check failed (ssh %d): %s" % (rc, (err or out).strip()[-200:]))
+    if n != 0:
+        return "hidden", None
+    sha = git(BIN, "rev-parse", commit).stdout.decode().strip()
+    try:
+        ssh("rm -rf %s" % WORK, timeout=120)
+        ship(BIN, sha, "bin")
+        ship(DASH, "HEAD", "dash")
+        rc, out, err = ssh("python3 - ", data=RUNNER.encode(), timeout=3600)
+        if rc:
+            raise GateError("the test run failed (ssh %d): %s" % (rc, (err or out).strip()[-300:]))
+        return "ok", parse_results(out)
+    finally:
+        if not keep:
+            ssh("rm -rf %s" % WORK, timeout=120)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="offload-test-gate", description="test gate before the GitHub sync")
+    ap.add_argument("--take-baseline", action="store_true", help="run, then write the baseline")
+    ap.add_argument("--commit", default="HEAD", help="~/bin commit to test (default HEAD)")
+    ap.add_argument("--json", action="store_true", help="machine-readable summary on stdout")
+    ap.add_argument("--keep", action="store_true", help="keep the sandbox dir")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code else 0
+    # One gate run at a time on this Mac: runs share the sandbox dir and the baseline file. Held until exit.
+    BASELINE.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(str(BASELINE) + ".lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("test gate: another run is in progress; waiting for it", file=sys.stderr)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    base = None if a.take_baseline else load_baseline(BASELINE)
+    if not a.take_baseline and base is None:
+        print("no baseline at %s; run offload-test-gate --take-baseline" % BASELINE, file=sys.stderr)
+        return 2
+    t0 = time.time()
+    try:
+        state, res = run_gate(a.commit, a.keep)
+        sha = git(BIN, "rev-parse", a.commit).stdout.decode().strip()[:12]
+    except GateError as e:
+        print("test gate error: %s" % e, file=sys.stderr)
+        return 4
+    except subprocess.TimeoutExpired as e:
+        print("test gate error: timed out: %s" % (e.cmd[-1][:40] if e.cmd else ""), file=sys.stderr)
+        return 4
+    secs = round(time.time() - t0)
+    if state == "hidden":
+        print("hidden data on sandbox")
+        if a.json:
+            print(json.dumps({"state": "hidden", "exit": 3}))
+        return 3
+    rcs = {n: v[0] for n, v in res.items()}
+    tails = {n: v[1] for n, v in res.items()}
+    npass = sum(1 for v in rcs.values() if v == 0)
+    if a.take_baseline:
+        save_baseline(BASELINE, updated_baseline({}, rcs), sha)
+        summary = {"state": "baseline", "exit": 0, "commit": sha, "total": len(rcs), "passing": npass,
+                   "failing": len(rcs) - npass, "seconds": secs}
+        print("baseline written (%s): %d tests, %d passing, %d failing, %ds" % (
+            sha, len(rcs), npass, len(rcs) - npass, secs))
+        if a.json:
+            print(json.dumps(summary))
+        return 0
+    c = compare(base, rcs)
+    code = 1 if c["new_fail"] else 0
+    if code == 0 and (c["fixed"] or c["new_pass"] or c["removed"]):
+        save_baseline(BASELINE, updated_baseline(base, rcs), sha)
+    summary = {"state": "pass" if code == 0 else "fail", "exit": code, "commit": sha, "total": len(rcs),
+               "passing": c["passing"], "failing": c["failing"], "new_fail": c["new_fail"],
+               "still_fail": c["still_fail"], "fixed": c["fixed"], "new_pass": c["new_pass"],
+               "removed": c["removed"], "seconds": secs}
+    print("test gate %s (%s): %d tests, %d passing, %d failing (%d new, %d known), %d fixed, %ds" % (
+        "FAILED" if code else "ok", sha, len(rcs), c["passing"], c["failing"], len(c["new_fail"]),
+        len(c["still_fail"]), len(c["fixed"]), secs))
+    for n in c["new_fail"]:
+        print("\nNEW FAILURE: %s (exit %d)" % (n, rcs[n]))
+        for line in tails[n][-TAIL:]:
+            print("  | " + line)
+    if code and c["still_fail"]:
+        print("\nalready failing (not blocking): " + ", ".join(c["still_fail"]))
+    if a.json:
+        print(json.dumps(summary))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

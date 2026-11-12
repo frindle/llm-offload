@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NOT INSTALLED. queue-deadman.py (backlog H2), read-only watchdog. To install (main decides):
+       cp ~/bin/launchd/com.example.queue-deadman.plist ~/Library/LaunchAgents/ &&
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.queue-deadman.plist
+     Kill switch: touch ~/.ollama-dispatch/deadman.disabled -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.queue-deadman</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/user/bin/queue-deadman.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/user/bin/ollama-queue-logs/queue-deadman.log</string>
+  <key>StandardErrorPath</key><string>/Users/user/bin/ollama-queue-logs/queue-deadman.log</string>
+</dict>
+</plist>

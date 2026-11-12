@@ -1,0 +1,27 @@
+# Review: src/report/collect.ts
+
+## VERDICT: FAIL
+_a defect survived adversarial verification._
+
+| # | severity | where | what |
+|---|---|---|---|
+| 1 | MEDIUM | `src/report/collect.ts:6 (removed)` | The guard `if (r.active) {` was deleted, making `return rows.filter((r) => r.active).map((r) => r.id |
+
+## Defects
+
+### [MEDIUM] The guard `if (r.active) {` was deleted, making `return rows.filter((r) => r.active).map((r) => r.id);` unconditional. The fall-through path it protected is now unreachable.
+`src/report/collect.ts:6 (removed)`
+
+```
+if (r.active) {
+```
+**How it fails:** Previously, when `if (r.active) {` was false, control fell through to the code after this block; now it never does. Whatever that fall-through reached no longer runs for any input, and any local used only by the deleted condition is now dead. CHECK THE FALL-THROUGH TARGET to judge severity: if it merely reached another equivalent return this is dead code, but if it reached a refresh, retry, fetch, or a different return shape, that behaviour is lost. The harness can prove the guard is gone; it cannot prove from this hunk alone what the lost path did.
+**Verified trigger:** any input for which `if (r.active) {` was previously false
+
+## How this was produced
+
+- Model `qwen3.6-35b-a3b-vl-mtp-mxfp8`, num_ctx 131,072, think=off — 2 calls, 1s of model time
+- Wall clock 1s
+- Filtered before you saw them: 0 finding(s) quoting code that is not in the diff, 0 with no concrete failure scenario
+
+*Every quote above was checked as a literal substring of the real input before the finding was allowed to appear, and every finding had to supply a concrete failure scenario and survive an adversarial re-check.*

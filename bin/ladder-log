@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""ladder-log add|report -- ledger and per-model Claude cost for the fix ladder."""
+import argparse
+import glob
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+RUNGS = ["haiku", "sonnet", "main", "review"]
+# USD per million tokens: input, 5m cache write, 1h cache write, cache read, output
+PRICE = {
+    "claude-opus-5-5": (4.00, 5.00, 8.00, 0.20, 20.00),
+    "claude-sonnet-5-5": (2.00, 2.50, 4.00, 0.10, 10.00),
+    "claude-haiku-5-5": (0.10, 0.125, 0.20, 0.01, 0.50),
+}
+LONG = 100_000  # Haiku prompts over this are priced x5
+
+
+def ledger_path():
+    return os.environ.get("LADDER_LEDGER") or os.path.expanduser("~/.ollama-dispatch/ladder-ledger.jsonl")
+
+
+def projects_root():
+    return os.environ.get("LADDER_PROJECTS") or os.path.expanduser("~/.claude/projects")
+
+
+def read_ledger(since=None):
+    p = ledger_path()
+    rows = []
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if since and r.get("ts", "")[:10] < since:
+                    continue
+                rows.append(r)
+    return rows
+
+
+def cmd_add(a):
+    row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "task": a.task, "repo": a.repo,
+           "rung": a.rung, "result": a.result}
+    for k in ("check", "agent_id", "note"):
+        if getattr(a, k):
+            row[k] = getattr(a, k)
+    os.makedirs(os.path.dirname(ledger_path()), exist_ok=True)
+    with open(ledger_path(), "a") as f:
+        f.write(json.dumps(row) + "\n")
+    print("logged", a.task, a.rung, a.result)
+
+
+def find_transcript(agent_id):
+    hits = sorted(glob.glob(os.path.join(projects_root(), "*", "*", "subagents", f"agent-{agent_id}.jsonl")))
+    return hits[0] if hits else None
+
+
+def call_cost(model, u):
+    """USD for one call, or None for an unknown model."""
+    pr = PRICE.get(model)
+    if pr is None:
+        return None
+    inp = u.get("input_tokens") or 0
+    out = u.get("output_tokens") or 0
+    cr = u.get("cache_read_input_tokens") or 0
+    cw = u.get("cache_creation_input_tokens") or 0
+    cc = u.get("cache_creation") or {}
+    w5, w1 = cc.get("ephemeral_5m_input_tokens") or 0, cc.get("ephemeral_1h_input_tokens") or 0
+    if w5 + w1 != cw:
+        w5, w1 = cw, 0
+    mult = 5 if model == "claude-haiku-5-5" and inp + cr + cw > LONG else 1
+    return mult * (inp * pr[0] + w5 * pr[1] + w1 * pr[2] + cr * pr[3] + out * pr[4]) / 1e6
+
+
+def transcript_cost(path):
+    """({model: usd}, {model: tokens}, [warnings]); each message.id counted once (last line wins)."""
+    msgs = {}
+    for line in open(path):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        m = d.get("message") if isinstance(d, dict) else None
+        if not isinstance(m, dict) or d.get("type") not in (None, "assistant") or not m.get("usage"):
+            continue
+        msgs[m.get("id") or d.get("uuid") or id(d)] = (m.get("model"), m["usage"])
+    usd, toks, warn = {}, {}, []
+    for model, u in msgs.values():
+        n = sum(u.get(k) or 0 for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                                        "cache_creation_input_tokens"))
+        c = call_cost(model, u)
+        if c is None:
+            if model not in ("<synthetic>", None) or n:
+                w = f"unknown model {model!r}: {n} tokens counted, priced 0"
+                if w not in warn:
+                    warn.append(w)
+            c = 0.0
+        usd[model] = usd.get(model, 0.0) + c
+        toks[model] = toks.get(model, 0) + n
+    return usd, toks, warn
+
+
+def pct(n, d):
+    return "n/a" if not d else f"{100 * n / d:.0f}% ({n}/{d})"
+
+
+def cmd_report(a):
+    rows = read_ledger(a.since)
+    if not rows:
+        print("ladder-log: no ledger rows" + (f" since {a.since}" if a.since else ""))
+        return
+    tasks = {}
+    for r in rows:
+        tasks.setdefault(r["task"], []).append(r)
+    total = {}
+    seen = set()
+    h_tasks = h_first_pass = s_tasks = 0
+    for t, rs in tasks.items():
+        rungs = [r["rung"] for r in rs]
+        print(f"task {t}: rungs {' > '.join(rungs)}")
+        hs = [r for r in rs if r["rung"] == "haiku"]
+        if hs:
+            h_tasks += 1
+            h_first_pass += hs[0]["result"] == "pass"
+        if any(r["rung"] == "sonnet" for r in rs):
+            s_tasks += 1
+        tcost = {}
+        for r in rs:
+            aid = r.get("agent_id")
+            if not aid or (t, aid) in seen:
+                continue
+            seen.add((t, aid))
+            path = find_transcript(aid)
+            if not path:
+                print(f"  {r['rung']} agent {aid}: transcript missing, cost unknown")
+                continue
+            usd, toks, warn = transcript_cost(path)
+            for w in warn:
+                print(f"  warning: agent {aid}: {w}")
+            for m, v in usd.items():
+                tcost[m] = tcost.get(m, 0.0) + v
+                total[m] = total.get(m, 0.0) + v
+            print(f"  {r['rung']} agent {aid}: ${sum(usd.values()):.4f} " +
+                  ", ".join(f"{m} ${v:.4f}" for m, v in sorted(usd.items(), key=lambda x: str(x[0]))))
+        print(f"  task cost: ${sum(tcost.values()):.4f}")
+    print(f"TOTAL tasks {len(tasks)}; Haiku first-pass rate {pct(h_first_pass, h_tasks)}; "
+          f"escalation to Sonnet {pct(s_tasks, h_tasks)}")
+    for m, v in sorted(total.items(), key=lambda x: str(x[0])):
+        print(f"  cost {m}: ${v:.4f}")
+    print(f"  cost total: ${sum(total.values()):.4f}")
+    print("Note: main-session review cost is not in subagent transcripts and is not included.")
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="ladder-log")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("add")
+    s.add_argument("--task", required=True)
+    s.add_argument("--repo", required=True)
+    s.add_argument("--rung", required=True, choices=RUNGS)
+    s.add_argument("--result", required=True, choices=["pass", "fail", "unsure"])
+    s.add_argument("--check")
+    s.add_argument("--agent-id", dest="agent_id")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("report")
+    s.add_argument("--since")
+    s.set_defaults(fn=cmd_report)
+    a = p.parse_args(argv)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

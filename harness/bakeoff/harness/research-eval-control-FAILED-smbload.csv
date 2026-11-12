@@ -1,0 +1,2 @@
+model,rep,task_id,class,verdict,detail,latency_s,swap_before_mb,avail_before_mb,ts
+"qwen3-coder-next:q4_K_M",0,extract_1,extract,error,"TimeoutError: timed out",900.3,5452,40415,2026-08-23T20:59:46.978582+00:00

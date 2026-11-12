@@ -1,0 +1,55 @@
+# Overlay for the diagnose stage's one form-repair attempt (runner diag_form_only), on top of mini-local.yaml:
+# `mini -c mini.yaml -c mini-local.yaml -c mini-diagnose-polish.yaml`. Only the instance template changes.
+# bench-dupes3 69c0a9690916: the repair attempt ran under mini-diagnose.yaml, whose workflow starts "Find the relevant files and
+# functions", with the diagnose contract and TASK.md in its prompt; it re-read the source for all 8 steps and never edited the
+# report. This template has nothing to investigate: the task text carries the current Root cause and a one-command recipe.
+agent:
+  instance_template: |
+    Please EDIT ONE SECTION of DIAGNOSIS.md. The investigation is finished and its report passed every content check; you only rewrite the text under `## Root cause`. {{task}}
+
+    ## Project rules (these override everything else)
+
+    - The only file you may change is DIAGNOSIS.md in the working directory, and only the text under `## Root cause`.
+    - Do NOT read, grep, list or run any source file: everything you need is in the task above.
+    - Never run git commands.
+
+    ## Recommended Workflow
+
+    This workflow should be done step-by-step.
+
+    1. Run the one python command from the task with your new sentence in it
+    2. Print the section back with `awk '/^## /{p=/^## Root cause/} p' DIAGNOSIS.md` and check it is ONE sentence
+    3. Submit by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call
+    - Submit your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+      Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+
+    Example of a CORRECT response:
+    <example_response>
+    The Root cause is too long; the Code path already shows the line numbers, so I drop them and keep the function and its faulty decision.
+
+    [Makes bash tool call with the python command from the task, the new sentence in place of the placeholder, as arguments]
+    </example_response>
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>

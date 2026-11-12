@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""Refresh the public llm-offload GitHub repo from the live trees: scrub, check, test, commit and push.
+
+The repo (default ~/Desktop/GitHub Projects.nosync/llm-offload, or $CLAUDE_OFFLOAD_REPO; GitHub frindle/llm-offload,
+PUBLIC) is a one-way copy: live -> repo. The sources are only read. The repo's MANIFEST.txt says what is copied:
+  bin/        ~/bin at HEAD (committed work only, so half-done edits never land), minus [bin-exclude] and symlinks
+  <dest>/     each [git-sources] line "dest|checkout|ref" (ref defaults to HEAD): that commit's regular files, minus .github/
+  hooks/      the [hooks] files from ~/.claude/hooks
+  launchd/    the [launchd] plists from ~/Library/LaunchAgents
+  config/     the [config] files from ~/.ollama-dispatch
+  docs/state/ the [state-docs] files from ~/.ollama-dispatch
+Those folders belong to the sync: a file that leaves the source leaves the repo too. Everything else in the repo
+(README, MANIFEST.txt, LICENSE, .github/, the allow files, frozen folders such as harness/) is edited in the repo
+directly and is checked, never rewritten.
+
+Order of work. Any failure stops the sync before anything is written, committed or pushed:
+  1. Stage every source in a temp folder.
+  2. Secret guard on the staged tree and the repo's own files: secret-looking file names and text (private keys,
+     GitHub / Slack / OpenAI / Anthropic / AWS / Google keys, JWTs, literal bearer tokens, key = "long literal"), and
+     the actual values of the local secrets (token files, ~/.darkbloom, MCP env and headers in ~/.claude.json,
+     secret-named environment variables). Known fakes go in the repo's .secret-allow as "path<TAB>kind<TAB>why".
+  3. Runtime check: staged files matching a [runtime] glob (code that machines run from a published image) must pass
+     the private-info scan BEFORE scrubbing. Scrubbing them would break the image, so they get fixed at the source.
+  4. Scrub the staged tree: the private rules rewrite names, home paths, hosts, domains and labels (file names too);
+     private IPv4 and MAC addresses become documentation addresses, keyed by a private salt so they can't be reversed.
+  5. Private-info scan of the scrubbed tree and the repo's own files: private IPv4 (RFC 1918, 100.64/10), MAC
+     addresses, /Users or /home paths with a real name, emails, and the private patterns. A hit that is a known fake
+     goes in the repo's .private-allow as "path-glob<TAB>regex matching the line<TAB>why".
+  6. Test gate: offload-test-gate runs ~/bin's tests on claude-sandbox. --no-gate skips it (logged to
+     ~/.ollama-dispatch/test-gate-skips.log). --dry-run and --no-push never run it.
+  7. Replace the managed folders, commit (the message lists ~/bin's commit subjects, scrubbed and scanned; if anything
+     is left, the list is dropped), push (fast-forward only).
+Findings print the file, line and kind, never the value.
+
+Private files, outside git, in $OFFLOAD_PRIVATE_DIR (default ~/.config/llm-offload):
+  scrub-rules.txt   one "regex<TAB>replacement" per line (Python re syntax), applied in order; required
+  public-words.txt  words that match a private pattern but are public anyway (the GitHub account name); optional
+  salt              key for the address mapping; created on first use (mode 0600)
+Private patterns: $OFFLOAD_PRIVATE_PATTERNS (default ~/.config/ollama-queue/private-patterns.txt), one regex per line,
+matched case-insensitively; required.
+
+Usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate]
+"""
+import fnmatch
+import hashlib
+import hmac
+import io
+import ipaddress
+import json
+import os
+import re
+import secrets as pysecrets
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+REPO = Path(os.environ.get("CLAUDE_OFFLOAD_REPO") or HOME / "Desktop/GitHub Projects.nosync/llm-offload")
+BIN = HOME / "bin"
+PRIVATE = Path(os.environ.get("OFFLOAD_PRIVATE_DIR") or HOME / ".config/llm-offload")
+PATTERNS_FILE = Path(os.environ.get("OFFLOAD_PRIVATE_PATTERNS") or HOME / ".config/ollama-queue/private-patterns.txt")
+SOURCES = {"hooks": HOME / ".claude/hooks", "launchd": HOME / "Library/LaunchAgents",
+           "config": HOME / ".ollama-dispatch", "state-docs": HOME / ".ollama-dispatch"}
+DEST = {"hooks": "hooks", "launchd": "launchd", "config": "config", "state-docs": "docs/state"}
+FIXED_MANAGED = ["bin", "hooks", "launchd", "config", "docs/state"]
+SECTIONS = ["bin-exclude", "git-sources", "runtime", "hooks", "launchd", "config", "state-docs"]
+STATE = ".sync-state.json"
+ALLOW_FILES = (".secret-allow", ".private-allow")
+GIT_ID = ["-c", "core.hooksPath=/dev/null", "-c", "user.name=frindle",
+          "-c", "user.email=69526085+frindle@users.noreply.github.com"]
+GATE = Path(os.environ.get("OFFLOAD_TEST_GATE") or Path(__file__).resolve().parent / "offload-test-gate")
+SKIP_LOG = Path(os.environ.get("OFFLOAD_GATE_SKIPS_LOG") or HOME / ".ollama-dispatch/test-gate-skips.log")
+MAX_FILE = 20 * 1024 * 1024
+
+SECRET_NAMES = ["*.pem", "*.key", "*.p12", "*.pfx", "*.keychain*", ".env", ".env.*", "id_rsa*", "id_ed25519*",
+                "id_ecdsa*", "auth_token", "local_token", "token", "*.token", ".bloom-key", "obsidian-token",
+                "agent.json", "enrollment.json", "local.json", "credentials*", ".netrc", ".npmrc", ".pypirc"]
+PATTERNS = [
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})")),
+    ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9]{32,}")),
+    ("aws-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("google-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("bearer-literal", re.compile(r"(?i)\b(?:bearer|token)\s+[A-Za-z0-9._~+/=-]{32,}")),
+    ("secret-assignment", re.compile(
+        r"(?i)(?:api[_-]?key|secret|passw(?:or)?d|token|passkey)[\"']?\s*[:=]\s*[\"'][A-Za-z0-9+/_.=-]{24,}[\"']")),
+]
+SECRET_KEY = re.compile(r"(?i)key|token|secret|passw|passkey|auth|cookie|credential")
+TOKEN_LIKE = re.compile(r"[A-Za-z0-9+/_.=:-]{16,}")
+
+# Private-info scan (and the address scrub, which uses the same address patterns so the two always agree).
+IPV4 = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?!\d)(/\d{1,2}(?!\d))?")
+MAC = re.compile(r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}([:-])){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])")
+HOME_PATH = re.compile(r"(?:/Users|/home)/(<[^>/\s]*>|\$\{?\w+\}?|[A-Za-z][A-Za-z0-9_.-]*)")
+EMAIL = re.compile(r"(?<![\\A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})"
+                   r"(?![A-Za-z0-9-])")
+PRIVATE_NETS = [ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+DOC_BLOCKS = ("192.0.2", "198.51.100", "203.0.113")
+DOC_MAC = "00:00:5e:ef:10"                      # RFC 7042 documentation range
+OK_USERS = {"user", "username", "you", "me", "name", "example", "someone", "runner", "app", "home", "nobody", "root",
+            "Shared", "$USER", "USER", "<user>", "claude", "test", "tester", "queue", "alice", "bob", "dev"}
+OK_EMAIL_DOMAINS = {"users.noreply.github.com", "noreply.github.com", "example.com", "example.org", "example.net",
+                    "anthropic.com"}
+OK_EMAIL_LOCAL = {"noreply", "git"}
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(*cmd, cwd=None, check=True, data=None):
+    r = subprocess.run([str(c) for c in cmd], cwd=cwd, input=data, capture_output=True)
+    if check and r.returncode:
+        die("%s failed (%d): %s" % (" ".join(map(str, cmd[:4])), r.returncode,
+                                    r.stderr.decode(errors="replace")[-400:]))
+    return r
+
+
+def manifest():
+    sec, out = None, {k: [] for k in SECTIONS}
+    for raw in (REPO / "MANIFEST.txt").read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = re.fullmatch(r"\[([a-z-]+)\]", line)
+        if m:
+            sec = m.group(1)
+            if sec not in out:
+                die("MANIFEST.txt: unknown section [%s]" % sec)
+            continue
+        if sec is None:
+            die("MANIFEST.txt: entry before any section: %s" % line)
+        if sec == "git-sources":
+            f = [x.strip() for x in line.split("|")]
+            if len(f) not in (2, 3) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", f[0]) or f[0] in FIXED_MANAGED:
+                die("MANIFEST.txt: [git-sources] takes 'dest|checkout[|ref]' with a new top-level dest: %s" % line)
+            out[sec].append((f[0], Path(os.path.expanduser(f[1])), f[2] if len(f) == 3 else "HEAD"))
+            continue
+        if sec in ("hooks", "launchd", "config", "state-docs") and ("/" in line or line.startswith(".")):
+            die("MANIFEST.txt: [%s] takes plain file names: %s" % (sec, line))
+        out[sec].append(line)
+    return out
+
+
+def stage_git(dst, checkout, ref, excludes=()):
+    """checkout@ref -> dst: regular files only (no symlinks, no submodules), minus the excludes."""
+    head = run("git", "-C", checkout, "rev-parse", "--verify", ref + "^{commit}").stdout.decode().strip()
+    tar = run("git", "-C", checkout, "archive", "--format=tar", head).stdout
+    skipped, n = [], 0
+    with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
+        for m in tf.getmembers():
+            if m.isdir() or m.name == "pax_global_header":
+                continue
+            if not m.isreg():
+                skipped.append(m.name)
+                continue
+            if any(fnmatch.fnmatchcase(m.name, pat) for pat in excludes):
+                continue
+            parts = Path(m.name).parts
+            if m.name.startswith("/") or ".." in parts or ".git" in parts:
+                die("refusing an odd path from git archive: %r" % m.name)
+            out = dst / m.name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(tf.extractfile(m).read())
+            out.chmod(0o755 if m.mode & 0o111 else 0o644)
+            n += 1
+    return head, n, skipped
+
+
+def stage_files(dst, src_dir, names):
+    """Copy the named files. A name with glob characters (com.*.x.plist keeps a private label prefix out of the
+    public MANIFEST) must match exactly one file."""
+    missing = []
+    for name in names:
+        if any(c in name for c in "*?["):
+            hits = sorted(p.name for p in src_dir.glob(name)) if src_dir.is_dir() else []
+            if len(hits) != 1:
+                missing.append("%s (%d matches)" % (name, len(hits)))
+                continue
+            name = hits[0]
+        src = src_dir / name
+        if src.is_symlink() or not src.is_file():
+            missing.append(str(src).replace(str(HOME), "~"))
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst / name)
+        (dst / name).chmod(0o755 if os.access(src, os.X_OK) else 0o644)
+    return missing
+
+
+def files(root):
+    return [p for p in sorted(root.rglob("*")) if p.is_file() and not p.is_symlink()]
+
+
+def text_of(p):
+    """File text, or None for binary or oversized files."""
+    if p.stat().st_size > MAX_FILE:
+        return None
+    data = p.read_bytes()
+    return None if b"\0" in data[:8192] else data.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- secret guard
+
+def known_secrets():
+    """{value: where it came from} for the local secrets. Values are compared, never printed."""
+    vals = {}
+
+    def add(v, label, strict=False):
+        if not isinstance(v, str):
+            return
+        v = v.strip()
+        if strict:
+            ok = len(v) >= 12
+        else:   # config values: only token-shaped ones (no paths, URLs, prose, plain numbers or words)
+            ok = (len(v) >= 16 and TOKEN_LIKE.fullmatch(v) is not None and "://" not in v
+                  and not v.startswith(("/", "~")) and re.search(r"\d", v) and re.search(r"[A-Za-z]", v))
+        if ok:
+            vals.setdefault(v, label)
+
+    for p in [".config/dispatch-cpu-runner/token", ".darkbloom/auth_token", ".darkbloom/local_token",
+              ".ollama-dispatch/.bloom-key", ".config/ollama-worker/obsidian-token"]:
+        try:
+            add((HOME / p).read_text(errors="replace"), "~/" + p, strict=True)
+        except OSError:
+            pass
+    for p in (HOME / ".config/ollama-queue").glob("*token*"):
+        try:
+            add(p.read_text(errors="replace"), "~/.config/ollama-queue/" + p.name, strict=True)
+        except OSError:
+            pass
+
+    def walk(obj, label, secret_ctx):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v, label, secret_ctx or k in ("env", "headers") or bool(SECRET_KEY.search(str(k))))
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, label, secret_ctx)
+        elif secret_ctx:
+            add(obj, label)
+
+    for p in [".darkbloom/local.json", ".claude.json", ".claude/settings.json"]:
+        try:
+            walk(json.loads((HOME / p).read_text(errors="replace")), "~/" + p, False)
+        except (OSError, ValueError):
+            pass
+    for k, v in os.environ.items():
+        if SECRET_KEY.search(k):
+            add(v, "env " + k)
+    return vals
+
+
+def secret_allowed():
+    out, p = set(), REPO / ".secret-allow"
+    if p.exists():
+        for line in p.read_text().splitlines():
+            f = line.split("\t")
+            if len(f) >= 3 and not line.startswith("#") and not f[1].startswith("the value of"):
+                out.add((f[0], f[1]))
+    return out
+
+
+def guard(root, secret_vals, allow):
+    """[(path, line, kind)] for everything secret-looking under root."""
+    found = []
+    for p in files(root):
+        rel = p.relative_to(root).as_posix()
+        if any(fnmatch.fnmatchcase(p.name, pat) for pat in SECRET_NAMES):
+            found.append((rel, 0, "secret-like file name"))
+            continue
+        if p.stat().st_size > MAX_FILE:
+            found.append((rel, 0, "file over %d MB" % (MAX_FILE >> 20)))
+            continue
+        data = p.read_bytes()
+        for v, label in secret_vals.items():
+            i = data.find(v.encode())
+            if i >= 0:
+                found.append((rel, data[:i].count(b"\n") + 1, "the value of " + label))
+        if b"\0" in data[:8192]:
+            continue
+        for ln, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            for kind, rx in PATTERNS:
+                if rx.search(line) and (rel, kind) not in allow:
+                    found.append((rel, ln, kind))
+    return found
+
+
+# ---------------------------------------------------------------- scrub and private-info scan
+
+def private_config():
+    rules_file = PRIVATE / "scrub-rules.txt"
+    if not rules_file.is_file():
+        die("no scrub rules at %s: refusing to publish unscrubbed files" % rules_file)
+    if not PATTERNS_FILE.is_file():
+        die("no private patterns at %s: refusing to publish unchecked files" % PATTERNS_FILE)
+    rules = []
+    for n, line in enumerate(rules_file.read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) != 2:
+            die("%s:%d: needs 'regex<TAB>replacement'" % (rules_file.name, n))
+        try:
+            rules.append((re.compile(f[0]), f[1]))
+        except re.error as e:
+            die("%s:%d: bad regex (%s)" % (rules_file.name, n, e))
+    patterns = [re.compile(ln.strip(), re.I) for ln in PATTERNS_FILE.read_text().splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+    pw = PRIVATE / "public-words.txt"
+    public = {w.strip().lower() for w in pw.read_text().splitlines()
+              if w.strip() and not w.startswith("#")} if pw.is_file() else set()
+    salt_file = PRIVATE / "salt"
+    if not salt_file.is_file():
+        salt_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(salt_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(pysecrets.token_hex(32) + "\n")
+    salt = salt_file.read_text().strip().encode()
+    return {"rules": rules, "patterns": patterns, "public": public, "salt": salt}
+
+
+def _private_ip(s):
+    try:
+        ip = ipaddress.IPv4Address(s)
+    except ValueError:
+        return False
+    return any(ip in n for n in PRIVATE_NETS)
+
+
+def _generic_range(m):
+    """'10.0.0.0/8'-style ranges (prefix 16 or shorter) name the RFC ranges themselves, not a host."""
+    return m.group(2) is not None and int(m.group(2)[1:]) <= 16
+
+
+def _doc_mac(s):
+    low = s.lower().replace("-", ":")
+    return low.startswith(DOC_MAC) or low in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+
+
+def scrub_text(text, cfg):
+    for rx, rep in cfg["rules"]:
+        text = rx.sub(rep, text)
+
+    def ip(m):
+        if not _private_ip(m.group(1)) or _generic_range(m):
+            return m.group(0)
+        h = int.from_bytes(hmac.new(cfg["salt"], b"ip:" + m.group(1).encode(), hashlib.sha256).digest()[:4], "big")
+        return "%s.%d%s" % (DOC_BLOCKS[h % 3], (h // 3) % 254 + 1, m.group(2) or "")
+
+    def mac(m):
+        if _doc_mac(m.group(0)):
+            return m.group(0)
+        h = hmac.new(cfg["salt"], b"mac:" + m.group(0).lower().replace("-", ":").encode(), hashlib.sha256).digest()
+        return (DOC_MAC + ":%02x" % h[0]).replace(":", m.group(1))
+    return MAC.sub(mac, IPV4.sub(ip, text))
+
+
+def scrub_tree(root, cfg):
+    """Rewrite file contents and names under root. Returns (files changed, files renamed)."""
+    changed = renamed = 0
+    for p in files(root):
+        t = text_of(p)
+        if t is not None:
+            new = scrub_text(t, cfg)
+            if new != t:
+                p.write_text(new)
+                changed += 1
+        rel = p.relative_to(root).as_posix()
+        new_rel = rel
+        for rx, rep in cfg["rules"]:
+            new_rel = rx.sub(rep, new_rel)
+        if new_rel != rel:
+            if new_rel.startswith("/") or ".." in Path(new_rel).parts or (root / new_rel).exists():
+                die("scrub: cannot rename %s (target exists or is outside the tree)" % rel)
+            (root / new_rel).parent.mkdir(parents=True, exist_ok=True)
+            p.rename(root / new_rel)
+            renamed += 1
+    return changed, renamed
+
+
+def scan_line(line, cfg):
+    kinds = []
+    for m in IPV4.finditer(line):
+        if _private_ip(m.group(1)) and not _generic_range(m):
+            kinds.append("private ip")
+    for m in MAC.finditer(line):
+        if not _doc_mac(m.group(0)):
+            kinds.append("mac address")
+    for m in HOME_PATH.finditer(line):
+        if m.group(1) not in OK_USERS and len(m.group(1)) > 1 and m.group(1)[0] not in "<$":   # <u>, $USER: placeholders
+            kinds.append("home path")
+    for m in EMAIL.finditer(line):
+        loc, dom = m.group(1), m.group(2).lower()
+        if not (dom in OK_EMAIL_DOMAINS or loc in OK_EMAIL_LOCAL
+                or dom.endswith((".invalid", ".example", ".test", ".localhost"))):
+            kinds.append("email")
+    for rx in cfg["patterns"]:
+        for m in rx.finditer(line):
+            if m.group(0).lower() not in cfg["public"]:
+                kinds.append("private pattern")
+    return kinds
+
+
+def private_allowed():
+    rules, p = [], REPO / ".private-allow"
+    if p.exists():
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            f = line.split("\t")
+            if len(f) != 3 or not f[2].strip():
+                die(".private-allow:%d: needs 'path-glob<TAB>regex<TAB>why'" % n)
+            rules.append((f[0], re.compile(f[1])))
+    return rules
+
+
+def scan_tree(root, cfg, allow, only=None):
+    """[(path, line, kind)] for the private info left under root (only: path globs to limit the scan)."""
+    found = []
+    for p in files(root):
+        rel = p.relative_to(root).as_posix()
+        if only is not None and not any(fnmatch.fnmatchcase(rel, g) for g in only):
+            continue
+        for kind in scan_line(rel, cfg):
+            found.append((rel, 0, kind + " (in the file name)"))
+        t = text_of(p)
+        if t is None:
+            continue
+        name_only = rel in ALLOW_FILES   # the allow files hold patterns for fakes; only the private words matter
+        for ln, line in enumerate(t.splitlines(), 1):
+            for kind in scan_line(line, cfg):
+                if name_only and kind != "private pattern":
+                    continue
+                if not any(fnmatch.fnmatchcase(rel, g) and rx.search(line) for g, rx in allow):
+                    found.append((rel, ln, kind))
+    return found
+
+
+def report(found, what, limit=200):
+    for rel, ln, kind in found[:limit]:
+        print("%s: %s:%s %s" % (what, rel, ln, kind), file=sys.stderr)
+    if len(found) > limit:
+        print("%s: ... %d more" % (what, len(found) - limit), file=sys.stderr)
+
+
+# ---------------------------------------------------------------- main
+
+def gate(head, skip):
+    """Run the test gate on the commit about to be synced; stop the sync unless it exits 0."""
+    if skip:
+        SKIP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with SKIP_LOG.open("a") as f:
+            f.write("%s\t%s\t--no-gate\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), head[:12]))
+        print("test gate skipped (--no-gate); logged to %s" % SKIP_LOG, file=sys.stderr)
+        return
+    sys.stdout.flush()
+    r = subprocess.run([str(GATE), "--commit", head])
+    if r.returncode:
+        die("test gate exit %d: not syncing, nothing written or pushed (--no-gate skips it, logged)" % r.returncode,
+            r.returncode)
+
+
+def main():
+    args = set(sys.argv[1:])
+    if args - {"--dry-run", "--no-push", "--no-gate"} or not (REPO / "MANIFEST.txt").is_file():
+        die("usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate]   (repo: %s, needs MANIFEST.txt)" % REPO)
+    man = manifest()
+    cfg = private_config()
+    managed = FIXED_MANAGED + [d for d, _, _ in man["git-sources"]]
+    heads = {}
+    with tempfile.TemporaryDirectory(prefix="co-sync-") as td:
+        stage = Path(td) / "tree"
+        head, n, skipped = stage_git(stage / "bin", BIN, "HEAD", man["bin-exclude"])
+        for dest, checkout, ref in man["git-sources"]:
+            heads[dest] = stage_git(stage / dest, checkout, ref, [".github/*"])[0]
+        missing = []
+        for sec in ["hooks", "launchd", "config", "state-docs"]:
+            missing += stage_files(stage / DEST[sec], SOURCES[sec], man[sec])
+        native = Path(td) / "native"      # the repo's own files (tracked or about to be) are checked too, never rewritten
+        listed = run("git", "ls-files", "-z", "-c", "-o", "--exclude-standard", cwd=REPO).stdout.decode().split("\0")
+        for rel in sorted(set(filter(None, listed))):
+            p = REPO / rel
+            if rel == STATE or any(rel == d or rel.startswith(d + "/") for d in managed):
+                continue
+            if p.is_symlink():
+                die("the repo has a symlink outside the synced folders: %s (remove it)" % rel)
+            if p.is_file():
+                (native / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(p, native / rel)
+        vals, sallow = known_secrets(), secret_allowed()
+        found = guard(stage, vals, sallow) + [("(repo) " + r, ln, k) for r, ln, k in
+                                              (guard(native, vals, sallow) if native.exists() else [])]
+        if found:
+            report(found, "SECRET GUARD")
+            die("secret guard: %d finding(s); nothing copied or committed" % len(found))
+        pallow = private_allowed()
+        if man["runtime"]:
+            found = scan_tree(stage, cfg, pallow, only=man["runtime"])
+            if found:
+                report(found, "RUNTIME")
+                die("runtime check: %d private-info finding(s) in files machines run; fix them at the source "
+                    "(scrubbing would break the image); nothing copied or committed" % len(found))
+        changed, renamed = scrub_tree(stage, cfg)
+        found = scan_tree(stage, cfg, pallow) + [("(repo) " + r, ln, k) for r, ln, k in
+                                                 (scan_tree(native, cfg, pallow) if native.exists() else [])]
+        if found:
+            report(found, "PRIVATE INFO")
+            die("private-info scan: %d finding(s) left after the scrub; add a scrub rule (outside git) or, for a "
+                "known fake, a .private-allow line; nothing copied or committed" % len(found))
+        if missing:
+            print("missing sources (left out): " + ", ".join(missing), file=sys.stderr)
+        print("bin: %d files from ~/bin %s (%d symlinks or other non-files skipped); %s; scrub: %d files rewritten, "
+              "%d renamed" % (n, head[:12], len(skipped),
+                              ", ".join("%s %s" % (d, h[:12]) for d, h in heads.items()) or "no other sources",
+                              changed, renamed))
+        if "--dry-run" in args:
+            print("dry run: secret guard, runtime check and private-info scan clean; nothing written")
+            return
+        if "--no-push" not in args:
+            gate(head, "--no-gate" in args)
+        for d in managed:
+            shutil.rmtree(REPO / d, ignore_errors=True)
+            if (stage / d).exists():
+                (REPO / d).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(stage / d, REPO / d)
+    st = REPO / STATE
+    prev = json.loads(st.read_text()).get("bin_head") if st.exists() else None
+    st.write_text(json.dumps({"bin_head": head, **{d + "_head": h for d, h in heads.items()}}, indent=1) + "\n")
+    run("git", "add", "-A", cwd=REPO)
+    # bin/.gitignore is ~/bin's whitelist; it would hide files ~/bin tracks anyway (qctl, bench expect
+    # files, ...). The managed folders hold nothing but the staged copy, so they are added with -f.
+    run("git", "add", "-A", "-f", "--", *[d for d in managed if (REPO / d).exists()], cwd=REPO)
+    if not run("git", "diff", "--cached", "--quiet", cwd=REPO, check=False).returncode:
+        print("no changes")     # still push below: an earlier --no-push commit goes out once the gate has passed
+    else:
+        log = run("git", "-C", BIN, "log", "--format=- %h %s", "-n", "80", "%s..%s" % (prev, head),
+                  check=False).stdout.decode() if prev else ""
+        log = scrub_text(log, cfg)
+        if any(scan_line(line, cfg) for line in log.splitlines()):
+            log = ""
+        msg = "sync: ~/bin %s\n\n%s" % (head[:12], ("~/bin commits since the last sync:\n" + log) if log else
+                                             "Live tree as of this ~/bin commit.\n")
+        run("git", *GIT_ID, "commit", "-q", "-F", "-", cwd=REPO, data=msg.encode())
+        print(run("git", "log", "-1", "--format=%h %s", cwd=REPO).stdout.decode().strip())
+    if "--no-push" in args:
+        return
+    if not run("git", "remote", cwd=REPO).stdout.strip():
+        print("no remote: not pushed")
+        return
+    r = run("git", "push", "-q", "origin", "HEAD", cwd=REPO, check=False)
+    print("pushed" if not r.returncode else "push FAILED: " + r.stderr.decode(errors="replace")[-300:])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+model,rep,task_id,class,verdict,detail,latency_s,swap_before_mb,avail_before_mb,ts
+"qwen3-coder-next:q4_K_M",0,extract_1,extract,error,"RemoteDisconnected: Remote end closed connection without response",170.8,3976,36351,2026-08-23T21:20:27.088740+00:00
+"qwen3-coder-next:q4_K_M",0,extract_2,extract,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27933,2314,2026-08-23T21:20:27.226240+00:00
+"qwen3-coder-next:q4_K_M",0,extract_3,extract,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27893,2534,2026-08-23T21:20:27.255630+00:00
+"qwen3-coder-next:q4_K_M",0,extract_4,extract,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27845,2506,2026-08-23T21:20:27.328959+00:00
+"qwen3-coder-next:q4_K_M",0,extract_5,extract,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27781,2535,2026-08-23T21:20:27.359347+00:00
+"qwen3-coder-next:q4_K_M",0,extract_6,extract,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27757,2608,2026-08-23T21:20:27.389319+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_1,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27741,2680,2026-08-23T21:20:27.432375+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_2,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27709,2704,2026-08-23T21:20:27.462928+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_3,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27637,13363,2026-08-23T21:20:27.577921+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_4,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27613,20370,2026-08-23T21:20:27.628993+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_5,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27573,26207,2026-08-23T21:20:27.664723+00:00
+"qwen3-coder-next:q4_K_M",0,compute_total_iters,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27541,27779,2026-08-23T21:20:27.696920+00:00
+"qwen3-coder-next:q4_K_M",0,compute_ceiling_count,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27525,29346,2026-08-23T21:20:27.728204+00:00
+"qwen3-coder-next:q4_K_M",0,compute_zero_files,compute,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27509,31175,2026-08-23T21:20:27.760532+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_slowest,multihop,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27485,33136,2026-08-23T21:20:27.790440+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_slowest_value,multihop,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27421,35023,2026-08-23T21:20:27.820669+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_ceiling_files,multihop,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27405,37095,2026-08-23T21:20:27.852654+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_1,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27389,39450,2026-08-23T21:20:27.883862+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_2,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27357,41467,2026-08-23T21:20:27.917705+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_3,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27341,41782,2026-08-23T21:20:27.947310+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_task_1,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27245,47784,2026-08-23T21:20:28.073101+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_task_2,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27205,51048,2026-08-23T21:20:28.102928+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_column,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27197,51023,2026-08-23T21:20:28.130021+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_future,abstain,error,"URLError: <urlopen error [Errno 61] Connection refused>",0.0,27173,50994,2026-08-23T21:20:28.156554+00:00
+"qwen3-coder-next:q4_K_M",0,extract_1,extract,correct,"1737.0",96.7,4965,40055,2026-08-23T21:24:50.918232+00:00
+"qwen3-coder-next:q4_K_M",0,extract_2,extract,correct,"1303.0",5.2,26800,2385,2026-08-23T21:24:56.168747+00:00
+"qwen3-coder-next:q4_K_M",0,extract_3,extract,correct,"394.0",1.7,26987,1978,2026-08-23T21:24:57.966663+00:00
+"qwen3-coder-next:q4_K_M",0,extract_4,extract,correct,"1063.0",1.7,27184,2170,2026-08-23T21:24:59.701166+00:00
+"qwen3-coder-next:q4_K_M",0,extract_5,extract,correct,"625.0",1.5,27112,2132,2026-08-23T21:25:01.218060+00:00
+"qwen3-coder-next:q4_K_M",0,extract_6,extract,correct,"857.0",1.6,27496,2090,2026-08-23T21:25:02.806813+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_1,compute,wrong,"got 1249.2 want 1082.3",4.0,27320,2105,2026-08-23T21:25:06.813846+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_2,compute,wrong,"got 310.6 want 175.3",9.9,27094,2130,2026-08-23T21:25:16.736724+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_3,compute,wrong,"got 735.8 want 655.8",3.1,27118,2124,2026-08-23T21:25:19.874875+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_4,compute,wrong,"got 1193.4 want 1314.3",26.5,26886,2124,2026-08-23T21:25:46.370494+00:00
+"qwen3-coder-next:q4_K_M",0,compute_mean_5,compute,error,"TimeoutError: timed out",900.2,27001,2112,2026-08-23T21:40:46.708332+00:00
+"qwen3-coder-next:q4_K_M",0,compute_total_iters,compute,wrong,"got 432.0 want 543.0",45.2,27935,1711,2026-08-23T21:41:32.256798+00:00
+"qwen3-coder-next:q4_K_M",0,compute_ceiling_count,compute,wrong,"got 6.0 want 7.0",138.7,28829,2243,2026-08-23T21:43:51.092756+00:00
+"qwen3-coder-next:q4_K_M",0,compute_zero_files,compute,unparseable,"no JSON object in reply",153.7,28260,2110,2026-08-23T21:46:25.008933+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_slowest,multihop,wrong,"got 'qwen3-coder-next:q4_K_M' want 'deepseek-r1:32b'",41.1,28422,1670,2026-08-23T21:47:06.471970+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_slowest_value,multihop,wrong,"got 113.8 want 75.6",2.0,23897,8314,2026-08-23T21:47:08.554701+00:00
+"qwen3-coder-next:q4_K_M",0,multihop_ceiling_files,multihop,correct,"'qwen2.5-coder:14b'",1.9,20230,7871,2026-08-23T21:47:10.540492+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_1,abstain,correct,"correctly abstained",2.2,17179,7684,2026-08-23T21:47:12.820317+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_2,abstain,correct,"correctly abstained",2.2,14080,7413,2026-08-23T21:47:15.051578+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_model_3,abstain,correct,"correctly abstained",2.3,11278,7127,2026-08-23T21:47:17.413132+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_task_1,abstain,correct,"correctly abstained",1.5,8676,6718,2026-08-23T21:47:18.928211+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_task_2,abstain,correct,"correctly abstained",1.5,7219,6544,2026-08-23T21:47:20.449468+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_column,abstain,correct,"correctly abstained",1.2,6058,6393,2026-08-23T21:47:21.690416+00:00
+"qwen3-coder-next:q4_K_M",0,abstain_future,abstain,correct,"correctly abstained",1.6,5520,6275,2026-08-23T21:47:23.373142+00:00

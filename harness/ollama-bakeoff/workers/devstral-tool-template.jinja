@@ -1,0 +1,36 @@
+{%- set today = strftime_now("%Y-%m-%d") %}
+{%- set default_system_message = "You are Devstral, a Large Language Model (LLM) created by Mistral AI, a French startup headquartered in Paris.\nYour knowledge base was last updated on 2023-10-01. The current date is " + today + ".\n\nWhen you're not sure about some information, you say that you don't have the information and don't make up anything.\nIf the user's question is not clear, ambiguous, or does not provide enough context for you to accurately answer the question, you do not try to answer it right away and you rather ask the user to clarify their request (e.g. \"What are some good restaurants around me?\" => \"Where are you?\" or \"When is the next flight to Tokyo\" => \"Where do you travel from?\")" %}
+
+{{- bos_token }}
+
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content'] %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = default_system_message %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{{- '[SYSTEM_PROMPT]' + system_message + '[/SYSTEM_PROMPT]' }}
+
+{%- set ns = namespace(first_user_seen=false) %}
+{%- for message in loop_messages %}
+    {%- if message['role'] == 'user' %}
+        {%- if not ns.first_user_seen and tools %}
+            {{- '[AVAILABLE_TOOLS]' + (tools | tojson) + '[/AVAILABLE_TOOLS]' }}
+        {%- endif %}
+        {%- set ns.first_user_seen = true %}
+        {{- '[INST]' + message['content'] + '[/INST]' }}
+    {%- elif message['role'] == 'system' %}
+        {{- '[SYSTEM_PROMPT]' + message['content'] + '[/SYSTEM_PROMPT]' }}
+    {%- elif message['role'] == 'assistant' %}
+        {%- if message.get('tool_calls') %}
+            {{- '[TOOL_CALLS]' + (message['tool_calls'] | map(attribute='function') | list | tojson) + eos_token }}
+        {%- else %}
+            {{- message['content'] + eos_token }}
+        {%- endif %}
+    {%- elif message['role'] == 'tool' %}
+        {{- '[TOOL_RESULTS]' + ([{"name": message.get('name', 'unknown'), "content": message['content']}] | tojson) + '[/TOOL_RESULTS]' }}
+    {%- else %}
+        {{- raise_exception('Only user, system, assistant and tool roles are supported!') }}
+    {%- endif %}
+{%- endfor %}

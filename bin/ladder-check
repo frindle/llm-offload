@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""ladder-check DIR [options] -- CMD...
+
+Copy DIR to claude-sandbox:~/work/ladder/<basename>/ (rsync over ssh, --delete, no .venv / node_modules /
+__pycache__, .git kept) and run CMD there with a timeout. Prints the last --tail lines, exits with CMD's exit code
+(124 on timeout). A single CMD word is run as a shell string; several words are quoted and joined.
+
+--base REF  also run CMD on a clean checkout of REF (git archive, works from worktrees) in <basename>-base/ and
+            print "BASE rc=N" / "FIX rc=N". Exit code is the FIX one.
+--overlay   with --base: start the base dir from a copy of DIR, then overwrite tracked files with REF's, so files
+            new in the fix (a new repro test) are still there. Without it the base is a clean checkout of REF.
+"""
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+
+HOST = "claude-sandbox"
+REMOTE_ROOT = "work/ladder"          # relative to the sandbox home
+EXCLUDES = [".venv", "node_modules", "__pycache__"]
+
+
+def parse_args(argv):
+    if "--" not in argv:
+        raise SystemExit("usage: ladder-check DIR [--timeout S] [--tail N] [--base REF] [--overlay] -- CMD...")
+    i = argv.index("--")
+    head, cmd = argv[:i], argv[i + 1:]
+    if not cmd:
+        raise SystemExit("ladder-check: no CMD after --")
+    p = argparse.ArgumentParser(prog="ladder-check")
+    p.add_argument("dir")
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--tail", type=int, default=60)
+    p.add_argument("--base", default=None)
+    p.add_argument("--overlay", action="store_true")
+    a = p.parse_args(head)
+    a.cmd = cmd
+    return a
+
+
+def remote_dir(local, suffix=""):
+    name = os.path.basename(os.path.abspath(local).rstrip("/"))
+    if not name or name in (".", ".."):  # rsync --delete into work/ladder/ itself would wipe other tasks
+        raise SystemExit(f"ladder-check: refusing a directory with no usable name: {local!r}")
+    return f"{REMOTE_ROOT}/{name}{suffix}"
+
+
+def rsync_cmd(local, rdir):
+    cmd = ["rsync", "-az", "--delete", "-e", "ssh"]
+    for e in EXCLUDES:
+        cmd += ["--exclude", e]
+    cmd += [os.path.abspath(local).rstrip("/") + "/", f"{HOST}:{rdir}/"]
+    return cmd
+
+
+def shell_string(cmd):
+    return cmd[0] if len(cmd) == 1 else shlex.join(cmd)
+
+
+def run_cmd(rdir, cmd, timeout):
+    """ssh argv that runs CMD in rdir with a remote timeout."""
+    inner = f"cd {shlex.quote(rdir)} && timeout {int(timeout)} bash -c {shlex.quote(shell_string(cmd))}"
+    return ["ssh", HOST, f"bash -lc {shlex.quote(inner)}"]
+
+
+def archive_cmds(local, ref, rdir, clean):
+    """(local git archive argv, ssh argv that extracts it). clean wipes rdir first."""
+    pre = f"rm -rf {shlex.quote(rdir)}; " if clean else ""
+    extract = f"{pre}mkdir -p {shlex.quote(rdir)} && tar -x -C {shlex.quote(rdir)}"
+    return (["git", "-C", os.path.abspath(local), "archive", ref],
+            ["ssh", HOST, extract])
+
+
+def run_remote(rdir, cmd, timeout, tail):
+    try:
+        r = subprocess.run(run_cmd(rdir, cmd, timeout), capture_output=True, text=True, timeout=timeout + 60)
+        out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+    except subprocess.TimeoutExpired:
+        out, rc = "ladder-check: ssh timed out\n", 124
+    lines = out.splitlines()
+    return rc, "\n".join(lines[-tail:]) if tail > 0 else ""
+
+
+def sync(local, rdir):
+    subprocess.run(["ssh", HOST, f"mkdir -p {shlex.quote(rdir)}"], check=True)
+    subprocess.run(rsync_cmd(local, rdir), check=True)
+
+
+def prepare_base(local, ref, rdir, overlay):
+    if overlay:
+        sync(local, rdir)
+    arch, ext = archive_cmds(local, ref, rdir, clean=not overlay)
+    a = subprocess.Popen(arch, stdout=subprocess.PIPE)
+    e = subprocess.run(ext, stdin=a.stdout)
+    a.stdout.close()
+    if a.wait() != 0 or e.returncode != 0:
+        raise SystemExit(f"ladder-check: could not prepare base {ref}")
+
+
+def main(argv):
+    a = parse_args(argv)
+    if not os.path.isdir(a.dir):
+        raise SystemExit(f"ladder-check: not a directory: {a.dir}")
+    rdir = remote_dir(a.dir)
+    sync(a.dir, rdir)
+    rc, tail = run_remote(rdir, a.cmd, a.timeout, a.tail)
+    if a.base:
+        bdir = remote_dir(a.dir, "-base")
+        prepare_base(a.dir, a.base, bdir, a.overlay)
+        brc, btail = run_remote(bdir, a.cmd, a.timeout, a.tail)
+        print(f"--- BASE ({a.base}) ---\n{btail}\nBASE rc={brc}")
+        print(f"--- FIX ---\n{tail}\nFIX rc={rc}")
+    else:
+        print(tail)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to $OLLAMA_DISPATCH_HOME/model-ladder.json. Fallback ladder (cheapest -> most capable) used to escalate a job that a smaller model failed to converge on. Each entry is a model tag or {\"model\": .., \"host\": ..}; host defaults to the primary. Env OLLAMA_DISPATCH_MODEL_LADDER (comma-separated tags) overrides this file.",
+  "ladder": [
+    {"model": "qwen2.5-coder:7b", "host": "primary"},
+    {"model": "qwen2.5-coder:14b", "host": "primary"},
+    {"model": "qwen2.5-coder:32b", "host": "primary"}
+  ]
+}

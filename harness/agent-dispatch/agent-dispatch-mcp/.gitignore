@@ -1,0 +1,17 @@
+# The real config holds host-specific endpoints, hostnames and paths.
+# Only config.example.toml is ever committed.
+config.toml
+config.local.toml
+*.local.toml
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store

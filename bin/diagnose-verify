@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Generic mechanical check of an offloaded diagnosis (project-agnostic).
+
+1. DIAGNOSIS.md and test_repro.py exist.
+2. test_repro.py FAILS at baseline (a passing test = no evidence = reject).
+3. Optional --mutate FILE:OLD:NEW (repeatable): apply the edit to a temp copy of
+   the workdir; the test must then PASS, proving the test targets the named code.
+4. Static checks on the test: it must contain assert statements and must not
+   mock/patch (a mocked suspect proves nothing).
+5. --symptom REGEX: the baseline failure output must match it (wrong-reason failures
+   are rejected).
+6. Negative control: with --mutate, an unrelated edit (a trailing comment) is applied
+   to the same file(s); the test must still FAIL (guards flaky/vacuous oracles).
+Exit 0 = mechanically sound (Opus then reads DIAGNOSIS.md + the test only).
+Usage: diagnose-verify WORKDIR [--mutate FILE:OLD:NEW] [--symptom REGEX]
+"""
+import argparse, ast, os, re, shutil, subprocess, sys, tempfile
+
+
+def run(d):
+    r = subprocess.run([sys.executable, "-m", "pytest", "-x", "-q", "test_repro.py"],
+                       cwd=d, capture_output=True, text=True, timeout=300,
+                       env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    return r.returncode, (r.stdout + r.stderr)[-1500:]
+
+
+def static_check(path):
+    src = open(path).read()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        return f"test_repro.py has a syntax error: {e}"
+    if not any(isinstance(n, ast.Assert) for n in ast.walk(tree)):
+        return "test has no assert statements"
+    if re.search(r"\b(unittest\.mock|MagicMock|monkeypatch|mock\.patch|@patch)\b", src):
+        return "test mocks/patches code (a mocked suspect proves nothing)"
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workdir")
+    ap.add_argument("--mutate", action="append", default=[])
+    ap.add_argument("--symptom", help="regex the baseline failure output must match")
+    a = ap.parse_args()
+    for f in ("DIAGNOSIS.md", "test_repro.py"):
+        if not os.path.exists(os.path.join(a.workdir, f)):
+            print(f"REJECT: missing {f}"); return 1
+    bad = static_check(os.path.join(a.workdir, "test_repro.py"))
+    if bad:
+        print("REJECT: " + bad); return 1
+    rc, out = run(a.workdir)
+    if rc == 0:
+        print("REJECT: test passes at baseline (no evidence of the bug)"); return 1
+    if "no tests ran" in out or "ERROR collecting" in out or "ImportError" in out:
+        print("REJECT: test errors instead of failing on an assertion\n" + out); return 1
+    if a.symptom and not re.search(a.symptom, out, re.S):
+        print(f"REJECT: baseline failure does not match symptom /{a.symptom}/ (wrong-reason failure)\n" + out); return 1
+    print("OK baseline fails:\n" + out)
+    if a.mutate:
+        tmp = tempfile.mkdtemp()
+        shutil.copytree(a.workdir, tmp, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '.pytest_cache'))
+        for m in a.mutate:
+            f, old, new = m.split(":", 2)
+            p = os.path.join(tmp, f)
+            s = open(p).read()
+            if old not in s:
+                print(f"REJECT: mutation target not found in {f}"); return 1
+            open(p, "w").write(s.replace(old, new, 1))
+        rc2, out2 = run(tmp)
+        shutil.rmtree(tmp)
+        if rc2 != 0:
+            print("REJECT: mutation did not make the test pass (test not tied to named code)\n" + out2)
+            return 1
+        print("OK mutation turns test green")
+        ctl = tempfile.mkdtemp()
+        shutil.copytree(a.workdir, ctl, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '.pytest_cache'))
+        for m in a.mutate:
+            p = os.path.join(ctl, m.split(":", 2)[0])
+            open(p, "a").write("\n# negative control\n")
+        rc3, out3 = run(ctl)
+        shutil.rmtree(ctl)
+        if rc3 == 0:
+            print("REJECT: negative control (no-op edit) made the test pass; oracle is flaky or vacuous\n" + out3)
+            return 1
+        print("OK negative control stays red")
+    print("MECHANICAL_OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

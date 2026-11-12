@@ -1,0 +1,4 @@
+# Known fakes the private-info scan may skip: path-glob<TAB>regex matching the line<TAB>why. Reviewed by hand.
+docs/bundle-triage-2026-10-06.md	pricing-discount-pen[n]y	a bench task name (a coin), not a person
+bin/offload-repo-sync	^PRIVATE_NETS = \[ipaddress\.IPv4Network\(n\) for n in \("	the RFC 1918 and CGNAT range names the scan itself uses, not hosts
+bin/offload-repo-sync	-style ranges \(prefix 16 or shorter\) name the RFC ranges	docstring naming an RFC 1918 range, not a host

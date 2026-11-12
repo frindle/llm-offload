@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "truncate_words"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

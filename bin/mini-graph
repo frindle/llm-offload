@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""mini-graph callers FILE FN | callees FILE FN | where NAME | neighbors FILE   [--graph PATH]
+Read-only graph lookup for the mini-swe agent (thin wrapper over mini_graph.py; never writes, never runs graphify)."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mini_graph
+sys.exit(mini_graph.cli(sys.argv[1:]))

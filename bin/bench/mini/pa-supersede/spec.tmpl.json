@@ -1,0 +1,8 @@
+{
+ "args": [
+  "--fn",
+  "supersedePending"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

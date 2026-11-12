@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""mini-submit SPEC.json --label L --model M [--override REASON] [--dry-run] [other ollama-queue enqueue flags]
+
+The ONLY door to the queue for mini-swe-runner jobs (queue-submit execs it; mini-bench calls it; ollama-queue.py enqueue
+refuses a mini-swe-runner job without the receipt this writes once MINI_RECEIPT_ENFORCE is on). It takes NO --cwd: it creates
+its own empty work dir ~/.ollama-dispatch/mini-work/<label>-<YYYYmmddHHMMSS>/work (the run dir is its parent, where the
+runner drops REVIEW*.md), outside the spec dir, baseline_from and the task files.
+
+Checks run in order and stop at the first FAIL:  `mini-submit: FAIL <id> <reason>` then `  fix: <exact command>`.
+  C0 runner --self-test prints `self-test ok` (cached per runner sha in ~/.ollama-dispatch/mini-selftest/). Not overridable.
+  C1 spec parses; baseline_from is a dir; each step's task file exists (absolute); the ref dir holds s<N>/<allowed> (or <allowed>
+     for a plain spec); every test_file exists in baseline_from.
+  C2 cwd_guard(workdir, spec, spec) + the reverse (workdir not inside baseline_from / spec dir / task dir). Not overridable.
+  C3 mini-validate --check-fresh SPEC exits 0 and VALIDATION.md was written by the CURRENT runner sha. Not overridable.
+  C4 two-phase/steps: red_ok list, target_fn (or explicit []), fn_scope in warn|enforce|fail|off, fix_steps >= the V6 formula, fix_wall
+      (mini-validate fills the missing ones before it validates, unless --no-fill).
+  C5 runner --check-only on the work dir (rc 0); the dir is then wiped back to empty.
+  C6 steps specs: runner --check-only --try-fix-chain REF: the s<N> refs applied cumulatively must pass the REAL phase-B gates.
+  C7 label: ^[a-z0-9]+(-[a-z0-9]+)*$, <= 48 chars, >= 2 meaningful tokens (area-change[-step]; not project-fix-u3).
+  C8 TRIAGE: a family with prior budget-charged failures needs TRIAGE.md in the spec dir (infra-only history is auto-triaged).
+mode "auto" specs (mini-auto new; the model diagnoses, writes the test, then the fix): C1 checks baseline_from is a git worktree
+root, task is an absolute non-empty description file, file hints are tracked; C3 is the MINI_AUTO=off kill switch plus the
+must-not-offload refusal (repo, hints, description) instead of mini-validate; C4 and C6 do not apply.
+--override REASON may skip only C4, C7, C8; it is recorded in the receipt and in mini-overrides.jsonl.
+On success: writes <spec dir>/SUBMIT-OK.json and runs `ollama-queue.py enqueue --runner <runner> --cwd <workdir> --task-file SPEC ...`.
+Before enqueueing it prints one `WARNING: graph ...` line when the repo's graphify graph is stale/missing for the allowed files (warn only; MINI_GRAPH_WARN=off silences).
+--dry-run runs the checks, prints the enqueue command and removes the work dir (no receipt, no enqueue).
+
+Env (tests / alternate installs): MINI_SUBMIT_HOME (default ~/.ollama-dispatch), MINI_RUNNER, MINI_SUBMIT_QUEUE, MINI_VALIDATE,
+FAILURE_LEDGER, MINI_LIVELOG_DIR.
+"""
+import argparse
+import difflib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE))
+import mini_submit_receipt as MR  # noqa: E402
+from mini_submit_model import vet_submit_model  # noqa: E402
+
+DAEMON_PATH = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+STOPLIST = {"fix", "task", "job", "test", "rerun", "retry", "mini", "run", "wip", "tmp"}
+SKIP_TOKEN = re.compile(r"u\d+[a-z]?|s\d+|r\d+|\d+")
+LABEL_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+OVERRIDABLE = {"C4", "C7", "C8"}
+
+
+def home_dir():
+    return Path(os.environ.get("MINI_SUBMIT_HOME") or Path.home() / ".ollama-dispatch")
+
+
+def runner_path():
+    return Path(os.path.expanduser(os.environ.get("MINI_RUNNER") or str(HERE / "mini-swe-runner.py")))
+
+
+class Fail(Exception):
+    def __init__(self, cid, reason, fix=""):
+        super().__init__(reason)
+        self.cid, self.reason, self.fix = cid, reason, fix
+
+
+def patch_cmd(spec_path, edits):
+    """Shell command that applies [(key-path list, value), ...] to the spec JSON in place."""
+    body = ";".join("d" + "".join(f"[{k!r}]" for k in path) + f"={val!r}" for path, val in edits)
+    code = f"import json,pathlib;p=pathlib.Path({str(spec_path)!r});d=json.loads(p.read_text());{body};p.write_text(json.dumps(d,indent=1))"
+    return "python3 -c " + shlex.quote(code)
+
+
+def load_runner():
+    sp = importlib.util.spec_from_file_location("mini_swe_runner", runner_path())
+    r = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(r)
+    return r
+
+
+def rm_tree_contents(d):
+    """Empty directory d (keeps d itself); read-only files/dirs are made writable first."""
+    def onerr(fn, path, _exc):
+        try:
+            os.chmod(path, stat.S_IRWXU)
+            fn(path)
+        except OSError:
+            pass
+    for c in Path(d).iterdir():
+        if c.is_symlink() or c.is_file():
+            if not c.is_symlink():   # Path.chmod FOLLOWS symlinks: chmod on the work-dir .venv link stripped the baseline venv's x bit
+                try:
+                    c.chmod(0o644)
+                except OSError:
+                    pass
+            c.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(c, onerror=onerr)
+
+
+# ---------------------------------------------------------------------------------------------------- label (C7)
+def check_label(label):
+    """None if the label is acceptable, else the reason. PURE."""
+    if not LABEL_RE.match(label or ""):
+        return f"label {label!r} must match ^[a-z0-9]+(-[a-z0-9]+)*$ (lowercase words joined by single hyphens)"
+    if len(label) > 48:
+        return f"label is {len(label)} chars (max 48)"
+    good = [t for t in label.split("-") if len(t) >= 3 and t not in STOPLIST and not SKIP_TOKEN.fullmatch(t)]
+    if len(good) < 2:
+        return (f"label {label!r} has {len(good)} meaningful token(s) {good}; need >= 2 words of 3+ letters that are not in "
+                f"{sorted(STOPLIST)} or a counter like u2b/s3/r1/-2. Name it area-change[-step], e.g. webhook-retry-backoff")
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------- checks
+class Ctx:
+    pass
+
+
+def c0(ctx):
+    rp = runner_path()
+    sha = MR.sha_file(rp)
+    if not sha:
+        raise Fail("C0", f"runner {rp} is not readable", f"ls -l {rp}")
+    cache = home_dir() / "mini-selftest" / sha
+    cmd = f"{sys.executable} {rp} --self-test"
+    if cache.is_file():
+        return f"self-test cached ({sha[:12]})"
+    try:
+        p = subprocess.run([sys.executable, str(rp), "--self-test"], capture_output=True, text=True, timeout=1800, cwd=str(HERE),
+                           env={**os.environ, "PATH": DAEMON_PATH})
+        out, rc = p.stdout + p.stderr, p.returncode
+    except subprocess.TimeoutExpired:
+        out, rc = "TIMEOUT", 124
+    if rc != 0 or not any(ln.strip() == "self-test ok" for ln in out.splitlines()):
+        raise Fail("C0", f"runner --self-test failed (rc={rc}): {out.strip()[-300:]!r}", cmd)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+    return f"self-test ok ({sha[:12]}), cached"
+
+
+def spec_steps(ctx):
+    return ctx.R.merged_steps(ctx.spec) if ctx.spec.get("steps") else [ctx.spec]
+
+
+def ref_dir(ctx):
+    r = Path(os.path.expanduser(str(ctx.spec.get("ref") or "ref")))
+    return r if r.is_absolute() else Path(ctx.spec_dir) / r   # relative ref is spec-dir relative, never cwd relative
+
+
+def task_paths(ctx):
+    """Absolute task file paths of the spec/steps."""
+    out = []
+    for sp in spec_steps(ctx):
+        t = sp.get("task")
+        if isinstance(t, str) and not ctx.R.is_inline_task(t) and Path(os.path.expanduser(t)).is_absolute():
+            out.append(Path(os.path.expanduser(t)))
+    return out
+
+
+def c1(ctx):
+    sp_path = ctx.spec_path
+    try:
+        ctx.spec = json.loads(sp_path.read_text())
+        assert isinstance(ctx.spec, dict)
+    except (OSError, ValueError, AssertionError) as e:
+        raise Fail("C1", f"spec {sp_path} does not parse as a JSON object: {type(e).__name__}", f"python3 -m json.tool {sp_path}")
+    try:
+        ctx.R = load_runner()
+    except Exception as e:  # noqa: BLE001
+        raise Fail("C1", f"cannot import the runner {runner_path()}: {type(e).__name__}: {str(e)[:160]}", f"python3 {runner_path()} --self-test")
+    R, spec = ctx.R, ctx.spec
+    if spec.get("mode") == "auto":
+        return c1_auto(ctx)
+    steps = spec_steps(ctx)
+    is_steps = bool(spec.get("steps"))
+    rel_edits, rel_msgs = [], []
+    for i, sp in enumerate(steps, 1):
+        bf = sp.get("baseline_from")
+        bfp = Path(os.path.expanduser(str(bf))) if bf else None
+        if not bfp or not bfp.is_dir():
+            raise Fail("C1", f"step {i}: baseline_from {bf!r} is not a directory",
+                       patch_cmd(sp_path, [(["baseline_from"], "<DIR holding the repo and the frozen tests>")]))
+        t = sp.get("task")
+        if isinstance(t, str) and not R.is_inline_task(t):
+            tp = Path(os.path.expanduser(t))
+            if tp.is_absolute():
+                if not tp.is_file():
+                    raise Fail("C1", f"step {i}: task file {tp} does not exist", f"ls -l {tp}")
+            elif not (bfp / t).is_file():
+                cand = ctx.spec_dir / t
+                if cand.is_file():
+                    path = ["steps", i - 1, "task"] if is_steps else ["task"]
+                    rel_edits.append((path, str(cand)))
+                    rel_msgs.append(f"step {i} task {t!r}")
+                else:
+                    raise Fail("C1", f"step {i}: task file {t!r} is in neither baseline_from nor {ctx.spec_dir}", f"ls -l {cand}")
+        tf = sp.get("test_file")
+        if sp.get("phase_a_only"):  # test_draft job: the test does not exist yet, the local model writes it
+            if not tf or (bfp / tf).exists():
+                raise Fail("C1", f"step {i}: a test_draft job needs test_file set and ABSENT from baseline_from (found {tf!r} in {bfp})", "mini-testdraft emit SPEC --out DIR")
+            continue
+        if not tf or not (bfp / tf).is_file():
+            raise Fail("C1", f"step {i}: test_file {tf!r} is not in baseline_from {bfp} (commit the frozen test there)", f"ls -l {bfp}/{tf}")
+    if rel_edits:
+        raise Fail("C1", f"{'; '.join(rel_msgs)} relative: the runner resolves it against the WORK dir, not the spec dir; use the absolute path",
+                   patch_cmd(sp_path, rel_edits))
+    refd = ref_dir(ctx)
+    for i, sp in enumerate(steps, 1):
+        sd = refd / f"s{i}" if is_steps else refd
+        missing = [f for f in sp.get("allowed") or [] if not (sd / f).is_file()]
+        if missing:
+            cps = " && ".join(f"cp <fixed {f}{' for step ' + str(i) + ' (cumulative)' if is_steps else ''}> {sd}/{f}" for f in missing)
+            raise Fail("C1", f"step {i}: no reference fix {missing} in {sd}", f"mkdir -p {sd} && {cps}")
+    return f"{len(steps)} step(s), ref {refd}"
+
+
+def _git_top(d):
+    try:
+        p = subprocess.run(["git", "-C", str(d), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=30)
+        return os.path.realpath(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def auto_inputs(ctx):
+    """(baseline_from, tracked files, resolved file hints, fn hint, description) of an auto spec. C1 has checked them."""
+    spec, R = ctx.spec, ctx.R
+    bf = os.path.realpath(os.path.expanduser(str(spec["baseline_from"])))
+    p = subprocess.run(["git", "-C", bf, "ls-files"], capture_output=True, text=True, timeout=60)
+    files = [x for x in p.stdout.split("\n") if x]
+    hints = [R.auto_resolve(str(h), files) or str(h) for h in R.as_list(spec.get("files")) if str(h).strip()]
+    fn = str(spec["fn"]).split(".")[-1] if spec.get("fn") else None
+    desc = Path(os.path.expanduser(str(spec["task"]))).read_text(errors="replace").strip()
+    return bf, files, hints, fn, desc
+
+
+def c1_auto(ctx):
+    """mode auto: no frozen test and no ref exist yet (the model writes both after its diagnosis). baseline_from must be the root of
+    a git worktree, task an absolute non-empty description file; file hints must name tracked files (or dirs); diagnose=skip needs
+    exactly one file hint and fn."""
+    spec, sp_path = ctx.spec, ctx.spec_path
+    bf = spec.get("baseline_from")
+    bfp = Path(os.path.expanduser(str(bf))) if bf else None
+    if not bfp or not bfp.is_dir():
+        raise Fail("C1", f"auto: baseline_from {bf!r} is not a directory", "mini-auto new --repo REPO ... (it makes the worktree and the spec)")
+    if _git_top(bfp) != os.path.realpath(bfp):
+        raise Fail("C1", f"auto: baseline_from {bfp} is not the root of a git worktree", "mini-auto new --repo REPO ... (it makes the worktree and the spec)")
+    t = spec.get("task")
+    tp = Path(os.path.expanduser(str(t))) if isinstance(t, str) and t.strip() else None
+    if not tp or not tp.is_absolute():
+        cand = ctx.spec_dir / str(t or "TASK.md")
+        raise Fail("C1", f"auto: task {t!r} must be the absolute path of the description file", patch_cmd(sp_path, [(["task"], str(cand))]))
+    if not tp.is_file() or not tp.read_text(errors="replace").strip():
+        raise Fail("C1", f"auto: task file {tp} is missing or empty (it holds the problem description)", f"ls -l {tp}")
+    _bf, files, hints, fn, _desc = auto_inputs(ctx)
+    bad = [h for h in hints if h not in files and not (Path(_bf) / h).is_dir()]
+    if bad:
+        raise Fail("C1", f"auto: file hint(s) {bad} are not tracked files of {_bf} (nor a unique path suffix of one)",
+                   patch_cmd(sp_path, [(["files"], [h for h in hints if h not in bad])]))
+    if spec.get("diagnose") not in (None, "always", "skip"):
+        raise Fail("C1", f"auto: diagnose must be \"always\" or \"skip\", got {spec.get('diagnose')!r}", patch_cmd(sp_path, [(["diagnose"], "always")]))
+    if spec.get("diagnose") == "skip" and not (len(hints) == 1 and hints[0] in files and fn):
+        raise Fail("C1", "auto: diagnose=skip needs exactly one tracked file hint and an fn hint", patch_cmd(sp_path, [(["diagnose"], "always")]))
+    return f"auto: baseline {_bf}, {len(hints)} file hint(s){', fn ' + fn if fn else ''}, diagnose={spec.get('diagnose') or 'always'}"
+
+
+def c3_auto(ctx):
+    """mode auto replaces mini-validate (there is no ref or frozen test to validate). Kill switch MINI_AUTO=off. Refuses every
+    must-not-offload area named by the repo, the hints or the description (the runner refuses the diagnosed target again)."""
+    if os.environ.get("MINI_AUTO", "on").strip().lower() in ("off", "0", "no", "false"):
+        raise Fail("C3", "auto mode is OFF (MINI_AUTO=off)", "unset MINI_AUTO  # or fix it directly")
+    bf, _files, hints, fn, desc = auto_inputs(ctx)
+    R = ctx.R
+    hits = R.auto_forbidden([("repo", x) for x in R.auto_repo_names(bf)] + [("file hint", h) for h in hints] + [("function hint", fn)], desc)
+    if hits:
+        raise Fail("C3", "must-not-offload: " + "; ".join(f"{w} {v!r} ({h})" for w, v, h in hits)[:300],
+                   "fix it directly (Claude writes code in money/auth/secret/migration/gate areas)")
+    return "auto: no must-not-offload area; the model writes the test and the fix, Claude reviews every result"
+
+
+def c2(ctx):
+    R, spec, wd = ctx.R, ctx.spec, ctx.workdir
+    cand_specs = [spec] + (spec_steps(ctx) if spec.get("steps") else [])
+    for s in cand_specs:
+        bad = R.cwd_guard(wd, s, str(ctx.spec_path))
+        if bad:
+            raise Fail("C2", bad, "unset MINI_SUBMIT_HOME (mini-submit picks its own work dir under ~/.ollama-dispatch/mini-work)")
+    wr = Path(wd).resolve()
+    sources = [("spec dir", ctx.spec_dir)] + [("task dir", p.parent) for p in task_paths(ctx)]
+    for sp in spec_steps(ctx):
+        if sp.get("baseline_from"):
+            sources.append(("baseline_from", Path(os.path.expanduser(str(sp["baseline_from"])))))
+    for label, p in sources:
+        pr = Path(p).resolve()
+        if pr == wr or pr in wr.parents:
+            raise Fail("C2", f"work dir {wr} is inside the {label} {pr}", "unset MINI_SUBMIT_HOME (mini-submit picks its own work dir under ~/.ollama-dispatch/mini-work)")
+    return f"work dir {wr} is outside spec/task/baseline"
+
+
+def draft_enabled():
+    return os.environ.get("MINI_TESTDRAFT_MODE", "off") == "on" and os.environ.get("MINI_TESTDRAFT", "on") != "off"
+
+
+def c3_draft(ctx):
+    """test_draft replaces C3 (no validated frozen test exists yet). Needs the kill switch open, no must-not-offload path, and an
+    acceptance command that is mini-testdraft check on the original validated-ref spec. The draft is gated AFTER the model runs (V1-V7 + mutation)."""
+    if not draft_enabled():
+        raise Fail("C3", "test_draft mode is OFF", "export MINI_TESTDRAFT_MODE=on  # (kill switch: unset it, or MINI_TESTDRAFT=off)")
+    spec = ctx.spec
+    blob = " ".join([str(spec.get("baseline_from")), *map(str, spec.get("allowed") or []), str(spec.get("test_file"))])
+    sys.path.insert(0, str(HERE))
+    forb = re.compile(r"resell|bfmr|tax|pnl|auth|secret|keychain|token|migrat|mini-validate|mini-swe-runner|mini-submit|mini-spec|canary", re.I)
+    if forb.search(blob):
+        raise Fail("C3", f"{blob[:100]} matches a must-not-offload area (money/auth/migration/gate): Claude writes this test", "write the frozen test by hand")
+    cmd = spec.get("draft_accept_cmd") or ""
+    if "mini-testdraft" not in cmd or " check " not in cmd or "{draft}" not in cmd:
+        raise Fail("C3", "draft_accept_cmd must be a `mini-testdraft check <orig spec> --draft {draft}` command", "mini-testdraft emit SPEC --out DIR")
+    if "--min-mutation 0 " in cmd + " " or "--allow-unscored" in cmd:
+        raise Fail("C3", "draft_accept_cmd weakens the gate (--min-mutation 0 / --allow-unscored)", "remove it")
+    return "test_draft enabled; acceptance = mini-testdraft check (V1-V7 + mutation)"
+
+
+def c3(ctx):
+    if ctx.spec.get("phase_a_only"):
+        return c3_draft(ctx)
+    if ctx.spec.get("mode") == "auto":
+        return c3_auto(ctx)
+    val = Path(os.environ.get("MINI_VALIDATE") or HERE / "mini-validate")
+    fix = f"{val} {ctx.spec_path}"
+    p = subprocess.run([sys.executable, str(val), "--check-fresh", str(ctx.spec_path)], capture_output=True, text=True,
+                       env={**os.environ, "MINI_RUNNER": str(runner_path())})
+    if p.returncode != 0:
+        raise Fail("C3", (p.stdout + p.stderr).strip()[-400:] or f"mini-validate --check-fresh rc={p.returncode}", fix)
+    vf = ctx.spec_dir / "VALIDATION.md"
+    m = re.search(r"^- runner: .*? sha=([0-9a-f]{12})\s*$", vf.read_text() if vf.is_file() else "", re.M)
+    cur = (MR.sha_file(runner_path()) or "")[:12]
+    if not m or m.group(1) != cur:  # belt and braces: an older mini-validate does not compare the runner
+        raise Fail("C3", f"VALIDATION.md was written by runner sha {m.group(1) if m else 'unknown'}, current is {cur}", fix)
+    return "VALIDATION fresh for this spec and runner"
+
+
+def validation_sizing(ctx):
+    """{step n: (fix_steps, fix_wall)} the V6 formula values mini-validate recorded in VALIDATION.md."""
+    vf = ctx.spec_dir / "VALIDATION.md"
+    txt = vf.read_text() if vf.is_file() else ""
+    return {int(m.group(1)): (int(m.group(2)), int(m.group(3)))
+            for m in re.finditer(r"^- s(\d+) V6 sizing: .*?formula fix_steps=(\d+) fix_wall=(\d+)s", txt, re.M)}
+
+
+def infer_target_fn(ctx, i, sp):
+    """Names of the functions the step's reference fix edits (a suggestion for the C4 fix); [] when unknowable."""
+    names = []
+    try:
+        is_steps = bool(ctx.spec.get("steps"))
+        refd = ref_dir(ctx)
+        for f in sp.get("allowed") or []:
+            new = (refd / (f"s{i}" if is_steps else ".") / f).read_text()
+            if is_steps and i > 1 and (refd / f"s{i - 1}" / f).is_file():
+                old = (refd / f"s{i - 1}" / f).read_text()
+            else:
+                bp = Path(os.path.expanduser(str(sp["baseline_from"]))) / f
+                old = bp.read_text() if bp.is_file() else ""
+            changed = set()
+            for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False).get_opcodes():
+                if tag != "equal":
+                    changed.update(range(j1 + 1, j2 + 1))
+            for n, (a, b) in ctx.R.functions(f, new).items():
+                if b and any(a <= ln <= b for ln in changed) and n not in names:
+                    names.append(n)
+    except Exception:  # noqa: BLE001
+        return []
+    return names
+
+
+def c4(ctx):
+    spec = ctx.spec
+    steps = spec_steps(ctx)
+    if spec.get("phase_a_only"):
+        return "test_draft job: sizing skipped (phase A only)"
+    if not (spec.get("steps") or spec.get("mode") == "two-phase"):
+        return "not a two-phase spec: skipped"
+    is_steps = bool(spec.get("steps"))
+    sizing = validation_sizing(ctx)
+    edits, why = [], []
+    for i, sp in enumerate(steps, 1):
+        base = ["steps", i - 1] if is_steps else []
+        form_steps, form_wall = sizing.get(i, (None, None))
+        add = {}
+        if not isinstance(sp.get("red_ok"), list):
+            add["red_ok"] = []
+            why.append(f"step {i}: red_ok list missing")
+        if "target_fn" not in sp or sp.get("target_fn") in (None, "") or (not isinstance(sp.get("target_fn"), (str, list))):
+            tfn = infer_target_fn(ctx, i, sp)
+            add["target_fn"] = tfn
+            why.append(f"step {i}: target_fn missing (use [] only if the step genuinely has no function)")
+        if sp.get("fn_scope") not in ("warn", "enforce", "fail", "off"):  # "fail" is the runner's name for "enforce" (its default)
+            add["fn_scope"] = "enforce"
+            why.append(f"step {i}: fn_scope must be warn|enforce|fail|off, got {sp.get('fn_scope')!r}")
+        fs = sp.get("fix_steps")
+        if form_steps is not None and not (isinstance(fs, int) and fs >= form_steps):
+            add["fix_steps"] = form_steps
+            why.append(f"step {i}: fix_steps {fs!r} < V6 formula {form_steps}")
+        elif form_steps is None and not isinstance(fs, int):
+            add["fix_steps"] = 30
+            why.append(f"step {i}: fix_steps missing")
+        fw = sp.get("fix_wall")
+        if not (isinstance(fw, int) and fw > 0):
+            add["fix_wall"] = form_wall if form_wall is not None else 20 * add.get("fix_steps", form_steps or 30)
+            why.append(f"step {i}: fix_wall missing")
+        edits += [(base + [k], v) for k, v in add.items()]
+    if why:
+        raise Fail("C4", "; ".join(why) + f" (the spec changes, so rerun mini-validate {ctx.spec_path} after the fix)", patch_cmd(ctx.spec_path, edits))
+    return f"{len(steps)} step(s) have red_ok, target_fn, fn_scope, fix_steps>=formula, fix_wall"
+
+
+def run_runner(ctx, extra):
+    cmd = [sys.executable, str(runner_path()), "--check-only", "--cwd", str(ctx.workdir), "--task-file", str(ctx.spec_path), *extra]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env={**os.environ, "PATH": DAEMON_PATH})
+        return cmd, p.returncode, p.stdout + p.stderr
+    except subprocess.TimeoutExpired:
+        return cmd, 124, "TIMEOUT"
+
+
+def wipe_workdir(ctx):
+    rm_tree_contents(ctx.workdir)
+    for c in ctx.run_dir.iterdir():  # REVIEW*.md, pause files the check-only run left beside work/
+        if c.name != ctx.workdir.name:
+            shutil.rmtree(c, ignore_errors=True) if c.is_dir() else c.unlink(missing_ok=True)
+
+
+def c5(ctx):
+    cmd, rc, out = run_runner(ctx, [])
+    wipe_workdir(ctx)
+    if rc != 0:
+        raise Fail("C5", f"runner --check-only rc={rc}: {out.strip()[-500:]}", " ".join(shlex.quote(c) for c in cmd[:3]) + " --cwd <empty dir> --task-file " + str(ctx.spec_path))
+    return "runner --check-only ok; work dir wiped"
+
+
+def c6(ctx):
+    if not ctx.spec.get("steps"):
+        return "plain spec: skipped"
+    refd = ref_dir(ctx)
+    cmd, rc, out = run_runner(ctx, ["--try-fix-chain", str(refd)])
+    wipe_workdir(ctx)
+    if rc != 0:
+        red = [ln.split("[mini-runner]", 1)[-1].strip() for ln in out.splitlines() if "try-fix-chain" in ln and ("RED" in ln or "REJECTED" in ln or "no reference" in ln)]
+        res = [ln for ln in out.splitlines() if ln.startswith("RESULT")][-1:]
+        raise Fail("C6", "runner-gate suspect: the reference fixes pass mini-validate but fail the real gates with chain context: "
+                   + ("; ".join(red) or "".join(res) or out.strip()[-300:])[:600],
+                   f"{sys.executable} {runner_path()} --check-only --cwd <empty dir> --task-file {ctx.spec_path} --try-fix-chain {refd}"
+                   "  # if the ref is right, the runner gate is wrong: fix mini-swe-runner.py, do not weaken the spec")
+    return "every step GREEN with the refs applied cumulatively"
+
+
+def c7(ctx):
+    why = check_label(ctx.label)
+    if why:
+        raise Fail("C7", why, f"mini-submit {ctx.spec_path} --label <area>-<change>[-<step>] --model {ctx.model}")
+    return f"label {ctx.label}"
+
+
+def family_rows(ctx, rows):
+    """Failure rows of this task family: same task_file (or label), else the same spec-dir family stem."""
+    spec_s = str(ctx.spec_path)
+    exact = [r for r in rows if (r.get("task_file") and str(Path(str(r["task_file"])).resolve()) == spec_s) or r.get("label") == ctx.label]
+    if exact:
+        return exact
+
+    def stem(name):
+        m = re.match(r"^(.*\d)[a-z]$", name)
+        return m.group(1) if m else name
+    mine = stem(ctx.spec_dir.name)
+    return [r for r in rows if r.get("task_file") and stem(Path(str(r["task_file"])).resolve().parent.name) == mine]
+
+
+def c8(ctx):
+    sys.path.insert(0, str(HERE))
+    import failure_ledger as FL
+    fam = family_rows(ctx, FL.load_rows())
+    fam.sort(key=lambda r: str(r.get("ts") or ""))
+    if not fam:
+        return "no prior failures of this family"
+    budget = FL.budget_failures(fam)
+    triage = ctx.spec_dir / "TRIAGE.md"
+    tri = Path(os.environ.get("MINI_TRIAGE") or HERE / "mini-triage")
+    if budget:
+        if not triage.is_file():
+            latest = budget[-1].get("job_id")
+            raise Fail("C8", f"{len(budget)} prior failed run(s) of this family ({', '.join(str(r.get('job_id')) for r in budget[-4:])}) "
+                       f"and no TRIAGE.md in {ctx.spec_dir}: classify the failure before relaunching",
+                       f"{tri} {latest} --write {ctx.spec_dir}")
+        return f"{len(budget)} prior failure(s), TRIAGE.md present"
+    if not triage.is_file():  # only pipeline/infra failures: auto-triage and continue
+        latest = fam[-1].get("job_id")
+        p = subprocess.run([sys.executable, str(tri), str(latest), "--write", str(ctx.spec_dir)], capture_output=True, text=True)
+        if not triage.is_file():
+            triage.write_text(f"# TRIAGE\n\nPrior failures of this task family were all runner/infra (auto-written by mini-submit): "
+                              f"{', '.join(str(r.get('job_id')) for r in fam)}.\n")
+        return f"{len(fam)} infra-only prior failure(s): TRIAGE.md auto-written (mini-triage rc={p.returncode})"
+    return f"{len(fam)} infra-only prior failure(s), TRIAGE.md present"
+
+
+CHECKS = [("C0", c0), ("C1", c1), ("C2", c2), ("C3", c3), ("C4", c4), ("C5", c5), ("C6", c6), ("C7", c7), ("C8", c8)]
+
+
+# ---------------------------------------------------------------------------------------------------- main
+def graph_warning(steps):
+    """One-line WARNING (or '') when the repo's graphify graph is missing/stale for the steps' allowed files. Warn only, never blocks,
+    never runs graphify. MINI_GRAPH_WARN=off silences. Locates the graph like the runner (git common dir of baseline_from, spec `graph`)."""
+    if os.environ.get("MINI_GRAPH_WARN", "").strip().lower() in ("off", "0", "no", "false"):
+        return ""
+    try:
+        spec_mod = importlib.util.spec_from_file_location("mini_graph", HERE / "mini_graph.py")
+        mg = importlib.util.module_from_spec(spec_mod)
+        spec_mod.loader.exec_module(mg)
+        out = []
+        for sp in steps:
+            bf = Path(os.path.expanduser(str(sp.get("baseline_from") or "")))
+            files = [f for f in (sp.get("allowed") or []) if isinstance(f, str)]
+            if not bf.is_dir() or not files:
+                continue
+            gp = mg.locate_graph(bf, sp.get("graph"))
+            G = mg.load(gp) if gp else None
+            top = mg._git(bf, "rev-parse", "--show-toplevel").stdout.strip() or str(bf)
+            w = mg.submit_warning(G, bf, files, wtroot=top if not G else str(gp.parent.parent))
+            if w and w not in out:
+                out.append(w)
+        return " | ".join(out)
+    except Exception:  # noqa: BLE001  advisory only: never break a submit
+        return ""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
+    ap.add_argument("spec", nargs="?")
+    ap.add_argument("--task-file", dest="task_file")
+    ap.add_argument("--label", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--override", metavar="REASON")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--cwd")
+    ap.add_argument("--runner")
+    ap.add_argument("--skip-validation")
+    a, rest = ap.parse_known_args(argv)
+    if a.cwd is not None:
+        print("mini-submit: takes no --cwd (it creates its own empty work dir under ~/.ollama-dispatch/mini-work)", file=sys.stderr)
+        return 2
+    if a.skip_validation is not None:
+        print("mini-submit: --skip-validation is gone (C3 is not overridable): run mini-validate SPEC", file=sys.stderr)
+        return 2
+    if a.runner and os.path.basename(a.runner) != "mini-swe-runner.py":
+        print(f"mini-submit: only the mini-swe runner goes through mini-submit, not {a.runner}", file=sys.stderr)
+        return 2
+    spec_arg = a.spec or a.task_file
+    if not spec_arg or (a.spec and a.task_file and a.spec != a.task_file):
+        print("mini-submit: need exactly one SPEC.json (positional or --task-file)", file=sys.stderr)
+        return 2
+    if a.override is not None and not a.override.strip():
+        print("mini-submit: --override needs a non-empty REASON", file=sys.stderr)
+        return 2
+    ctx = Ctx()
+    ctx.spec_path = Path(os.path.expanduser(spec_arg)).resolve()
+    ctx.spec_dir = ctx.spec_path.parent
+    # reject a model Darkbloom does not serve; resolve aliases to the served id (2026-10-25 stall)
+    _vm, _merr = vet_submit_model(a.model)
+    if _merr:
+        print(f"mini-submit: {_merr}", file=sys.stderr)
+        return 2
+    a.model = _vm
+    ctx.label, ctx.model, ctx.R, ctx.spec = a.label, a.model, None, {}
+    if not ctx.spec_path.is_file():
+        print(f"mini-submit: spec not found: {ctx.spec_path}", file=sys.stderr)
+        return 2
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", a.label)[:60] or "job"
+    stamp = f"{safe}-{time.strftime('%Y%m%d%H%M%S')}"
+    ctx.run_dir, k = home_dir() / "mini-work" / stamp, 2
+    while ctx.run_dir.exists():  # the same label twice in one second (bench batches, test T6/T7) would collide at C2
+        ctx.run_dir, k = home_dir() / "mini-work" / f"{stamp}-{k}", k + 1
+    ctx.workdir = ctx.run_dir / "work"
+    ctx.checks, created = [], False
+    try:
+        for cid, fn in CHECKS:
+            if a.override and cid in OVERRIDABLE:
+                ctx.checks.append({"id": cid, "status": "overridden", "note": a.override})
+                print(f"mini-submit: {cid} SKIPPED (override: {a.override})")
+                continue
+            try:
+                note = fn(ctx)
+            except Fail as f:
+                print(f"mini-submit: FAIL {f.cid} {f.reason}")
+                if f.fix:
+                    print(f"  fix: {f.fix}")
+                return 1
+            ctx.checks.append({"id": cid, "status": "ok", "note": note})
+            print(f"mini-submit: {cid} ok {note}")
+            if cid == "C2":
+                try:
+                    ctx.workdir.mkdir(parents=True, exist_ok=False)
+                    created = True
+                except OSError as e:
+                    print(f"mini-submit: FAIL C2 cannot create work dir {ctx.workdir}: {e}")
+                    return 1
+        _gw = graph_warning(spec_steps(ctx))
+        if _gw:
+            print("mini-submit: " + _gw)
+        enq = [sys.executable, str(Path(os.environ.get("MINI_SUBMIT_QUEUE") or HERE / "ollama-queue.py")), "enqueue",
+               "--runner", str(runner_path()), "--cwd", str(ctx.workdir), "--task-file", str(ctx.spec_path),
+               "--label", a.label, "--model", a.model]
+        for flag, val in (("--host", "auto"), ("--task-kind", "coding"), ("--allow-no-verify", None), ("--allow-unisolated", None)):
+            if flag not in rest and not any(x.startswith(flag + "=") for x in rest):
+                enq += [flag] + ([val] if val else [])
+        enq += rest
+        if a.dry_run:
+            print("mini-submit: DRY-RUN ok; would run: " + " ".join(shlex.quote(c) for c in enq))
+            return 0
+        override = {"reason": a.override, "skipped": [c["id"] for c in ctx.checks if c["status"] == "overridden"]} if a.override else None
+        rp = MR.write_receipt(ctx.spec_path, ctx.workdir, runner_path(), a.label, ctx.checks, override=override)
+        if override:
+            with open(home_dir() / "mini-overrides.jsonl", "a") as f:
+                f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "label": a.label, "spec": str(ctx.spec_path), **override}) + "\n")
+        print(f"mini-submit: OK receipt {rp}")
+        print(f"run_dir: {ctx.run_dir}")
+        print(f"workdir: {ctx.workdir}")
+        p = subprocess.run(enq, capture_output=True, text=True)
+        out = (p.stdout + ("" if not p.stderr else "\n" + p.stderr)).strip()
+        print(out)
+        if p.returncode != 0:
+            print(f"mini-submit: enqueue failed rc={p.returncode}")
+            return p.returncode
+        created = False  # the queue owns the work dir now
+        m = re.search(r'"id":\s*"([0-9a-f]{6,})"', out) or re.search(r"\b([0-9a-f]{10,})\b", out)
+        print("job_id: " + (m.group(1) if m else out.splitlines()[-1] if out else ""))
+        return 0
+    finally:
+        if created or (a.dry_run and ctx.run_dir.exists()):
+            shutil.rmtree(ctx.run_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

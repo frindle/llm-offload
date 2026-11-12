@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""mini-bench [--only a,b] [--runid X] [--dry-run] [--list]   -- regression bench for the local mini-swe runner
+
+Fixtures live in ~/bin/bench/mini/<task>/ as plain directories (src/, TASK.md [TASK-s2.md ...], spec.tmpl.json, expect), never
+nested git repos. For each task:
+  setup    copy the tree (minus TASK*.md, spec.tmpl.json, expect) to ~/.ollama-dispatch/bench-fixtures/<runid>/<task>, git init + commit
+  spec     mini-spec WORKTREE TASK.md --name bench-<runid>-<task> <spec.tmpl.json args>; the fixture's final TASK*.md replace the drafts
+  lint     mini-spec --lint (no TODO markers, intake class == spec.tmpl.json "intake")
+  check    runner --check-only, then --check-only --probe (PROBE ok): the fixture itself is sound, no model
+  enqueue  (NOT with --dry-run) mini-submit spec.json --label bench-<runid>-<task> --bundle bench-<runid>
+  collect  poll `ollama-queue.py status`, parse the last RESULT line of the job log (parse_runner_result from ollama-queue.py)
+  report   ~/.ollama-dispatch/mini-bench/<runid>.json + a RESULT-class table, then `qctl retire bench-<runid> --reason bench`
+
+--dry-run stops after check (nothing is enqueued, no GPU time): fixtures, runs and the report go to a temp dir. A real run takes
+~10-25 min per task (~3-4 h for all ten, ~1 h for a 3-task --only smoke) of GPU queue time, so it needs the owner's OK.
+Per task and per phase/attempt the report records wall, steps, peak and summed prompt tokens and exit_status, read from the trajectory
+timestamps (traj_stats). Target: median job <= 15 min, p90 <= 25 min on the small-fix fixtures, pass rate not below baseline minus 1 task;
+compare old vs new overlay with the same --only set, n=2 per arm (docs/mini-swe-agent.md "Speed target and bench compare").
+"Accepted first try" = PASS with only A1/B1 trajectory files (no phase retry). Run it after ANY runner change (docs/mini-swe-agent.md).
+Exit: 0 = every task fine (dry-run: all fixtures sound; real: all matched `expect`), 1 otherwise, 2 = bad usage.
+"""
+import argparse
+import types
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+BIN = Path(os.path.realpath(__file__)).parent
+FIXTURES = BIN / "bench/mini"
+QUEUE = BIN / "ollama-queue.py"
+QCTL = BIN / "qctl"
+RUNNER = BIN / "mini-swe-runner.py"
+MODEL = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+LIVE = ("running", "queued", "pending", "scheduled", "held", "planned", "paused")
+GIT_ENV = {"GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost", "GIT_COMMITTER_NAME": "bench", "GIT_COMMITTER_EMAIL": "bench@localhost"}
+SKIP = ("spec.tmpl.json", "expect")
+
+
+def load(path, name):
+    ld = importlib.machinery.SourceFileLoader(name, str(path))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ld))
+    ld.exec_module(m)
+    return m
+
+
+def tasks_all():
+    return sorted(p.name for p in FIXTURES.iterdir() if (p / "spec.tmpl.json").is_file()) if FIXTURES.is_dir() else []
+
+
+def setup(task, root):
+    """Copy the fixture's code tree to root/<task>, git init + commit. Returns the path."""
+    src, dst = FIXTURES / task, Path(root) / task
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, ignore=lambda d, names: [n for n in names if Path(d) == src and (n in SKIP or n.startswith("TASK"))])
+    env = {**os.environ, **GIT_ENV}
+    for c in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "bench fixture"]):
+        subprocess.run(["git", *c], cwd=dst, check=True, capture_output=True, env=env)
+    return dst
+
+
+def build_run(task, runid, wt, runs, ms):
+    """mini-spec the fixture; the fixture's TASK*.md (final contracts) replace the drafts. Returns (run dir, problems)."""
+    tmpl = json.loads((FIXTURES / task / "spec.tmpl.json").read_text())
+    name = f"bench-{runid}-{task}"
+    r = subprocess.run([sys.executable, str(BIN / "mini-spec"), str(wt), str(FIXTURES / task / "TASK.md"), "--name", name, "--runs-dir", str(runs), *tmpl["args"]],
+                       capture_output=True, text=True)
+    rd = Path(runs) / name
+    if not (rd / "spec.json").is_file():
+        return rd, [f"mini-spec wrote no run dir (rc={r.returncode}): " + (r.stdout + r.stderr).strip()[-400:]]
+    for t in sorted((FIXTURES / task).glob("TASK*.md")):
+        (rd / t.name).write_text(t.read_text())
+    spec = json.loads((rd / "spec.json").read_text())
+    bad = []
+    got = (spec.get("intake") or {}).get("class")
+    if got != tmpl.get("intake", "local-ready"):
+        bad.append(f"intake class is {got}, fixture says {tmpl.get('intake', 'local-ready')}")
+    n = len(spec.get("steps") or [1])
+    if n != tmpl.get("steps", 1):
+        bad.append(f"{n} step(s), fixture says {tmpl.get('steps', 1)}")
+    return rd, bad
+
+
+def check_fixture(task, runid, root, runs, ms):
+    """setup + spec + lint + runner check + probe. Returns {lint, check, probe, problems}."""
+    out = {"lint": None, "check": None, "probe": None, "problems": []}
+    wt = setup(task, root)
+    rd, bad = build_run(task, runid, wt, runs, ms)
+    out["run_dir"] = str(rd)
+    out["problems"] += bad
+    if not (rd / "spec.json").is_file():
+        return out
+    lr = subprocess.run([sys.executable, str(BIN / "mini-spec"), "--lint", str(rd)], capture_output=True, text=True)
+    out["lint"] = "ok" if lr.returncode == 0 else "FAIL"
+    if lr.returncode:
+        out["problems"].append("lint: " + (lr.stdout + lr.stderr).strip()[-300:])
+        return out
+    crc, cout = ms.check_only(rd)
+    out["check"] = "ok" if crc == 0 else "FAIL"
+    if crc:
+        out["problems"].append("check-only: " + cout.strip()[-300:])
+        return out
+    prc, plines = ms.probe(rd)
+    out["probe"] = "ok" if prc == 0 else "FAIL"
+    out["probe_lines"] = plines
+    if prc:
+        out["problems"] += plines
+    return out
+
+
+def parse_status(text):
+    """{label: (state, job id)} from `ollama-queue.py status`."""
+    rows = {}
+    for m in re.finditer(r"^\[([a-z_]+)\s*\]\s+([0-9a-f]{6,})\s+(\S+)", text, re.M):
+        rows[m.group(3)] = (m.group(1), m.group(2))
+    return rows
+
+
+def enqueue_cmd(task, runid, rd, model):
+    """mini-submit (checks C0-C8, fresh workdir, SUBMIT-OK.json) owns --cwd/--runner/--host/--task-kind; the rest passes through to enqueue."""
+    return [sys.executable, str(BIN / "mini-submit"), str(Path(rd) / "spec.json"), "--label", f"bench-{runid}-{task}", "--model", model,
+            "--num-ctx", "131072", "--bundle", f"bench-{runid}"]
+
+
+def job_result(job_id, qmod):
+    """Last RESULT line of the job's log -> (verdict, failure_class, reason) via ollama-queue.parse_runner_result, else None."""
+    for p in sorted(Path(BIN / "ollama-queue-livelogs").glob(f"{job_id}*")) + sorted(Path(BIN / "ollama-queue-logs").glob(f"{job_id}*")):
+        if p.suffix == ".json":
+            continue
+        try:
+            r = qmod.parse_runner_result(p.read_text(errors="replace")[-200000:])
+        except OSError:
+            continue
+        if r:
+            return r
+    return None
+
+
+def accepted_first_try(rd, verdict):
+    names = [p.name for p in Path(rd).glob("*.traj.json")]
+    return verdict == "PASS" and bool(names) and all(re.search(r"\.(?:s\d+)?[AB]1\.traj\.json$", n) for n in names)
+
+
+TRAJ_RE = re.compile(r"\.(s\d+)?([AB])(\d+)\.traj\.json$")
+
+
+def traj_stats(rd):
+    """Per trajectory in a run dir -> {attempts: [{name, phase, attempt, wall_s, steps, peak_prompt, sum_prompt, exit_status}], wall_s, steps,
+    peak_prompt, sum_prompt}. wall = last minus first message timestamp (the first reply's prefill is not counted), job wall = first
+    to last timestamp over all of the job's trajectories. Unreadable files are skipped."""
+    att, lo, hi = [], None, None
+    for p in sorted(Path(rd).glob("*.traj.json")):
+        m = TRAJ_RE.search(p.name)
+        try:
+            t = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        msgs = t.get("messages", [])
+        ts = [x["extra"]["timestamp"] for x in msgs if isinstance(x.get("extra"), dict) and isinstance(x["extra"].get("timestamp"), (int, float))]
+        pt = [((x["extra"].get("response") or {}).get("usage") or {}).get("prompt_tokens") or 0 for x in msgs
+              if x.get("role") == "assistant" and isinstance(x.get("extra"), dict) and isinstance(x["extra"].get("response"), dict)]
+        ex = next((x["extra"].get("exit_status") for x in reversed(msgs) if x.get("role") == "exit" and isinstance(x.get("extra"), dict)), None)
+        att.append({"name": p.name, "phase": m.group(2) if m else "?", "attempt": int(m.group(3)) if m else 0, "step": m.group(1) if m and m.group(1) else "",
+                    "wall_s": round(max(ts) - min(ts), 1) if ts else 0.0, "steps": len(pt), "peak_prompt": max(pt, default=0), "sum_prompt": sum(pt),
+                    "exit_status": ex or (t.get("info") or {}).get("exit_status") or "?", "t0": min(ts) if ts else None, "t1": max(ts) if ts else None})
+        if ts:
+            lo, hi = min(ts) if lo is None else min(lo, min(ts)), max(ts) if hi is None else max(hi, max(ts))
+    att.sort(key=lambda a: (a["t0"] or 0))
+    for a in att:
+        a.pop("t0"), a.pop("t1")
+    return {"attempts": att, "wall_s": round(hi - lo, 1) if lo is not None else 0.0, "steps": sum(a["steps"] for a in att),
+            "peak_prompt": max((a["peak_prompt"] for a in att), default=0), "sum_prompt": sum(a["sum_prompt"] for a in att)}
+
+
+def pctl(vals, q):
+    """Nearest-rank percentile (q in 0-100) of a list; None when empty."""
+    v = sorted(vals)
+    return v[min(len(v) - 1, max(0, -(-len(v) * q // 100) - 1))] if v else None
+
+
+def speed_summary(walls):
+    """Median / p90 job wall in minutes against the target (median <= 15, p90 <= 25)."""
+    med, p90 = pctl(walls, 50), pctl(walls, 90)
+    if med is None:
+        return {"jobs": 0}
+    return {"jobs": len(walls), "median_min": round(med / 60, 1), "p90_min": round(p90 / 60, 1), "target_met": med <= 900 and p90 <= 1500}
+
+
+def result_class(verdict, cls):
+    if verdict is None:
+        return "NO-RESULT"
+    return "PASS" if verdict == "PASS" else f"FAIL-{(cls or 'model').upper()}"
+
+
+def table(rows):
+    cols = ("task", "lint", "probe", "class", "first-try", "wall", "steps", "peak-prompt", "sum-prompt", "exit", "result")
+    w = [max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in cols]
+    line = lambda r: "  ".join(str(r.get(c, "")).ljust(w[i]) for i, c in enumerate(cols))
+    return "\n".join([line({c: c for c in cols}), *map(line, rows)])
+
+
+def stat_cells(st):
+    if not st or not st["attempts"]:
+        return {c: "-" for c in ("wall", "steps", "peak-prompt", "sum-prompt", "exit")}
+    return {"wall": f"{st['wall_s'] / 60:.1f}m", "steps": st["steps"], "peak-prompt": st["peak_prompt"], "sum-prompt": st["sum_prompt"],
+            "exit": ",".join(dict.fromkeys(a["exit_status"] for a in st["attempts"]))}
+
+
+def attempt_table(tasks):
+    """One line per phase/attempt of every finished task."""
+    out = ["task  attempt  wall  steps  peak-prompt  sum-prompt  exit_status"]
+    for t, r in tasks.items():
+        for a in (r.get("stats") or {}).get("attempts", []):
+            out.append(f"{t}  {a['step']}{a['phase']}{a['attempt']}  {a['wall_s'] / 60:.1f}m  {a['steps']}  {a['peak_prompt']}  {a['sum_prompt']}  {a['exit_status']}")
+    return "\n".join(out) if len(out) > 1 else ""
+
+
+def finish_bench(runid, run=subprocess.run, out=lambda m: print(m, flush=True)):
+    """Always-run cleanup of a bench: cancel (forcefully, `cancel --force` also stops a running one) every still-live
+    `bench-RUNID-*` job, then `qctl retire bench-RUNID`, printing each exit code and output. Runs on Ctrl-C, errors and
+    --max-wait timeouts. `run` is injectable for the self-test. Returns the retire exit code."""
+    try:
+        st = parse_status(run([sys.executable, str(QUEUE), "status"], capture_output=True, text=True).stdout)
+    except (OSError, KeyboardInterrupt) as e:
+        out(f"[mini-bench] cleanup: queue status failed ({e!r}); retiring anyway")
+        st = {}
+    for lab, (state, jid) in sorted(st.items()):
+        if lab.startswith(f"bench-{runid}-") and state in LIVE:
+            c = run([sys.executable, str(QUEUE), "cancel", "--force", jid], capture_output=True, text=True)
+            out(f"[mini-bench] cancel {lab} ({state}, job {jid}): rc={c.returncode} {(c.stdout + c.stderr).strip()[-200:]}")
+    r = run([str(QCTL), "retire", f"bench-{runid}", "--reason", "bench"], capture_output=True, text=True)
+    out(f"[mini-bench] qctl retire bench-{runid}: rc={r.returncode} {(r.stdout + r.stderr).strip()[-400:]}")
+    return r.returncode
+
+
+def self_test():
+    st = parse_status("[running ] b9b199091173  bench-x-a   m  host=h pid=1\n[failed  ] 7130ec317dab  bench-x-b  m host=h  exit=1\nunraid: IDLE\n")
+    assert st == {"bench-x-a": ("running", "b9b199091173"), "bench-x-b": ("failed", "7130ec317dab")}, st
+    st = parse_status("[done_unconverged] aaaaaaaaaaaa bench-x-c m host=h\n[needs_opus] bbbbbbbbbbbb bench-x-d m host=h\n")
+    assert st == {"bench-x-c": ("done_unconverged", "aaaaaaaaaaaa"), "bench-x-d": ("needs_opus", "bbbbbbbbbbbb")}, st
+    assert "done_unconverged" not in LIVE and "needs_opus" not in LIVE
+    # cleanup (Ctrl-C / timeout): live jobs of this bench are cancelled, then retire runs and its rc/output is reported
+    calls, said = [], []
+
+    def fake(cmd, **kw):
+        calls.append([Path(str(c)).name for c in cmd[1:]][1 if str(cmd[0]).endswith("python3") or cmd[0] == sys.executable else 0:])
+        txt = ("[running ] b9b199091173  bench-r1-a  m  host=h pid=1\n[queued  ] c9b199091173  bench-r1-b  m host=h\n"
+               "[failed  ] 7130ec317dab  bench-r1-c  m host=h\n[running ] d9b199091173  bench-other-z  m host=h\n")
+        return types.SimpleNamespace(returncode=3 if cmd[1] == "retire" else 0, stdout=txt if cmd[-1] == "status" else "ok", stderr="")
+    rc = finish_bench("r1", run=fake, out=said.append)
+    assert rc == 3 and ["cancel", "--force", "b9b199091173"] in calls and ["cancel", "--force", "c9b199091173"] in calls, calls
+    assert not any(c[-1] in ("7130ec317dab", "d9b199091173") for c in calls if c[0] == "cancel"), calls
+    assert calls[-1][:2] == ["retire", "bench-r1"] and any("retire bench-r1: rc=3" in m for m in said), (calls, said)
+    with tempfile.TemporaryDirectory() as d:
+        for n in ("work.A1.traj.json", "work.B1.traj.json"):
+            Path(d, n).write_text("{}")
+        assert accepted_first_try(d, "PASS") and not accepted_first_try(d, "FAIL (x)")
+        Path(d, "work.B2.traj.json").write_text("{}")
+        assert not accepted_first_try(d, "PASS")
+        c = Path(d, "c")
+        c.mkdir()
+        Path(c, "work.s2A1.traj.json").write_text("{}")
+        assert accepted_first_try(c, "PASS")
+    assert result_class("PASS", None) == "PASS" and result_class("FAIL (x)", "spec") == "FAIL-SPEC" and result_class(None, None) == "NO-RESULT"
+    with tempfile.TemporaryDirectory() as d:  # trajectory stats from timestamps
+        def traj(name, t0, steps, status, base=0):
+            msgs = [{"role": "system", "content": "s"}]
+            for i, (pt, dt) in enumerate(steps):
+                msgs.append({"role": "assistant", "extra": {"response": {"usage": {"prompt_tokens": pt}}, "timestamp": t0 + dt}})
+                msgs.append({"role": "tool", "extra": {"timestamp": t0 + dt + 1}})
+            msgs.append({"role": "exit", "extra": {"exit_status": status}})
+            Path(d, name).write_text(json.dumps({"messages": msgs, "info": {"exit_status": status}}))
+        traj("work.A1.traj.json", 1000, [(1000, 10), (2000, 70)], "LimitsExceeded")
+        traj("work.B1.traj.json", 1200, [(3000, 20), (5000, 100), (4000, 200)], "Submitted")
+        Path(d, "work.B2.traj.json").write_text("{not json")
+        st = traj_stats(d)
+        assert [(a["phase"], a["attempt"], a["steps"], a["wall_s"], a["peak_prompt"], a["sum_prompt"], a["exit_status"]) for a in st["attempts"]] == [
+            ("A", 1, 2, 61.0, 2000, 3000, "LimitsExceeded"), ("B", 1, 3, 181.0, 5000, 12000, "Submitted")], st
+        assert st["wall_s"] == 391.0 and st["steps"] == 5 and st["peak_prompt"] == 5000 and st["sum_prompt"] == 15000, st
+        assert stat_cells(st)["wall"] == "6.5m" and "A1" in attempt_table({"t": {"stats": st}}) and stat_cells(None)["wall"] == "-"
+    assert pctl([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 50) == 5 and pctl([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90) == 9 and pctl([], 50) is None
+    assert speed_summary([600, 800, 1400]) == {"jobs": 3, "median_min": 13.3, "p90_min": 23.3, "target_met": True}
+    assert speed_summary([1000, 2000])["target_met"] is False and speed_summary([]) == {"jobs": 0}
+    qmod = load(QUEUE, "ollama_queue")
+    assert qmod.parse_runner_result("noise\nRESULT FAIL step-1 bad-spec x\nRESULT PASS mode=two-phase\n")[0] == "PASS"
+    assert set(tasks_all()) >= {"text-truncate", "chain-2step", "greenfield-esm"} and len(tasks_all()) == 11, tasks_all()
+    print("mini-bench self-test ok")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--only", help="comma-separated task names (default: all)")
+    ap.add_argument("--runid", help="default: UTC timestamp")
+    ap.add_argument("--dry-run", action="store_true", help="setup + spec + lint + check + probe only; nothing enqueued (temp dirs)")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--self-test", action="store_true", help="pure helpers only (no fixtures built, no queue calls)")
+    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--poll", type=int, default=60, help="seconds between queue polls")
+    ap.add_argument("--max-wait", type=int, default=8 * 3600, help="give up collecting after this many seconds")
+    ap.add_argument("--out-dir", help="report dir (default ~/.ollama-dispatch/mini-bench; a temp dir with --dry-run)")
+    a = ap.parse_args(argv)
+    if a.self_test:
+        return self_test()
+    names = tasks_all()
+    if a.list:
+        print("\n".join(names))
+        return 0
+    if a.only:
+        want = [x.strip() for x in a.only.split(",") if x.strip()]
+        unknown = [x for x in want if x not in names]
+        if unknown:
+            print(f"mini-bench: unknown task(s) {unknown}; have {names}", file=sys.stderr)
+            return 2
+        names = want
+    if not names:
+        print(f"mini-bench: no fixtures in {FIXTURES}", file=sys.stderr)
+        return 2
+    runid = a.runid or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", runid):
+        print("mini-bench: --runid must be [A-Za-z0-9._-]", file=sys.stderr)
+        return 2
+    ms = load(BIN / "mini-spec", "mini_spec")
+    scratch = Path(tempfile.mkdtemp(prefix="mini-bench-")) if a.dry_run else None
+    root = (scratch / "fixtures" / runid) if a.dry_run else HOME / ".ollama-dispatch/bench-fixtures" / runid
+    runs = (scratch / "runs") if a.dry_run else HOME / ".ollama-dispatch/mini-runs"
+    out_dir = Path(a.out_dir) if a.out_dir else (scratch / "report" if a.dry_run else HOME / ".ollama-dispatch/mini-bench")
+    root.mkdir(parents=True, exist_ok=True)
+    runs.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {"runid": runid, "dry_run": a.dry_run, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "tasks": {}}
+    for t in names:
+        print(f"[mini-bench] {t}: setup/spec/lint/check/probe", flush=True)
+        r = check_fixture(t, runid, root, runs, ms)
+        report["tasks"][t] = r
+        print(f"[mini-bench] {t}: lint={r['lint']} check={r['check']} probe={r['probe']}" + ("".join(f"\n    {p}" for p in r["problems"])), flush=True)
+    sound = [t for t in names if not report["tasks"][t]["problems"]]
+    rows = []
+    if a.dry_run:
+        for t in names:
+            r = report["tasks"][t]
+            rows.append({"task": t, "lint": r["lint"], "probe": r["probe"], "class": "FIXTURE-OK" if not r["problems"] else "FIXTURE-BAD", "first-try": "-", **stat_cells(None), "result": "dry-run: not enqueued"})
+            if t in sound and t == next(x for x in names if x in sound):
+                print("[mini-bench] would enqueue (one line per task, first shown): " + " ".join(enqueue_cmd(t, runid, r["run_dir"], a.model)), flush=True)
+    else:
+        try:
+            qmod = load(QUEUE, "ollama_queue")
+            for t in sound:
+                r = report["tasks"][t]
+                p = subprocess.run(enqueue_cmd(t, runid, r["run_dir"], a.model), capture_output=True, text=True)
+                r["enqueue_rc"] = p.returncode
+                m = re.search(r"^run_dir:\s*(\S.*)$", p.stdout, re.M)
+                if m and not p.returncode:
+                    r["run_dir"] = m.group(1).strip()  # mini-submit's fresh <label>-<ts>/ dir: REVIEW*/traj files land here
+                if p.returncode:
+                    r["problems"].append("enqueue: " + (p.stdout + p.stderr).strip()[-300:])
+                print(f"[mini-bench] {t}: enqueue rc={p.returncode}", flush=True)
+            pend = {f"bench-{runid}-{t}": t for t in sound if not report["tasks"][t].get("enqueue_rc")}
+            t0 = time.time()
+            done = {}
+            while pend and time.time() - t0 < a.max_wait:
+                st = parse_status(subprocess.run([sys.executable, str(QUEUE), "status"], capture_output=True, text=True).stdout)
+                for lab, t in list(pend.items()):
+                    if lab in st and st[lab][0] not in LIVE:
+                        done[t] = st[lab]
+                        del pend[lab]
+                        print(f"[mini-bench] {t}: finished ({st[lab][0]}, job {st[lab][1]})", flush=True)
+                if pend:
+                    time.sleep(a.poll)
+            for t in names:
+                r = report["tasks"][t]
+                if t in done:
+                    state, jid = done[t]
+                    res = job_result(jid, qmod)
+                    verdict, cls, reason = res if res else (None, None, "")
+                    r.update(job=jid, state=state, verdict=verdict, failure_class=cls, reason=reason, result_class=result_class(verdict, cls),
+                             first_try=accepted_first_try(r["run_dir"], verdict), stats=traj_stats(r["run_dir"]))
+                elif t in pend.values():
+                    r.update(result_class="NO-RESULT", reason="still running at --max-wait")
+                exp = (FIXTURES / t / "expect").read_text().split()[0] if (FIXTURES / t / "expect").is_file() else "PASS"
+                r["expected"] = exp
+                rows.append({"task": t, "lint": r["lint"], "probe": r["probe"], "class": r.get("result_class") or "FIXTURE-BAD",
+                             "first-try": "yes" if r.get("first_try") else "no", **stat_cells(r.get("stats")),
+                             "result": (r.get("reason") or r.get("state") or "")[:60]})
+        finally:
+            finish_bench(runid)
+    report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    report["speed"] = speed_summary([r["stats"]["wall_s"] for r in report["tasks"].values() if (r.get("stats") or {}).get("attempts")])
+    rp = out_dir / f"{runid}.json"
+    rp.write_text(json.dumps(report, indent=1) + "\n")
+    print("\n" + table(rows))
+    if attempt_table(report["tasks"]):
+        print("\n" + attempt_table(report["tasks"]))
+    if report["speed"].get("jobs"):
+        print(f"\nspeed: {report['speed']} (target: median <= 15 min, p90 <= 25 min)")
+    print(f"\nreport: {rp}")
+    if a.dry_run:
+        print(f"(dry-run: nothing enqueued; scratch dir {scratch})")
+        return 0 if len(sound) == len(names) else 1
+    ok = all(report["tasks"][t].get("result_class") == "PASS" for t in names if (FIXTURES / t / "expect").read_text().split()[0] == "PASS")
+    return 0 if ok and len(sound) == len(names) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

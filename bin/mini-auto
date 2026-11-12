@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""mini-auto: hand a bug to the local model from a description alone (the runner's mode "auto").
+
+  mini-auto new --repo REPO [--base REF] --name NAME [--file F]... [--fn X] [--locate RE]... [--diagnose always|skip]
+                [--timeout S] [--remote [--remote-python 3.11|3.12|3.13] [--deps-lock P] [--remote-max-calls N]]
+                (DESCRIPTION | --desc-file PATH|-) [--submit [--model M] [--label L] [--dry-run]]
+      A fresh worktree of REPO at REF (default HEAD; mini-spec's make_worktree: branch dispatch/NAME under ~/dispatch-worktrees),
+      a run dir <runs>/NAME with TASK.md (the description, as the reporter would write it) and spec.json (mode auto), then with
+      --submit: mini-submit (all its checks, receipt, enqueue). --worktree WT uses an existing CLEAN worktree root instead.
+      --file/--fn are optional leads (the diagnosis confirms them); --diagnose skip (needs one --file and --fn) goes straight to
+      the test + fix. The local model then: diagnoses (DIAGNOSIS.md, diag_check), writes the failing test (phase A, frozen),
+      fixes the code (phase B, gates: test green, suite, typecheck, fn scope, advisory mutation score). Every pass is reviewed
+      by Claude: the queue event carries `review=~/bin/mini-scorecard review brief <id>`, which prints the packet inline.
+      --remote: the project's code (its tests, the gates) runs on a dispatch-cpu-runner, never on this Mac (third-party
+      code); the model still runs here, through the queue's relay. The runner builds the project venv for --remote-python
+      (default 3.12) from --deps-lock (pinned `name==version` lines, installed without resolution; else `-e . pytest`,
+      resolved there); --remote-max-calls caps the job's model calls (default 1500). Only the job's own files come back
+      into the work dir. A remote job that fails is fixed directly from its REVIEW-AUTO.md (mini-finish would run its tests
+      here, so it refuses one).
+  mini-auto review JOB ok|reject [--note TXT] [--into DIR] [--dry-run]
+      The reviewer's one step for a passed auto job (its queue event prints the packet inline): records the verdict
+      (`mini-scorecard review add --kind auto`; a reject needs --note) and, on ok, lands it as `land` does. A reject lands nothing.
+  mini-auto land JOB [--into DIR] [--dry-run]
+      After `mini-scorecard review add --job JOB --verdict ok` (or a `mini-finish JOB --check` PASS): copies the new test,
+      the fixed file and each existing test the fix updated (spec update_tests, checked by gate update_flip) from the job's
+      work dir into the repo checkout the job came from (or --into DIR), each only when the checkout's copy is still the one
+      the job started from. Nothing is committed. Refuses a job that neither passed with an ok verdict nor was finished, and
+      a finished job whose files changed after the check.
+  mini-auto show JOB
+      The job's result line, target, test and diff stat, and the packet path.
+
+Must-not-offload areas (money, auth, secrets, migrations, the offload gates) are refused by mini-submit C3 and by the runner.
+Env: MINI_RUNS (run dirs, default ~/.ollama-dispatch/mini-runs), MINI_WT_ROOT (worktrees), MINI_AUTO_MODEL (default model),
+MINI_AUTO_SUBMIT (the mini-submit command), OFFLOAD_QUEUE_LOGS / OFFLOAD_HOME (job records and reviews, as mini-scorecard).
+Kill switch: MINI_AUTO=off (mini-submit refuses auto specs).
+"""
+import argparse
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+RUNS = Path(os.environ.get("MINI_RUNS") or Path.home() / ".ollama-dispatch/mini-runs")
+QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or os.path.expanduser("~/bin/ollama-queue-logs"))
+OHOME = Path(os.environ.get("OFFLOAD_HOME") or os.path.expanduser("~/.ollama-dispatch"))
+MODEL = os.environ.get("MINI_AUTO_MODEL") or "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def die(msg, rc=1):
+    print(f"mini-auto: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def git(d, *a, check=False):
+    p = subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True, timeout=120)
+    if check and p.returncode:
+        die(f"git {' '.join(a)} in {d} failed: {p.stderr.strip()[-200:]}")
+    return p
+
+
+def load(name, path):
+    ld = SourceFileLoader(name, str(path))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ld))
+    ld.exec_module(m)
+    return m
+
+
+# ---------------------------------------------------------------------------------------------------- new
+def cmd_new(a):
+    if not NAME_RE.match(a.name) or len(a.name) > 48:
+        die(f"--name {a.name!r}: lowercase words joined by single hyphens, <= 48 chars (it is also the queue label)", 2)
+    desc = (sys.stdin.read() if a.desc_file == "-" else Path(a.desc_file).read_text()) if a.desc_file else (a.description or "")
+    desc = desc.strip()
+    if not desc:
+        die("no description: pass it as the last argument or with --desc-file PATH|-", 2)
+    run = RUNS / a.name
+    if run.exists():
+        die(f"run dir {run} exists: pick another --name", 2)
+    lock = None
+    if not a.remote and (a.remote_python or a.deps_lock or a.remote_max_calls):
+        die("--remote-python, --deps-lock and --remote-max-calls go with --remote", 2)
+    if a.deps_lock:
+        lock = os.path.realpath(os.path.expanduser(a.deps_lock))
+        if not os.path.isfile(lock):
+            die(f"--deps-lock {lock} is not a file", 2)
+    if a.remote_max_calls is not None and not 1 <= a.remote_max_calls <= 2000:
+        die("--remote-max-calls must be 1..2000", 2)
+    if bool(a.repo) == bool(a.worktree):
+        die("pass exactly one of --repo REPO (a fresh worktree is made) or --worktree WT (an existing clean worktree root)", 2)
+    if a.worktree:
+        wt = os.path.realpath(os.path.expanduser(a.worktree))
+        top = git(wt, "rev-parse", "--show-toplevel").stdout.strip()
+        if not top or os.path.realpath(top) != wt:
+            die(f"--worktree {wt} is not the root of a git worktree", 2)
+        if git(wt, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            die(f"--worktree {wt} has uncommitted changes to tracked files: commit or stash them, or use --repo", 2)
+        src = wt
+    else:
+        src = os.path.realpath(os.path.expanduser(a.repo))
+        if git(src, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+            die(f"--repo {src} is not a git repository", 2)
+        dirty = git(src, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+        if dirty and not a.base:
+            print(f"mini-auto: WARN: {src} has uncommitted changes; the job starts from its HEAD commit without them", file=sys.stderr)
+        ms = load("mini_spec_lib", os.environ.get("MINI_SPEC_LIB") or HERE / "mini-spec")
+        try:
+            wt = ms.make_worktree(src, a.base or "HEAD", a.name, os.environ.get("MINI_WT_ROOT"))
+        except (Exception, SystemExit) as e:  # mini-spec's die() raises Ambiguous
+            die(f"worktree: {e}", 1)
+    run.mkdir(parents=True)
+    (run / "TASK.md").write_text(desc + "\n")
+    spec = {"mode": "auto", "name": a.name, "allowed": [], "baseline_from": wt, "task": str(run / "TASK.md"),
+            "auto_repo": os.path.realpath(git(src, "rev-parse", "--show-toplevel").stdout.strip() or src)}
+    if a.file:
+        spec["files"] = a.file
+    if a.fn:
+        spec["fn"] = a.fn
+    if a.locate:
+        spec["locate"] = a.locate
+    if a.diagnose:
+        spec["diagnose"] = a.diagnose
+    if a.timeout:
+        spec["timeout"] = a.timeout
+    if a.remote:
+        spec["remote"] = {"python": a.remote_python or "3.12", "deps_lock": lock, "max_calls": a.remote_max_calls or 1500,
+                          "setup_timeout": 1800}
+    sp = run / "spec.json"
+    sp.write_text(json.dumps(spec, indent=1) + "\n")
+    print(f"run_dir: {run}\nspec: {sp}\nbaseline: {wt}")
+    if not a.submit:
+        print(f"submit: {HERE / 'mini-submit'} {sp} --label {a.label or a.name} --model {a.model}")
+        return 0
+    cmd = (os.environ.get("MINI_AUTO_SUBMIT") or str(HERE / "mini-submit")).split() + [str(sp), "--label", a.label or a.name, "--model", a.model]
+    if a.dry_run:
+        cmd.append("--dry-run")
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    keep = [ln for ln in out.splitlines() if ln.startswith(("mini-submit: FAIL", "  fix:", "mini-submit: OK", "mini-submit: DRY-RUN", "job_id:",
+                                                             "workdir:", "mini-submit: enqueue failed")) or "WARN" in ln]
+    print("\n".join(keep) if keep else out[-1500:])
+    if p.returncode:
+        print(f"not submitted (rc {p.returncode}); after fixing: {' '.join(cmd)}")
+    return p.returncode
+
+
+# ---------------------------------------------------------------------------------------------------- job lookups
+def job_record(job):
+    for p in (QLOGS / f"{job}.done.json", QLOGS / "archive" / f"{job}.done.json"):
+        try:
+            d = json.loads(p.read_text())
+            if isinstance(d, dict):
+                return d
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def latest_review(job):
+    rows = []
+    try:
+        for ln in (OHOME / "reviews.jsonl").read_text().splitlines():
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("job") == job:
+                rows.append(r)
+    except OSError:
+        pass
+    return rows[-1] if rows else None
+
+
+def resolve(job):
+    """(record, run dir, work dir, spec) of a finished queue job. The runner writes its packets next to the work dir."""
+    rec = job_record(job) if re.fullmatch(r"[\w.-]+", job) else {}
+    if not rec:
+        die(f"no finished-job record for {job} in {QLOGS} (or its archive/)")
+    work = Path(os.path.expanduser(str(rec.get("cwd") or "")))
+    try:
+        spec = json.loads(Path(os.path.expanduser(str(rec.get("task_file") or ""))).read_text())
+    except (OSError, ValueError):
+        spec = {}
+    return rec, work.parent, work, spec if isinstance(spec, dict) else {}
+
+
+def result_line(run):
+    p = run / "REVIEW-AUTO.md"
+    m = re.search(r"^RESULT (.*)$", p.read_text(errors="replace"), re.M) if p.is_file() else None
+    return m.group(1) if m else ""
+
+
+def head_blob(work, f):
+    """The bytes of f in the commit the job started from (the work dir's HEAD), or None when f is new."""
+    p = subprocess.run(["git", "-C", str(work), "show", f"HEAD:{f}"], capture_output=True, timeout=60)
+    return p.stdout if p.returncode == 0 else None
+
+
+def finish_hint(job, run, spec):
+    """What to do with a job that did not pass: mini-finish it (its tests run on this Mac), or for a remote job (its tests run
+    only on a CPU runner) fix it directly from its packet."""
+    if spec.get("remote"):
+        return f"; a remote job: fix it directly from {run / 'REVIEW-AUTO.md'} (run its tests on claude-sandbox, not here)"
+    return f"; finish it: ~/bin/mini-finish {job}" if (run / "spec.auto.json").is_file() else ""
+
+
+# ---------------------------------------------------------------------------------------------------- land
+def cmd_land(a):
+    rec, run, work, spec = resolve(a.job)
+    if spec.get("mode") != "auto":
+        die(f"job {a.job} is not an auto job (spec mode {spec.get('mode')!r}): land it the usual way")
+    try:
+        fin = json.loads((run / "finish" / "FINISHED.json").read_text())
+    except (OSError, ValueError):
+        fin = None
+    finished = isinstance(fin, dict) and str(fin.get("verdict") or "").startswith("PASS")
+    verdict = str(rec.get("runner_verdict") or "")
+    if not finished:  # a lane pass: needs the reviewer's ok. A job Claude finished (mini-finish PASS) was checked by its own gates
+        if rec.get("status") != "done" or not (verdict == "PASS" or verdict.startswith("NEEDS-REVIEW")):
+            die(f"job {a.job} did not pass (status {rec.get('status')}, verdict {verdict or '?'}) and was not finished: nothing to land"
+                + finish_hint(a.job, run, spec))
+        rv = latest_review(a.job)
+        if not (rv and rv.get("verdict") == "ok") and not getattr(a, "assume_ok", False):
+            die(f"job {a.job} has no ok review verdict ({'latest: ' + rv.get('verdict') if rv else 'none'}): run "
+                f"`~/bin/mini-scorecard review brief {a.job}` and record the verdict first")
+    fsp = run / "spec.auto.json"
+    try:
+        fspec = json.loads(fsp.read_text())
+    except (OSError, ValueError):
+        die(f"{fsp} is missing: the job never reached the fix stage")
+    files = [*fspec.get("allowed", []), fspec.get("test_file")]
+    if not all(files) or not work.is_dir():
+        die(f"cannot tell what to land (files {files}, work dir {work})")
+    # Existing tests the fix updated (update_tests, gate update_flip) land with it: left out, the checkout's suite still
+    # asserts the old behaviour against the new code. mini-finish's check covers them too (its scope is allowed + update_tests).
+    upd = [t for t in dict.fromkeys(fspec.get("update_tests") or []) if t and t not in files]
+    files += upd
+    if finished:  # land exactly what mini-finish checked
+        cand = Path(str(fin.get("check_dir") or "")) / "cand"
+        moved = [f for f in files if not (cand / f).is_file() or not (work / f).is_file()
+                 or (cand / f).read_bytes() != (work / f).read_bytes()]
+        if moved:
+            die(f"{', '.join(moved)} in {work} differ from what `mini-finish --check` passed ({cand}): rerun "
+                f"`~/bin/mini-finish {a.job} --check` first")
+    dest = Path(os.path.realpath(os.path.expanduser(a.into or spec.get("auto_repo") or spec.get("baseline_from") or "")))
+    if not dest.is_dir():
+        die(f"destination {dest} is not a directory")
+    plan, bad = [], []
+    for f in files:
+        src_new, cur = work / f, dest / f
+        if not src_new.is_file():
+            bad.append(f"{f}: not in the work dir")
+            continue
+        start = head_blob(work, f)
+        cur_b = cur.read_bytes() if cur.is_file() else None
+        new_b = src_new.read_bytes()
+        if f in upd and new_b == start:
+            continue  # an existing test the fix was free to update but left alone: nothing of the job's to land
+        if cur_b == new_b:
+            plan.append((f, "already landed"))
+        elif cur_b == start:  # unchanged since the job started (None == None: a new file that is still absent)
+            plan.append((f, "copy"))
+        else:
+            bad.append(f"{f}: {dest} changed it since the job started; apply by hand: git -C {work} diff HEAD -- {f}"
+                       if f in fspec.get("allowed", []) or f in upd else f"{f}: {dest / f} exists with other content")
+    if bad:
+        die("refused, nothing copied:\n  " + "\n  ".join(bad))
+    for f, what in plan:
+        if what == "copy" and not a.dry_run:
+            (dest / f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(work / f, dest / f)
+        print(f"{'would ' if a.dry_run and what == 'copy' else ''}{what}: {f} -> {dest / f}")
+    st = git(dest, "status", "--short", "--", *files).stdout.rstrip()
+    print(st or "(no changes)")
+    if not a.dry_run:
+        print(f"landed (uncommitted) in {dest}; test: {fspec.get('test_cmd')}\n"
+              f"after committing: ~/bin/mini-scorecard ledger add --job {a.job} --commit <sha> --repo {dest}")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- review
+def cmd_review(a):
+    """Verdict + land in one step, so reviewing a pass costs the session one call (the event already carried the packet)."""
+    rec, run, work, spec = resolve(a.job)
+    if spec.get("mode") != "auto":
+        die(f"job {a.job} is not an auto job (spec mode {spec.get('mode')!r}): record its verdict with `mini-scorecard review add`")
+    verdict = str(rec.get("runner_verdict") or "")
+    if rec.get("status") != "done" or not (verdict == "PASS" or verdict.startswith("NEEDS-REVIEW")):
+        die(f"job {a.job} did not pass (status {rec.get('status')}, verdict {verdict or '?'}): there is no lane result to review"
+            + finish_hint(a.job, run, spec))
+    note = " ".join(str(a.note or "").split())
+    if a.verdict == "reject" and not note:
+        die('a reject needs --note "<what is wrong>" (the scorecard keeps it)')
+    rv = latest_review(a.job)
+    cmd = [sys.executable, str(HERE / "mini-scorecard"), "review", "add", "--job", a.job, "--verdict", a.verdict, "--kind", "auto",
+           "--note", note]
+    if rv and rv.get("verdict") == a.verdict:
+        print(f"review: {a.job} {a.verdict} already recorded at {rv.get('ts')}")
+    elif a.dry_run:
+        print("would record: " + " ".join(shlex.quote(c) for c in cmd[2:]))
+    else:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        sys.stdout.write(p.stdout)
+        sys.stderr.write(p.stderr)
+        if p.returncode != 0:
+            die(f"the verdict was not recorded (mini-scorecard rc {p.returncode}); nothing landed")
+    if a.verdict == "reject":
+        try:
+            fs = json.loads((run / "spec.auto.json").read_text())
+        except (OSError, ValueError):
+            fs = {}
+        print(f"rejected: nothing landed; never land it as is. Fix it yourself: the model's test and fix are in {work} "
+              f"(git -C {work} diff HEAD; new test {fs.get('test_file', '?')}; test: {fs.get('test_cmd', '?')})")
+        return 0
+    a.assume_ok = a.dry_run   # a dry run recorded nothing, so land's verdict check would refuse
+    return cmd_land(a)
+
+
+# ---------------------------------------------------------------------------------------------------- show
+def cmd_show(a):
+    rec, run, work, spec = resolve(a.job)
+    if not run.is_dir():
+        die(f"no run dir for {a.job}")
+    line = result_line(run) or str(rec.get("runner_verdict") or "?")
+    print(f"job {a.job}  {rec.get('label', '')}  {line}")
+    fsp = run / "spec.auto.json"
+    if fsp.is_file():
+        fs = json.loads(fsp.read_text())
+        upd = fs.get("update_tests") or []
+        print(f"target {fs.get('allowed')} fn {fs.get('target_fn')}  test {fs.get('test_file')} :: {fs.get('test_cmd')}"
+              + (f"  may update {upd}" if upd else ""))
+        files = [*fs.get("allowed", []), fs.get("test_file"), *upd]
+        print(git(work, "diff", "--stat", "HEAD", "--", *[f for f in files if f]).stdout.rstrip())
+    for n in ("REVIEW-AUTO.md", "DIAGNOSIS.md", "REVIEW-D.md", "REVIEW.md"):
+        if (run / n).is_file():
+            print(f"{n}: {run / n}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("new")
+    n.add_argument("--repo")
+    n.add_argument("--worktree")
+    n.add_argument("--base")
+    n.add_argument("--name", required=True)
+    n.add_argument("--file", action="append")
+    n.add_argument("--fn")
+    n.add_argument("--locate", action="append")
+    n.add_argument("--diagnose", choices=["always", "skip"])
+    n.add_argument("--timeout", type=int)
+    n.add_argument("--remote", action="store_true")
+    n.add_argument("--remote-python", choices=["3.11", "3.12", "3.13"])
+    n.add_argument("--deps-lock")
+    n.add_argument("--remote-max-calls", type=int)
+    n.add_argument("--desc-file")
+    n.add_argument("--submit", action="store_true")
+    n.add_argument("--model", default=MODEL)
+    n.add_argument("--label")
+    n.add_argument("--dry-run", action="store_true")
+    n.add_argument("description", nargs="?")
+    ld = sub.add_parser("land")
+    ld.add_argument("job")
+    ld.add_argument("--into")
+    ld.add_argument("--dry-run", action="store_true")
+    rv = sub.add_parser("review")
+    rv.add_argument("job")
+    rv.add_argument("verdict", choices=["ok", "reject"])
+    rv.add_argument("--note", default="")
+    rv.add_argument("--into")
+    rv.add_argument("--dry-run", action="store_true")
+    sh = sub.add_parser("show")
+    sh.add_argument("job")
+    a = ap.parse_args(argv)
+    return {"new": cmd_new, "land": cmd_land, "review": cmd_review, "show": cmd_show}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

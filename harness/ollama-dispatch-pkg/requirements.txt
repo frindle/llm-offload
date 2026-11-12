@@ -1,0 +1,6 @@
+# Core pipeline has ZERO required third-party dependencies -- it uses only the
+# Python 3.10+ standard library and talks to Ollama over HTTP.
+#
+# Optional: better web_fetch main-text extraction. Without it, web_fetch falls
+# back to a naive HTML strip. Uncomment to enable.
+# trafilatura>=1.6

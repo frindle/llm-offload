@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to $OLLAMA_DISPATCH_HOME/defaults.json. The default model tag and host name used when a dispatch does not specify them. The model must be an Ollama tag that supports tool-calling.",
+  "model": "qwen2.5-coder:14b",
+  "host": "primary"
+}

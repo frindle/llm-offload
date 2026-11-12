@@ -1,0 +1,142 @@
+# agent-dispatch-harness — example configuration
+#
+# Copy this to `config.toml` (gitignored) and edit. Nothing host-specific is
+# ever a literal in the source: every path, endpoint, model and memory figure
+# the harness needs lives here.
+#
+#   cp config.example.toml config.toml
+#   $EDITOR config.toml
+#   bin/adh doctor
+#
+# Config is resolved in this order:
+#   1. --config PATH
+#   2. $ADH_CONFIG
+#   3. ./config.toml
+# TOML is used because it parses with the standard library (tomllib, 3.11+),
+# supports comments (JSON does not), and has no significant-whitespace traps
+# (YAML does, and would add a dependency).
+
+[paths]
+# Where the harness writes everything. Relative paths resolve against the
+# config file's own directory.
+work_dir       = "runs"          # scratch worktrees, one per run
+results_dir    = "results/local" # results.csv, diffs
+transcripts_dir = "transcripts"  # full JSON transcripts, one per run
+log_file       = "logs/driver.log"
+
+[backend]
+# An Ollama-compatible endpoint. See README "Limitations" — the harness speaks
+# Ollama's native /api/chat and /api/show. `openai` is a partial path kept for
+# llama-server, but the token accounting is weaker there.
+name      = "local"              # free-form label; goes in the CSV `backend` column
+host      = "http://127.0.0.1:11434"
+api_style = "ollama"             # "ollama" | "openai"
+
+# Whether this harness owns the inference server's lifecycle. Host gating can
+# only *restart* the server when it does; on a shared or remote endpoint the
+# harness still measures and records readiness, but cannot act on it.
+owns_server    = true
+restart_command = "brew services restart ollama"
+
+[gate]
+# Model-relative host-readiness gating. See README, "Why host gating matters".
+#
+# The gate predicts whether the NEXT model load fits in memory without paging.
+# It is model-relative because a flat percentage-of-physical threshold is wrong
+# in both directions at once: too high for a 9GB model (spurious waits), too low
+# for a 30GB model at a 64k context (certifies a run that is about to page).
+enabled = true
+
+weights_headroom   = 1.2   # multiplier on measured resident size
+kv_mb_per_1k_tokens = 150  # KV-cache allowance; the arithmetic is in adh/gate.py
+max_fraction_of_physical = 0.85  # never demand a threshold the host cannot reach
+wait_seconds       = 240   # bounded; a run past this is dispatched, flagged host_ready=no
+poll_seconds       = 5
+server_up_timeout_s = 60
+
+[worker]
+temperature   = 0.2
+max_iterations = 25
+bash_timeout_s = 180
+verify_timeout_s = 300
+# Hard cap on a single read_file result, in characters. An uncapped read is
+# how the shipped round's debug cell voided itself: one 228KB file consumed
+# the whole context window in a single turn. See RESULTS.md.
+read_file_max_chars = 60000
+# Repeated-identical-call nudge: after this many identical calls with identical
+# results, inject a loop-break note instead of letting the model spin.
+repeat_call_nudge_after = 2
+
+[round]
+# Identifier written into the results directory and used by `falsify`.
+id = "local-round-1"
+reps = 3
+# Deterministic per-rep shuffle so a reviewer can regenerate dispatch order.
+shuffle_seed = 8675309
+
+# ---------------------------------------------------------------------------
+# Roster. One [[models]] block per model under test.
+#
+# `native_ctx` and `resident_mb` are MEASURED, not guessed:
+#   native_ctx  -- read from the backend's own /api/show (`bin/adh probe`)
+#   resident_mb -- observed RSS with the model loaded (`ollama ps`)
+# Both go in the CSV so nobody ever compares two models at different windows
+# without seeing it.
+# ---------------------------------------------------------------------------
+
+[[models]]
+name        = "example-model:14b"
+native_ctx  = 32768
+resident_mb = 9000
+# Wall-clock budget for one run, seconds. Derive it from a measured
+# seconds-per-iteration rate rather than picking it; a hand-chosen wall is the
+# guesswork this harness exists to remove. See METHODOLOGY.md §5.
+wall_s      = 2400
+# Some model families' chat templates never render the native `tools` field.
+# For those, describe the tools as plain text and parse the calls back out.
+manual_tools = false
+
+[[models]]
+name        = "example-model:32b"
+native_ctx  = 131072
+resident_mb = 19900
+wall_s      = 3600
+manual_tools = true
+
+# ---------------------------------------------------------------------------
+# Context sizing. num_ctx = min(target_ctx, native_ctx).
+# Exceeding a model's native window is not a bigger window, it is an
+# out-of-spec run.
+# ---------------------------------------------------------------------------
+[context]
+target_ctx = 65536
+
+# ---------------------------------------------------------------------------
+# Tasks. Each entry points at a fixture directory containing task.toml.
+# Relative paths resolve against the config file's directory.
+# ---------------------------------------------------------------------------
+[[tasks]]
+path = "fixtures/greenfield-feature-python"
+
+[[tasks]]
+path = "fixtures/debug-from-symptom-python"
+
+# ---------------------------------------------------------------------------
+# Arms. `base` is always present. Others are prompt treatments applied to the
+# same cell so the comparison is base-vs-arm on one controlled host.
+# ---------------------------------------------------------------------------
+[arms]
+enabled = ["base", "repomap", "apisurface"]
+# repomap: prepend a generated `git ls-files` digest of the worktree.
+# apisurface: prepend the task fixture's api_surface.txt, if it ships one.
+repomap_max_files = 400
+
+# ---------------------------------------------------------------------------
+# Optional: web tools. Left disabled by default — a benchmark whose results
+# depend on live search results is not reproducible.
+# ---------------------------------------------------------------------------
+[web]
+enabled = false
+search_endpoint = ""   # a self-hosted JSON search endpoint
+timeout_s = 30
+fetch_max_chars = 20000

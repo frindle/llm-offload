@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""qctl -- one front door for the dispatch queue: status, retry, skip, clear, why, bundle.
+
+A THIN wrapper. Every mutation goes through the tool that owns it:
+  queue rows    ollama-queue.py bundle / resolve
+  ledger        ~/.ollama-dispatch/escalations/ESCALATIONS.md  ([ ] -> [x])
+  handoff       handoff-emit.py --acted <ids> --reason
+  run-status    POST http://127.0.0.1:7684/api/runs/<id>/clear  (never with an override)
+  wait reasons  the dashboard's _wait_reason_for, via GET /api/jobs
+Label -> slice mapping is dispatch-self-heal.py's (label_base / plan_slice_for_label).
+
+Every verb takes --dry-run, prints what it changed, and exits NONZERO on refusal.
+Every action (and refusal) is appended to ~/.ollama-dispatch/decisions.jsonl, which
+`qctl status` shows -- the one place automated and human decisions are logged.
+
+  qctl status [BUNDLE]               bundles -> slices -> stage rows, reasons, waits
+  qctl clear BUNDLE SLICE            tick ledger + handoff + run-status rows (only
+                                     when the slice is done/skipped/superseded)
+  qctl why JOB_ID                    what the job is waiting on
+  qctl slots                         studio-db coding+gate slots; coder tok/s concurrent vs alone
+  qctl bundle [--tag T] JOB_ID...    show (or with --tag, stamp) the jobs' bundle
+  qctl supersede BUNDLE --by TARGET --reason R [--slice SID] [--undo]
+                                     mark a failed/stalled bundle (or one failed slice)
+                                     superseded by a later bundle/job: the dashboard shows
+                                     it as "superseded", not stalled (qctl supersede --list)
+  qctl retire BUNDLE --reason TEXT   RETIRE an active bundle in one step: supersede marker +
+                                     plan cancel marker + `ollama-queue.py
+                                     resolve` on its finished (failed/done/blocked/needs_opus)
+                                     rows. Refuses (rc 2) with a pending/running job or a row
+                                     awaiting sign-off; --reason required and recorded;
+                                     idempotent; deletes nothing but the resolved queue rows
+  qctl auto-retire [--dry-run]       for each bundle whose newest job PASSED (queue .done.json), retire older
+                                     FAILED bundles with the same stem (leading miniN-/miniN_ stripped) via
+                                     `qctl retire`; PASS/accepted only, never touches awaiting_signoff or
+                                     live bundles; idempotent. Meant for a periodic sweep (see docs)
+  qctl failures [--bundle B] [--slice S] [--since 24h] [--by signature|slice|bundle] [--job ID]
+                                     failure ledger (~/.ollama-dispatch/failures.jsonl): per-job
+                                     table, grouped summary, or one job's full fingerprint
+  qctl triage [ARGS...]              failure-signature triage handoff (= triage-emit.py): list,
+                                     show ID, --acted ID --outcome FIXED|ESCALATED|WONTFIX --reason R
+  qctl timeline BUNDLE SLICE         chronological per-slice story: author rounds, gate,
+                                     second-opinion, signatures, the ONE attempt counter
+  qctl close JOB_ID --by REF --reason TEXT [--accept] [--dry-run]
+                                     close ONE finished job: slice + bundle superseded markers,
+                                     clear its dashboard run card, verify it is gone (rc 2 if
+                                     not), then `ollama-queue.py resolve`. Default = DISMISS only
+                                     (no accept); --accept also runs accept-bundle --job ID.
+                                     refuses a pending/running job; idempotent
+  qctl runs-clear [--apply ID...]    run-status retention: preview (default) or clear
+                                     ONLY the named ids (same predicate as auto-retention)
+"""
+import argparse
+import datetime
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BIN = Path(os.environ.get("QCTL_BIN") or Path(__file__).resolve().parent)
+DISPATCH = Path(os.environ.get("QCTL_DISPATCH") or Path.home() / ".ollama-dispatch")
+SLICE_RUNS = DISPATCH / "slice-runs"
+LEDGER = DISPATCH / "escalations" / "ESCALATIONS.md"
+DECISIONS = DISPATCH / "decisions.jsonl"
+QUEUE_LOGS = Path(os.environ.get("QCTL_QUEUE_LOGS") or BIN / "ollama-queue-logs")
+QUEUE_STATE = Path(os.environ.get("QCTL_QUEUE_STATE") or BIN / "ollama-queue-state.json")
+API = os.environ.get("QCTL_API", "http://127.0.0.1:7684")
+DASHBOARD_URL = API          # dashboard / run-status store base URL (qctl close)
+
+LIVE_JOB = ("running", "pending", "held", "planned", "paused", "launching")
+RETIRE_LIVE = ("pending", "running", "launching")           # retire refuses while any is present
+RETIRE_RESOLVABLE = ("done", "done_unconverged", "failed", "blocked", "needs_opus")
+CLEARABLE_SLICE = ("done", "skipped", "superseded")
+RETRY_REFUSE = ("done", "skipped", "superseded")
+
+
+class Refused(Exception):
+    pass
+
+
+# ----------------------------------------------------------------- plumbing --
+def _load_mod(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+_HEAL = []
+
+
+def heal():
+    if not _HEAL:
+        _HEAL.append(_load_mod("dispatch_self_heal", BIN / "dispatch-self-heal.py"))
+    return _HEAL[0]
+
+
+def _json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def run_state(bundle):
+    return _json(SLICE_RUNS / f"{bundle}.json")
+
+
+def queue_jobs():
+    return (_json(QUEUE_STATE, {}) or {}).get("jobs") or []
+
+
+def queue_state():
+    return _json(QUEUE_STATE, {}) or {}
+
+
+def slice_base(label):
+    """The `<plan>-<sid>` a queue label derives from (self-heal's label_base, plus
+    the esc-review-[<ts>Z-] prefix the queue's own bundle key also strips)."""
+    lab = re.sub(r"^esc-review-(?:\d+Z-)?", "", str(label or ""))
+    return heal().label_base(lab)
+
+
+def slice_jobs(bundle, sid, jobs=None):
+    want = heal().slice_job_labels(bundle, sid)
+    return [j for j in (jobs if jobs is not None else queue_jobs())
+            if slice_base(j.get("label")) == want]
+
+
+def driver_pid(bundle):
+    """pid of a LIVE advance driver for the plan, else None."""
+    lk = SLICE_RUNS / f"{bundle}.advance.lock"
+    try:
+        m = re.search(r"\d+", lk.read_text())
+    except OSError:
+        return None
+    if not m:
+        return None
+    pid = int(m.group(0))
+    try:
+        os.kill(pid, 0)
+        return pid
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+
+
+def log_decision(action, bundle=None, slice_id=None, job=None, outcome="", detail="",
+                 actor="qctl", path=None):
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "actor": actor,
+           "action": action, "bundle": bundle, "slice": slice_id, "job": job,
+           "outcome": outcome, "detail": detail}
+    p = Path(path or DECISIONS)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+    return rec
+
+
+def recent_decisions(bundle=None, n=8, path=None):
+    out = []
+    try:
+        lines = Path(path or DECISIONS).read_text().splitlines()
+    except OSError:
+        return out
+    for ln in reversed(lines):
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if bundle is None or r.get("bundle") == bundle:
+            out.append(r)
+        if len(out) >= n:
+            break
+    return list(reversed(out))
+
+
+def _api(method, path, body=None, timeout=10, base=None):
+    req = urllib.request.Request((base or API) + path, method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"null")
+        except ValueError:
+            return e.code, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _run(cmd, dry, timeout=600):
+    print(("  [dry-run] would run: " if dry else "  $ ") + " ".join(map(str, cmd)))
+    if dry:
+        return 0, ""
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    out = (r.stdout or "") + (r.stderr or "")
+    if out.strip():
+        print("    " + "\n    ".join(out.strip().splitlines()[-12:]))
+    return r.returncode, out
+
+
+# ------------------------------------------------------------------- status --
+def wait_reasons():
+    code, rows = _api("GET", "/api/jobs")
+    if code != 200 or not isinstance(rows, list):
+        return {}
+    return {r.get("id"): r.get("wait_reason") for r in rows if r.get("wait_reason")}
+
+
+def ledger_rows(bundle, sid=None, text=None):
+    """[(lineno, line, checked)] ledger rows naming this bundle (and slice)."""
+    if text is None:
+        try:
+            text = LEDGER.read_text()
+        except OSError:
+            return []
+    out = []
+    for i, ln in enumerate(text.splitlines()):
+        m = re.match(r"^- \[( |x)\] `([^`]+)` \*\*([^*]+)\*\*", ln)
+        if not m or m.group(2) != bundle:
+            continue
+        if sid is not None and m.group(3) != sid:
+            continue
+        out.append((i, ln, m.group(1) == "x"))
+    return out
+
+
+def bundles_overview(jobs):
+    seen = {}
+    for j in jobs:
+        b = j.get("bundle") or j.get("group_key")
+        if b:
+            seen.setdefault(b, []).append(j)
+    return seen
+
+
+def cmd_status(a):
+    jobs = queue_jobs()
+    qs = queue_state()
+    waits = wait_reasons()
+    commit = qs.get("_bundle_commit") or {}
+    print(f"queue: committed bundle = {commit.get('key') or '-'}"
+          + ("  (WAITING ON FAILURE -- still holding the lanes; parks loudly at the idle ceiling)" if commit.get("waiting_on_failure") else "")
+          + f"; focus = {(qs.get('_focus_wait') or {}).get('key') or '-'}"
+          + f"; pinned = {qs.get('pinned_group') or '-'}")
+    running = [j for j in jobs if j.get("status") == "running"]
+    for j in running:
+        print(f"  running: {j['id']} {j.get('label')} ({j.get('lane') or j.get('host_pref')})")
+    if not a.bundle:
+        groups = bundles_overview([j for j in jobs if j.get("status") in LIVE_JOB])
+        plans = sorted(p.stem for p in SLICE_RUNS.glob("*.json"))
+        print("\nbundles with live rows:")
+        for b, js in sorted(groups.items()):
+            st = {}
+            for j in js:
+                st[j["status"]] = st.get(j["status"], 0) + 1
+            print(f"  {b}: " + ", ".join(f"{v} {k}" for k, v in sorted(st.items())))
+        open_esc = {}
+        try:
+            for ln in LEDGER.read_text().splitlines():
+                m = re.match(r"^- \[ \] `([^`]+)`", ln)
+                if m:
+                    open_esc[m.group(1)] = open_esc.get(m.group(1), 0) + 1
+        except OSError:
+            pass
+        if open_esc:
+            print("\nopen escalations: " + ", ".join(f"{k} ({v})" for k, v in sorted(open_esc.items())))
+        print(f"\n{len(plans)} slice plan(s); `qctl status <bundle>` for one.")
+        return 0
+    b = a.bundle
+    st = run_state(b)
+    print(f"\nbundle {b}" + (f"  driver pid {driver_pid(b)} (live)" if driver_pid(b) else ""))
+    if st:
+        for sid in st.get("order") or list((st.get("slices") or {}).keys()):
+            s = (st.get("slices") or {}).get(sid) or {}
+            stat = s.get("status") or "?"
+            print(f"  [{stat:>10}] {sid}")
+            for k in ("escalation_reason", "skip_reason", "failure_reason", "blocked_reason"):
+                if s.get(k):
+                    print(f"               {k.split('_')[0]}: {str(s[k])[:220]}")
+            for j in slice_jobs(b, sid, jobs):
+                w = waits.get(j["id"])
+                print(f"      {j['id']} {j.get('status'):>9}  {j.get('label')}"
+                      + (f"  -- {w}" if w else ""))
+            for _i, ln, chk in ledger_rows(b, sid):
+                if not chk:
+                    print(f"      ESC open: {ln[:200]}")
+    else:
+        for j in [j for j in jobs if (j.get("bundle") or j.get("group_key")) == b]:
+            w = waits.get(j["id"])
+            print(f"  {j['id']} {j.get('status'):>9}  {j.get('label')}" + (f"  -- {w}" if w else ""))
+    dec = recent_decisions(b)
+    if dec:
+        print("\nrecent decisions:")
+        for r in dec:
+            print(f"  {r['ts']} {r['actor']:>10} {r['action']}"
+                  + (f" {r['slice']}" if r.get("slice") else "")
+                  + f" -> {r.get('outcome')}" + (f" ({r['detail'][:120]})" if r.get("detail") else ""))
+    return 0
+
+
+# -------------------------------------------------------------------- verbs --
+def _plan_path(b):
+    st = run_state(b)
+    if not st:
+        raise Refused(f"no slice plan for bundle {b!r} under {SLICE_RUNS}")
+    pp = st.get("plan_path")
+    if not pp or not Path(pp).exists():
+        raise Refused(f"bundle {b!r}: plan file {pp!r} is missing")
+    return st, pp
+
+
+def _slice(st, b, sid):
+    s = (st.get("slices") or {}).get(sid)
+    if s is None:
+        raise Refused(f"bundle {b!r} has no slice {sid!r} "
+                      f"(slices: {', '.join((st.get('slices') or {}).keys())})")
+    return s
+
+
+def clear_plan(slice_status, jobs, runs_by_id, driver, ledger):
+    """PURE. Decide what `clear` may touch. Returns (refusal|None, plan) where plan =
+    {"ledger": [lineno...], "handoff": [ids], "runs": [ids], "kept": [(id, why)]}.
+
+    Rules (the clear-safety contract; test-qctl.py revert-checks each):
+      * only a slice that is done / skipped / superseded;
+      * never while any of its jobs is live, or a plan driver is live (a live agent
+        may still need the rows);
+      * never a row awaiting sign-off (kept, named).
+    """
+    if slice_status not in CLEARABLE_SLICE:
+        return (f"slice is {slice_status!r}; clear only retires a done/skipped/superseded "
+                f"slice (retry or skip it first)"), None
+    live = [j for j in jobs if j.get("status") in LIVE_JOB]
+    if live:
+        return ("a live agent still needs this slice's rows: " +
+                ", ".join(f"{j['id']} ({j['status']})" for j in live)), None
+    if driver:
+        return f"the plan's advance driver (pid {driver}) is live -- it may still read these rows", None
+    plan = {"ledger": [i for i, _ln, chk in ledger if not chk], "handoff": [], "runs": [],
+            "kept": []}
+    for j in jobs:
+        r = runs_by_id.get(j["id"]) or {}
+        if r.get("awaiting_signoff"):
+            plan["kept"].append((j["id"], "awaiting sign-off"))
+            continue
+        plan["handoff"].append(j["id"])
+        if r and r.get("group") != "handled":
+            plan["runs"].append(j["id"])
+    return None, plan
+
+
+def cmd_clear(a):
+    st = run_state(a.bundle)
+    if not st:
+        raise Refused(f"no slice plan for bundle {a.bundle!r}")
+    s = _slice(st, a.bundle, a.slice)
+    jobs = slice_jobs(a.bundle, a.slice)
+    code, runs = _api("GET", "/api/runs")
+    if code != 200 or not isinstance(runs, list):
+        raise Refused(f"run-status API unavailable ({code}): cannot prove no row awaits sign-off")
+    why, plan = clear_plan(s.get("status"), jobs, {r.get("id"): r for r in runs},
+                           driver_pid(a.bundle), ledger_rows(a.bundle, a.slice))
+    if why:
+        raise Refused(why)
+    reason = a.reason or f"qctl clear: slice {a.slice} is {s.get('status')}"
+    for jid, w in plan["kept"]:
+        print(f"  kept {jid}: {w}")
+    if plan["ledger"]:
+        print(f"  ledger: {'would tick' if a.dry_run else 'ticking'} {len(plan['ledger'])} row(s)")
+        if not a.dry_run:
+            lines = LEDGER.read_text().splitlines(keepends=True)
+            for i in plan["ledger"]:
+                lines[i] = lines[i].replace("- [ ]", "- [x]", 1)
+            LEDGER.write_text("".join(lines))
+    if plan["handoff"]:
+        rc, out = _run([sys.executable, str(BIN / "handoff-emit.py"), "--acted", *plan["handoff"],
+                        "--reason", reason], a.dry_run, 120)
+        if rc != 0:
+            print(f"  handoff-emit refused some rows (rc {rc}) -- left as is")
+    for jid in plan["runs"]:
+        if a.dry_run:
+            print(f"  [dry-run] would POST /api/runs/{jid}/clear")
+            continue
+        c, res = _api("POST", f"/api/runs/{jid}/clear", {})
+        print(f"  run-status {jid}: " + ("cleared" if c == 200 else f"REFUSED ({c}): {res}"))
+    if not (plan["ledger"] or plan["handoff"] or plan["runs"]):
+        print("  nothing to clear")
+    return 0
+
+
+def cmd_slots(a):
+    """studio-db slot occupancy + last concurrent-vs-alone coder tok/s and gate duration
+    (~/.ollama-dispatch/slot-measure.jsonl, written by the daemon; config queue-slots.json)."""
+    home = Path.home() / ".ollama-dispatch"
+    try:
+        cfg = json.loads((home / "queue-slots.json").read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    gs = cfg.get("gate_slots", 1)
+    run = [j for j in queue_jobs() if j.get("status") == "running" and j.get("lane") == "studio-db"]
+    gates = [j for j in run if str(j.get("label", "")).startswith(("gate-", "regate-", "secondop-", "esc-review-"))]
+    code = [j for j in run if j not in gates]
+    fmt = lambda js: ",".join(f"{j['id'][:8]}" for j in js) or "-"
+    rows = []
+    try:
+        rows = [json.loads(l) for l in (home / "slot-measure.jsonl").read_text().splitlines()[-4000:] if l.strip()]
+    except (OSError, ValueError):
+        pass
+
+    def avg(xs):
+        return f"{sum(xs) / len(xs):.1f}" if xs else "-"
+    alone = [r["tokps"] for r in rows if r.get("ev") == "sample" and r.get("kind") == "coding"
+             and r.get("n") == 1 and r.get("tokps")]
+    conc = [r["tokps"] for r in rows if r.get("ev") == "sample" and r.get("kind") == "coding"
+            and (r.get("n") or 0) > 1 and r.get("tokps")]
+    gd = [r["dur_s"] for r in rows if r.get("ev") == "end" and r.get("kind") == "gate" and not r.get("conc")]
+    gc = [r["dur_s"] for r in rows if r.get("ev") == "end" and r.get("kind") == "gate" and r.get("conc")]
+    print(f"studio-db slots: coding {len(code)}/1 [{fmt(code)}]  gate {len(gates)}/{gs} [{fmt(gates)}]"
+          f"{'  (gate_slots=0: single-lane kill switch)' if not gs else ''}"
+          f" | coder tok/s alone {avg(alone)} (n={len(alone)}) vs concurrent {avg(conc)} (n={len(conc)})"
+          f" | gate s alone {avg(gd)} (n={len(gd)}) vs concurrent {avg(gc)} (n={len(gc)})")
+    return 0
+
+
+def cmd_why(a):
+    code, rows = _api("GET", "/api/jobs")
+    if code == 200 and isinstance(rows, list):
+        r = next((r for r in rows if r.get("id") == a.job), None)
+        if r is None:
+            raise Refused(f"no job {a.job} in the queue")
+        print(f"{a.job} [{r.get('status')}] {r.get('label')}")
+        print(f"  {r.get('wait_reason') or ('not waiting' if r.get('status') not in ('pending', 'held', 'planned') else 'next in line')}")
+        return 0
+    raise Refused(f"dashboard API unavailable ({code}: {rows})")
+
+
+def _ledger():
+    sys.path.insert(0, os.path.expanduser("~/bin"))
+    import failure_ledger as fl
+    fl.sweep()          # fail-open: backfills anything the daemon has not recorded yet
+    return fl
+
+
+def cmd_failures(a):
+    fl = _ledger()
+    rows = fl.select_rows(a.bundle, a.slice, a.since, a.job)
+    if a.job:
+        if not rows:
+            print(f"qctl: no ledger row for job {a.job}", file=sys.stderr)
+            return 1
+        print(fl.render_job(rows[-1]))
+        return 0
+    print(fl.render_failures(rows, a.by))
+    return 0
+
+
+def cmd_timeline(a):
+    fl = _ledger()
+    print(fl.render_timeline(a.bundle, a.slice))
+    return 0
+
+
+def cmd_runs_clear(a):
+    """Run-status retention. Default = preview: every row the auto-retention predicate
+    (runstatus_retention.py, served by GET /api/runs/retention) would archive, with the
+    reason; nothing is cleared. --apply ID... clears ONLY those ids, each re-checked
+    server-side by the same predicate (awaiting-signoff / unreviewed deliverables are
+    refused per id). It never chooses its own scope."""
+    if not a.apply or a.dry_run:
+        code, res = _api("GET", "/api/runs/retention", timeout=120)
+        if code != 200 or not isinstance(res, dict):
+            raise Refused(f"run-status API unavailable ({code}): {res}")
+        el = res.get("eligible") or []
+        want = set(a.apply or [])
+        print(f"retention mode={res.get('mode')} scanned={res.get('scanned')} eligible={len(el)}"
+              + (" (dry-run of --apply)" if want else ""))
+        for d in el:
+            if want and d.get("id") not in want:
+                continue
+            print(f"  {d.get('id')}  [{d.get('category')}] {d.get('label')} -- {d.get('reason')}")
+        for jid in sorted(want - {d.get("id") for d in el}):
+            print(f"  {jid}  would be REFUSED: not retention-eligible")
+        if el and not want:
+            print("clear with: qctl runs-clear --apply " + " ".join(d["id"] for d in el))
+        return 0
+    code, res = _api("POST", "/api/runs/retention/apply", {"ids": a.apply}, timeout=120)
+    if code != 200 or not isinstance(res, dict):
+        raise Refused(f"run-status API refused/unavailable ({code}): {res}")
+    bad = 0
+    for r in res.get("results") or []:
+        print(f"  {r.get('id')}: {r.get('result')}")
+        bad += 0 if r.get("ok") else 1
+    if bad:
+        raise Refused(f"{bad} id(s) not cleared")
+    return 0
+
+
+def cmd_supersede(a):
+    """Record (or --undo / --list) a superseded-by marker in the dashboard state
+    (bundle_view.superseded_path()). Needs --by and --reason; changes nothing else."""
+    bv = _load_mod("bundle_view", BIN / "bundle_view.py")
+    if a.list:
+        for k, v in sorted(bv.load_superseded().items()):
+            print(f"{k}  superseded-by {v.get('by')}  [{v.get('ts')}]  {v.get('reason')}")
+        return 0
+    if not a.bundle:
+        raise Refused("BUNDLE is required")
+    if a.undo:
+        if a.dry_run:
+            print(f"would unmark {a.bundle}")
+            return 0
+        if not bv.unmark_superseded(a.bundle, a.slice):
+            raise Refused(f"{a.bundle}{'#' + a.slice if a.slice else ''} is not marked superseded")
+        print(f"unmarked {a.bundle}")
+        return 0
+    if not a.by or not (a.reason or "").strip():
+        raise Refused("--by TARGET and --reason are both required")
+    if a.dry_run:
+        print(f"would mark {a.bundle}{'#' + a.slice if a.slice else ''} superseded by {a.by}")
+        return 0
+    key = bv.mark_superseded(a.bundle, a.by, a.reason, slice_id=a.slice)
+    print(f"marked {key} superseded by {a.by}")
+    return 0
+
+
+def close_lookup(job_id, logs=None, jobs=None):
+    for row in (queue_jobs() if jobs is None else jobs):
+        if row.get('id') == job_id and row.get('status') in RETIRE_LIVE:
+            raise Refused(f"{job_id} is still {row.get('status')} -- let it finish or cancel it first")
+    d = _json(Path(logs or QUEUE_LOGS) / f"{job_id}.done.json")
+    if not isinstance(d, dict):
+        raise Refused(f"no {job_id}.done.json -- job not finished or unknown")
+    bundle = d.get('bundle') or d.get('label')
+    if not bundle:
+        raise Refused(f"no bundle or label in {job_id}.done.json")
+    return (bundle, d.get('label'))
+
+
+def close_markers(bundle, job_id, by, reason):
+    if not (reason or "").strip():
+        raise Refused("--reason is required (non-empty)")
+    bv = _load_mod("bundle_view", BIN / "bundle_view.py")
+    have = bv.load_superseded()
+    result = []
+    for sid in (job_id, None):
+        key = f"{bundle}#{sid}" if sid else bundle
+        if key not in have:
+            k = bv.mark_superseded(bundle, by, reason, slice_id=sid)
+            result.append(k)
+    return result
+
+
+
+
+def close_clear_run(job_id, base=None):
+    code, res = _api("POST", f"/api/runs/{job_id}/clear", base=base or DASHBOARD_URL)
+    if code == 404:
+        return False
+    if code != 200:
+        raise Refused(f"run-status clear of {job_id} failed ({code}): {res}")
+    return True
+
+
+
+def close_verify(job_id, base=None):
+    code, rows = _api("GET", "/api/runs", base=base or DASHBOARD_URL)
+    if code != 200 or not isinstance(rows, list):
+        raise Refused(f"cannot verify {job_id}: GET /api/runs -> {code}")
+    for r in rows:
+        if isinstance(r, dict) and r.get("id") == job_id:
+            raise Refused(f"{job_id} card is still on the dashboard after clear")
+    return True
+
+
+
+def close_resolve(job_id):
+    """`ollama-queue.py resolve <id>`; a job already gone from the queue is fine (idempotent)."""
+    rc, out = _run([sys.executable, str(BIN / "ollama-queue.py"), "resolve", job_id], False, 120)
+    if rc != 0 and "job not found" not in out:
+        raise Refused(f"ollama-queue.py resolve {job_id} exited {rc}")
+    return True
+
+
+def close_accept(bundle, job_id):
+    """`ollama-queue.py accept-bundle <bundle> --job <id>`: accept the verdict and mark it done."""
+    rc, _ = _run([sys.executable, str(BIN / "ollama-queue.py"), "accept-bundle", bundle, "--job", job_id], False, 120)
+    if rc != 0:
+        raise Refused(f"ollama-queue.py accept-bundle {bundle} --job {job_id} exited {rc}")
+    return True
+
+
+def _worktree_cleanup(job_id=None, bundle=None):
+    """Terminal-state hook: reap this job/bundle's worktrees if (and only if) they pass every
+    worktree_cleanup safety rule. Applies only when ~/.ollama-dispatch/worktree-cleanup.enabled
+    exists; otherwise dry-run + log. Best effort, never fails the verb."""
+    try:
+        _load_mod("worktree_cleanup", BIN / "worktree_cleanup.py").hook_terminal(job_id=job_id, bundle=bundle)
+    except Exception as e:  # noqa: BLE001
+        print(f"  worktree-cleanup skipped: {e}")
+
+
+def cmd_close(a):
+    if not a.by or not (a.reason or "").strip():
+        raise Refused("--by REF and --reason are both required")
+    bundle, _ = close_lookup(a.job_id)
+    if a.dry_run:
+        print(f"would close {a.job_id} (bundle {bundle}) superseded by {a.by}")
+        return 0
+    keys = close_markers(bundle, a.job_id, a.by, a.reason)
+    cleared = close_clear_run(a.job_id)
+    close_verify(a.job_id)
+    close_resolve(a.job_id)
+    accepted = False
+    if getattr(a, "accept", False):
+        close_accept(bundle, a.job_id)
+        accepted = True
+    print(f"closed {a.job_id}: marked {keys or 'nothing new'}; card {'cleared' if cleared else 'already gone'}; "
+          f"resolved; {'accepted' if accepted else 'dismissed (not accepted)'}")
+    _worktree_cleanup(job_id=a.job_id)
+    return 0
+
+
+
+def bundle_job_rows(bundle, jobs, st=None):
+    """Queue rows belonging to `bundle`: stamped with its bundle tag, or labelled as one
+    of its plan's slices (self-heal's slice_job_labels, esc-review prefix included)."""
+    want = set()
+    for sid in ((st or {}).get("slices") or {}):
+        want.add(heal().slice_job_labels(bundle, sid))
+    return [j for j in jobs if j.get("bundle") == bundle
+            or (want and slice_base(j.get("label")) in want)]
+
+
+def retire_refusal(reason, rows, signoff_ids):
+    """PURE. Why `qctl retire` must not run, or None. `rows` = the bundle's queue rows,
+    `signoff_ids` = ids of run-status rows awaiting sign-off."""
+    if not (reason or "").strip():
+        return "--reason is required (non-empty): what retired this bundle and where it landed"
+    live = [j for j in rows if j.get("status") in RETIRE_LIVE]
+    if live:
+        return ("bundle has live job(s) " + ", ".join(f"{j['id']} ({j['status']})" for j in live)
+                + " -- let them finish or cancel them first")
+    held = [j["id"] for j in rows if j.get("id") in set(signoff_ids)]
+    if held:
+        return ("awaiting_signoff: " + ", ".join(held)
+                + " -- a human must sign off / override before the bundle is retired")
+    return None
+
+
+def cmd_retire(a):
+    """Retire an ACTIVE bundle: (1) supersede marker, (2) plan --cancel, (3) resolve its
+    finished queue rows. `supersede` alone only hides the history entry; the plan stays
+    armed and its rows stay in the Queue (2026-10-08 dashboard triage). Idempotent:
+    each step is skipped when already done. Never deletes anything else."""
+    if not a.bundle:
+        raise Refused("BUNDLE is required")
+    reason = (a.reason or "").strip()
+    why = retire_refusal(reason, [], [])        # reason check needs no state
+    if why:
+        raise Refused(why)
+    st = run_state(a.bundle)
+    rows = bundle_job_rows(a.bundle, queue_jobs(), st)
+    code, runs = _api("GET", "/api/runs")
+    api_ok = code == 200 and isinstance(runs, list)
+    if not api_ok:
+        raise Refused(f"run-status API unavailable ({code}): cannot prove no row awaits sign-off")
+    signoff = [r.get("id") for r in runs if r.get("awaiting_signoff")]
+    why = retire_refusal(reason, rows, signoff)
+    if why:
+        raise Refused(why)
+    bv = _load_mod("bundle_view", BIN / "bundle_view.py")
+    pc = _load_mod("plan_cancel", BIN / "plan_cancel.py")
+    did = 0
+    # 1. supersede marker (keeps an existing record: the first reason stays authoritative)
+    if a.bundle in bv.load_superseded():
+        print(f"  supersede: {a.bundle} already marked -- kept")
+    elif a.dry_run:
+        print(f"  [dry-run] would mark {a.bundle} superseded (retired: {reason})")
+    else:
+        bv.mark_superseded(a.bundle, "qctl retire", f"retired: {reason}")
+        print(f"  supersede: marked {a.bundle}")
+        did += 1
+    # 2. plan cancel (only when a plan exists for it; a bare tagged bundle has none)
+    own = pc.cancelled(a.bundle, runs_dir=SLICE_RUNS)
+    if own:
+        print("  cancel: plan already cancelled -- kept")
+    elif not st:
+        print("  cancel: no slice plan for this bundle -- nothing to cancel")
+    else:
+        if a.dry_run:
+            print("  [dry-run] would mark the plan cancelled")
+        else:
+            pc.mark_cancelled(a.bundle, f"retired via qctl: {reason}", by="qctl retire",
+                              runs_dir=SLICE_RUNS)
+            print("  cancel: plan marked cancelled")
+            did += 1
+    # 3. resolve finished rows (never a live/held/paused/planned one)
+    todo = [j for j in rows if j.get("status") in RETIRE_RESOLVABLE]
+    for j in rows:
+        if j not in todo:
+            print(f"  kept {j['id']} ({j.get('status')}): not a finished row")
+    nfail = 0
+    for j in todo:
+        rc, _ = _run([sys.executable, str(BIN / "ollama-queue.py"), "resolve", j["id"]], a.dry_run, 120)
+        if rc != 0:
+            nfail += 1
+        else:
+            did += 0 if a.dry_run else 1
+    if nfail:
+        raise Refused(f"{nfail} row(s) could not be resolved (re-run qctl retire to retry)")
+    if a.dry_run:
+        print(f"[dry-run] {a.bundle}: nothing changed")
+    else:
+        print(f"retired {a.bundle}" if did else f"{a.bundle}: already retired -- nothing to do")
+        _worktree_cleanup(bundle=a.bundle)
+    return 0
+
+
+# ------------------------------------------------------------- auto-retire --
+_GEN_PREFIX = re.compile(r"^mini\d+[-_]")
+
+
+def label_stem(label):
+    """PURE. Strip a leading `miniN-`/`miniN_` run-generation prefix: mini3-amz-photo-2p -> amz-photo-2p."""
+    return _GEN_PREFIX.sub("", str(label or ""), count=1)
+
+
+def _done_passed(d, logs):
+    """PURE-ish. True when this .done.json sidecar is an ACCEPTED/PASS finish: status done AND
+    (runner_verdict PASS, or the runner's livelog final RESULT is PASS, or a gate.json verdict pass)."""
+    if d.get("status") != "done":
+        return False
+    rv = d.get("runner_verdict")
+    if rv:
+        return str(rv).startswith("PASS")
+    if os.path.basename(str(d.get("runner") or "")) == "mini-swe-runner.py":
+        lines = []
+        try:
+            for lp in (d.get("live_log_path"), d.get("log_path")):
+                if lp and Path(lp).exists():
+                    lines += [l for l in Path(lp).read_text(errors="replace").splitlines() if l.startswith("RESULT ")]
+                    if lines:
+                        break
+        except OSError:
+            pass
+        return bool(lines) and lines[-1].startswith("RESULT PASS")
+    g = _json(Path(logs) / f"{d.get('id')}.gate.json", {}) or {}
+    return str(g.get("verdict") or "").lower() == "pass"
+
+
+_LIVE = ("pending", "running", "queued")
+_FINISHED_FAILED = ("failed", "blocked", "needs_opus", "done_unconverged")
+
+
+def _norm_ts(t):
+    """PURE. Normalise an ISO timestamp (Z or +00:00 suffix) to a comparable UTC string; '' if unparseable."""
+    if not t:
+        return ""
+    try:
+        d = datetime.datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc).isoformat()
+    except ValueError:
+        return ""
+
+
+def auto_retire_plan(passes, rows):
+    """PURE. passes = [{id,label,bundle,ts}] (PASS finishes); rows = live queue rows
+    [{id,label,bundle,status,ts}]. Returns [(bundle, replacement_row)] to retire: a bundle whose rows are
+    ALL finished-failed (status failed/blocked/needs_opus/done_unconverged), with at least one `failed`,
+    all older than a same-stem (label_stem) replacement from a DIFFERENT bundle: the newest same-stem PASS,
+    or a newer row with status pending/running/queued. Bundles with any other row are left alone; the
+    newest bundle is never retired (a replacement must itself be live/PASS), so its failure shows."""
+    by_stem = {}
+    for pz in passes:
+        st = label_stem(pz.get("bundle") or pz.get("label"))
+        if st and (st not in by_stem or _norm_ts(pz.get("ts")) > _norm_ts(by_stem[st].get("ts"))):
+            by_stem[st] = pz
+    groups = {}
+    for r in rows:
+        b = r.get("bundle")
+        if b:
+            groups.setdefault(b, []).append(r)
+    out = []
+    for b, rs in sorted(groups.items()):
+        if not any(r.get("status") == "failed" for r in rs):
+            continue
+        if any(r.get("status") not in _FINISHED_FAILED for r in rs):
+            continue
+        if not all(_norm_ts(r.get("ts")) for r in rs):
+            continue
+        newest = max(_norm_ts(r["ts"]) for r in rs)
+        stem = label_stem(b)
+        cands = []
+        pz = by_stem.get(stem)
+        if pz and pz.get("bundle") != b and newest < _norm_ts(pz.get("ts")):
+            cands.append((_norm_ts(pz.get("ts")), pz))
+        for b2, rs2 in groups.items():
+            if b2 == b or label_stem(b2) != stem:
+                continue
+            for r2 in rs2:
+                if r2.get("status") in _LIVE and newest < _norm_ts(r2.get("ts")):
+                    cands.append((_norm_ts(r2["ts"]), r2))
+        if cands:
+            out.append((b, max(cands, key=lambda c: c[0])[1]))
+    return out
+
+
+def auto_retire(dry_run=False, retire=None, logs=None, jobs=None):
+    """Retire older failed bundles superseded by a same-stem PASS or a newer live (pending/running/queued)
+    same-stem bundle, through cmd_retire (supersede marker + plan cancel + `ollama-queue.py resolve`;
+    never /api/runs/<id>/clear). Returns a list of (bundle, outcome). `retire` is injectable for tests."""
+    logs = Path(logs or QUEUE_LOGS)
+    passes = []
+    for f in logs.glob("*.done.json"):
+        d = _json(f, None)
+        if isinstance(d, dict) and d.get("id") and _done_passed(d, logs):
+            passes.append({"id": d["id"], "label": d.get("label"), "bundle": d.get("bundle") or d.get("label"),
+                           "ts": d.get("persisted_at") or ""})
+    rows = []
+    for j in (jobs if jobs is not None else queue_jobs()):
+        d = _json(logs / f"{j.get('id')}.done.json", None)
+        ts = (d.get("persisted_at") if isinstance(d, dict) else "") or j.get("enqueued_at") or ""
+        rows.append({"id": j.get("id"), "label": j.get("label"), "bundle": j.get("bundle"),
+                     "status": j.get("status"), "ts": ts})
+    retire = retire or cmd_retire
+    res = []
+    for b, pz in auto_retire_plan(passes, rows):
+        kind = "PASS" if pz.get("status") in (None, "done") else pz.get("status")
+        reason = f"auto-retire: superseded by {kind} {pz['label']} ({pz['id']})"
+        try:
+            retire(argparse.Namespace(bundle=b, reason=reason, dry_run=dry_run))
+            res.append((b, "dry-run" if dry_run else "retired"))
+        except Refused as e:
+            res.append((b, f"skipped: {e}"))
+    return res
+
+
+def cmd_auto_retire(a):
+    res = auto_retire(dry_run=a.dry_run)
+    for b, o in res:
+        print(f"auto-retire {b}: {o}")
+    if not res:
+        print("auto-retire: nothing to do")
+    return 0
+
+
+def cmd_bundle(a):
+    by = {j["id"]: j for j in queue_jobs()}
+    missing = [i for i in a.jobs if i not in by]
+    if missing:
+        raise Refused("unknown job id(s): " + ", ".join(missing))
+    if not a.tag:
+        for i in a.jobs:
+            print(f"{i}  bundle={by[i].get('bundle') or '-'}  {by[i].get('label')}")
+        return 0
+    rc, _ = _run([sys.executable, str(BIN / "ollama-queue.py"), "bundle", a.tag, *a.jobs], a.dry_run, 60)
+    if rc != 0:
+        raise Refused(f"ollama-queue.py bundle exited {rc}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="qctl", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="\n".join(__doc__.split("\n")[-9:]))
+    sub = ap.add_subparsers(dest="verb", required=True)
+    p = sub.add_parser("status", help="bundles -> slices -> stage rows")
+    p.add_argument("bundle", nargs="?")
+    p = sub.add_parser("clear", help="retire a done/skipped slice's ledger/handoff/run rows")
+    p.add_argument("bundle"); p.add_argument("slice"); p.add_argument("--reason")
+    p = sub.add_parser("slots", help="studio-db coding+gate slot occupancy; concurrent-vs-alone tok/s")
+    p = sub.add_parser("why", help="what a job is waiting on")
+    p.add_argument("job")
+    p = sub.add_parser("bundle", help="show or stamp jobs' bundle")
+    p.add_argument("jobs", nargs="+"); p.add_argument("--tag")
+    p = sub.add_parser("supersede", help="mark a failed/stalled bundle or slice superseded-by")
+    p.add_argument("bundle", nargs="?"); p.add_argument("--slice"); p.add_argument("--by")
+    p.add_argument("--reason"); p.add_argument("--undo", action="store_true")
+    p.add_argument("--list", action="store_true")
+    p = sub.add_parser("retire", help="retire an ACTIVE bundle: supersede + plan --cancel + resolve rows")
+    p.add_argument("bundle", nargs="?"); p.add_argument("--reason")
+    p = sub.add_parser("close", help="close ONE finished job: slice+bundle superseded markers + clear its dashboard card")
+    p.add_argument("job_id"); p.add_argument("--by"); p.add_argument("--reason")
+    p.add_argument("--accept", action="store_true", help="also accept the verdict (accept-bundle --job ID); default is dismiss only")
+    p = sub.add_parser("auto-retire", help="retire older failed same-stem bundles once a later one PASSED")
+    p = sub.add_parser("failures", help="failure ledger: table / summary / one job's fingerprint")
+    p.add_argument("--bundle"); p.add_argument("--slice"); p.add_argument("--since")
+    p.add_argument("--by", choices=["signature", "slice", "bundle"]); p.add_argument("--job")
+    p = sub.add_parser("timeline", help="chronological per-slice story with signatures")
+    p.add_argument("bundle"); p.add_argument("slice")
+    p = sub.add_parser("runs-clear", help="run-status retention preview / clear named ids")
+    p.add_argument("--apply", nargs="+", metavar="ID", help="clear ONLY these ids")
+    for sp in sub.choices.values():
+        sp.add_argument("--dry-run", action="store_true", help="print, change nothing")
+    _av = sys.argv[1:] if argv is None else argv
+    if _av and _av[0] == "triage":        # passthrough to the triage handoff CLI
+        os.execv(sys.executable, [sys.executable, os.path.expanduser("~/bin/triage-emit.py")] + list(_av[1:]))
+    a = ap.parse_args(argv)
+    fn = {"status": cmd_status, "clear": cmd_clear,
+          "why": cmd_why, "slots": cmd_slots, "failures": cmd_failures, "timeline": cmd_timeline, "bundle": cmd_bundle, "runs-clear": cmd_runs_clear,
+          "supersede": cmd_supersede, "retire": cmd_retire, "close": cmd_close,
+          "auto-retire": cmd_auto_retire}[a.verb]
+    b, s = getattr(a, "bundle", None), getattr(a, "slice", None)
+    mutating = a.verb in ("retry", "skip", "clear", "retire", "close", "auto-retire") or (a.verb == "supersede" and not a.list) or (a.verb == "bundle" and a.tag) \
+        or (a.verb == "runs-clear" and a.apply)
+    try:
+        rc = fn(a)
+        if mutating:
+            log_decision(a.verb, b if isinstance(b, str) else None, s,
+                         outcome="dry-run" if a.dry_run else "done",
+                         detail=getattr(a, "reason", "") or "")
+        return rc
+    except Refused as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        if mutating:
+            log_decision(a.verb, b if isinstance(b, str) else None, s, outcome="refused",
+                         detail=str(e))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

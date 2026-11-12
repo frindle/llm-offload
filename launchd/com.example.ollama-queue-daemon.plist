@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BONSAI_CTX</key>
+		<string>65536</string>
+		<key>GATE_AUTOFIX_MODE</key>
+		<string>live</string>
+		<key>GATE_PREGATE_HOST</key>
+		<string>unraid</string>
+		<key>GATE_PREGATE_MODEL</key>
+		<string>qwen3:14b</string>
+		<key>GATE_PREGATE_NUM_CTX</key>
+		<string>6144</string>
+		<key>GATE_TWO_TIER</key>
+		<string>1</string>
+		<key>HOME</key>
+		<string>/Users/user</string>
+		<key>PATH</key>
+		<string>/Users/user/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/pivy/bin</string>
+		<key>USER</key>
+		<string>owner</string>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>60</integer>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.example.ollama-queue-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/user/bin/ollama-queue.py</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/user/bin/ollama-queue-daemon.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/user/bin/ollama-queue-daemon.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/user/bin</string>
+</dict>
+</plist>

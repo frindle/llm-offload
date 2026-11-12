@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""mini-precheck SPEC.json [--cwd DIR] [--keep-path]
+
+Run only the mini-swe-runner pre-run check (precheck(): binaries on the agent's PATH, test_cmd first command
+not 127, target_fn present in the allowed files, test_file directory, baseline_from git state, and with
+--cwd (a prepared scratch dir) the oracle soundness + TASK.md preflight) and exit non-zero listing the reasons.
+Run it before enqueueing. By default PATH is first set to the queue daemon's PATH (Homebrew first, as under launchd); --keep-path uses your shell PATH instead. Handles `steps` specs.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("spec")
+    ap.add_argument("--cwd")
+    ap.add_argument("--keep-path", action="store_true")
+    a = ap.parse_args()
+    if not a.keep_path:
+        os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # the queue daemon's PATH (launchd)
+    here = Path(os.path.realpath(__file__)).parent
+    rp = Path(os.environ.get("MINI_RUNNER") or here / "mini-swe-runner.py")
+    sp = importlib.util.spec_from_file_location("mini_swe_runner", rp,  # explicit loader: a candidate copy (mini-swe-runner.py.new) has no .py suffix
+                                                loader=importlib.machinery.SourceFileLoader("mini_swe_runner", str(rp)))
+    r = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(r)
+    try:
+        spec = json.loads(Path(a.spec).read_text())
+    except (OSError, ValueError) as e:
+        print(f"mini-precheck: cannot read spec: {e}", file=sys.stderr)
+        return 2
+    err, warn = r.precheck_all(spec, a.cwd)
+    for w in warn:
+        print(f"WARN: {w}")
+    for e in err:
+        print(f"FAIL: {e}")
+    print("precheck " + ("FAILED" if err else "ok"))
+    return 1 if err else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
