@@ -21,6 +21,10 @@ Order of work. Any failure stops the sync before anything is written, committed 
      secret-named environment variables). Known fakes go in the repo's .secret-allow as "path<TAB>kind<TAB>why".
   3. Runtime check: staged files matching a [runtime] glob (code that machines run from a published image) must pass
      the private-info scan BEFORE scrubbing. Scrubbing them would break the image, so they get fixed at the source.
+     When ~/bin has queue-image/MANIFEST (the files the queue image ships), those files are runtime files too, along
+     with queue-image/ itself: they are published even when [bin-exclude] matches them (the image is built from this
+     public repo), a listed ~/bin symlink must be backed by the dashboard's src/ (the image workflow overlays
+     dashboard/src/*.py onto bin/), and a listed file the public tree would lack stops the sync.
   4. Scrub the staged tree: the private rules rewrite names, home paths, hosts, domains and labels (file names too);
      private IPv4 and MAC addresses become documentation addresses, keyed by a private salt so they can't be reversed.
   5. Private-info scan of the scrubbed tree and the repo's own files: private IPv4 (RFC 1918, 100.64/10), MAC
@@ -67,6 +71,8 @@ SOURCES = {"hooks": HOME / ".claude/hooks", "launchd": HOME / "Library/LaunchAge
            "config": HOME / ".ollama-dispatch", "state-docs": HOME / ".ollama-dispatch"}
 DEST = {"hooks": "hooks", "launchd": "launchd", "config": "config", "state-docs": "docs/state"}
 FIXED_MANAGED = ["bin", "hooks", "launchd", "config", "docs/state"]
+IMAGE_MANIFEST = "queue-image/MANIFEST"     # in ~/bin: the files the queue image ships (absent before the queue move)
+IMAGE_DASH = "dashboard"                    # the [git-sources] dest whose src/*.py the image workflow overlays on bin/
 SECTIONS = ["bin-exclude", "git-sources", "runtime", "hooks", "launchd", "config", "state-docs"]
 STATE = ".sync-state.json"
 ALLOW_FILES = (".secret-allow", ".private-allow")
@@ -150,8 +156,8 @@ def manifest():
     return out
 
 
-def stage_git(dst, checkout, ref, excludes=()):
-    """checkout@ref -> dst: regular files only (no symlinks, no submodules), minus the excludes."""
+def stage_git(dst, checkout, ref, excludes=(), keep=()):
+    """checkout@ref -> dst: regular files only (no symlinks, no submodules), minus the excludes (except the keep names)."""
     head = run("git", "-C", checkout, "rev-parse", "--verify", ref + "^{commit}").stdout.decode().strip()
     tar = run("git", "-C", checkout, "archive", "--format=tar", head).stdout
     skipped, n = [], 0
@@ -162,7 +168,7 @@ def stage_git(dst, checkout, ref, excludes=()):
             if not m.isreg():
                 skipped.append(m.name)
                 continue
-            if any(fnmatch.fnmatchcase(m.name, pat) for pat in excludes):
+            if m.name not in keep and any(fnmatch.fnmatchcase(m.name, pat) for pat in excludes):
                 continue
             parts = Path(m.name).parts
             if m.name.startswith("/") or ".." in parts or ".git" in parts:
@@ -194,6 +200,42 @@ def stage_files(dst, src_dir, names):
         shutil.copyfile(src, dst / name)
         (dst / name).chmod(0o755 if os.access(src, os.X_OK) else 0o644)
     return missing
+
+
+def image_entries(head):
+    """The queue image's file list (queue-image/MANIFEST in ~/bin at head); [] when there is none."""
+    r = run("git", "-C", BIN, "show", "%s:%s" % (head, IMAGE_MANIFEST), check=False)
+    if r.returncode:
+        return []
+    out = []
+    for raw in r.stdout.decode(errors="replace").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("/") or ".." in Path(line).parts:
+            die("%s: bad path %r" % (IMAGE_MANIFEST, line))
+        out.append(line)
+    return out
+
+
+def image_runtime(stage, entries):
+    """[runtime] globs for the queue image's files; stops the sync if the public tree would lack one."""
+    esc = lambda s: re.sub(r"([*?[])", r"[\1]", s)
+    globs, lost = ["bin/queue-image/*"], []
+    for e in entries:
+        hit = False
+        if (stage / "bin" / e).is_file():
+            globs.append("bin/" + esc(e))
+            hit = True
+        if "/" not in e and (stage / IMAGE_DASH / "src" / e).is_file():
+            globs.append(IMAGE_DASH + "/src/" + esc(e))
+            hit = True
+        if not hit:
+            lost.append(e)
+    if lost:
+        die("queue image: %s lists %d file(s) the public tree would not have (missing from ~/bin HEAD, or a symlink "
+            "not backed by %s/src/): %s" % (IMAGE_MANIFEST, len(lost), IMAGE_DASH, ", ".join(lost)))
+    return globs
 
 
 def files(root):
@@ -479,9 +521,12 @@ def main():
     heads = {}
     with tempfile.TemporaryDirectory(prefix="co-sync-") as td:
         stage = Path(td) / "tree"
-        head, n, skipped = stage_git(stage / "bin", BIN, "HEAD", man["bin-exclude"])
+        bin_head = run("git", "-C", BIN, "rev-parse", "--verify", "HEAD^{commit}").stdout.decode().strip()
+        image = image_entries(bin_head)
+        head, n, skipped = stage_git(stage / "bin", BIN, bin_head, man["bin-exclude"], keep=set(image))
         for dest, checkout, ref in man["git-sources"]:
             heads[dest] = stage_git(stage / dest, checkout, ref, [".github/*"])[0]
+        runtime = man["runtime"] + (image_runtime(stage, image) if image else [])
         missing = []
         for sec in ["hooks", "launchd", "config", "state-docs"]:
             missing += stage_files(stage / DEST[sec], SOURCES[sec], man[sec])
@@ -503,8 +548,8 @@ def main():
             report(found, "SECRET GUARD")
             die("secret guard: %d finding(s); nothing copied or committed" % len(found))
         pallow = private_allowed()
-        if man["runtime"]:
-            found = scan_tree(stage, cfg, pallow, only=man["runtime"])
+        if runtime:
+            found = scan_tree(stage, cfg, pallow, only=runtime)
             if found:
                 report(found, "RUNTIME")
                 die("runtime check: %d private-info finding(s) in files machines run; fix them at the source "
