@@ -6,7 +6,7 @@ on this Mac), collects the artifacts and normalizes each arm's output.
   loc_submit.py --tasks a,b,c          jobs for those tasks (default: every task named in $R/grade*/results.txt)
   loc_submit.py --normalize-only       re-normalize saved raw artifacts (~/offload-research/localize/raw/<task>/)
   loc_submit.py --collect a2a=36cb4de2 fetch a finished job's artifacts after its submitter was killed
-  options: --arms sweet,colgrep  --jobs N (<=3)  --query-max CHARS  --force
+  options: --arms sweet,sweetfast,colgrep  --jobs N (<=3)  --query-max CHARS  --force
 
 Output per arm/task: ~/offload-research/localize/out/<arm>/<task>.json
   {"task","arm","tool_version","query_chars","files":[top 20],"functions":[top 50 {"path","symbol","start","end"}],
@@ -31,8 +31,8 @@ HERE = Path(__file__).resolve().parent
 R = Path("/private/tmp/claude-501/-Users-user-Desktop-GitHub-Projects-claude-offload-nosync/"
          "bc93b00c-1a09-40bf-8add-2df5a1fcac65/scratchpad/real")
 LOC = Path.home() / "offload-research" / "localize"
-VERSIONS = {"sweet": "sweet-search@2.10.5", "colgrep": "colgrep v1.8.5 (LateOn-Code-edge default)"}
-ARM_NAME = {"sweet": "sweet-search", "colgrep": "colgrep"}
+VERSIONS = {"sweet": "sweet-search@2.10.5", "sweetfast": "sweet-search@2.10.5 --no-late-interaction", "colgrep": "colgrep v1.8.5 (LateOn-Code-edge default)"}
+ARM_NAME = {"sweet": "sweet-search", "sweetfast": "sweet-search-noli", "colgrep": "colgrep"}
 SETUP_TIMEOUT = 1800
 RUN_TIMEOUT = 6000
 LOCK = threading.Lock()
@@ -230,7 +230,7 @@ def norm_sweet(text):
 def normalize(task, qchars):
     ex = LOC / "raw" / task / "x"
     outs = {}
-    for arm in ("colgrep", "sweet"):
+    for arm in ("colgrep", "sweet", "sweetfast"):
         tj = ex / f"{arm}.times.json"
         if not tj.is_file():
             continue
@@ -241,7 +241,7 @@ def normalize(task, qchars):
                 rawtxt = (ex / "colgrep.search.json").read_text("utf-8", "replace")
                 files, funcs = norm_colgrep(rawtxt)
             else:
-                rawtxt = (ex / "sweet.search.out").read_text("utf-8", "replace")
+                rawtxt = (ex / f"{arm}.search.out").read_text("utf-8", "replace")
                 files, funcs = norm_sweet(rawtxt)
         except Exception as e:  # noqa: BLE001
             err = f"{type(e).__name__}: {e}"

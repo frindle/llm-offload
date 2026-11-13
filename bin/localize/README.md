@@ -20,3 +20,7 @@ the dispatch-cpu-runner (`submit_cpu_job(..., fallback=False)`); the Mac only pa
   hit@10 70%, MRR 0.39; function hit@5 9%, hit@10 22%. Below the 60% file hit@3 kill line, so arm A stops here.
   As a "patch missed a file" gate its false-alarm rate on passing patches is 63% at k=1, so it is no use there either.
 - Arm B (sweet-search) started the same day, one runner job at a time (~20-25 min per task on the Unraid CPU).
+- Arm B dropped the same day, before scoring: too slow on the Unraid CPU. Default mode: one big repo was 22% through
+  indexing after 50 min, a small one took 24 min. Light mode (`sweetfast`, no late-interaction index): bibtex 447 s,
+  conan1 still indexing after 21 min (bar: about 10 min per task), so it was stopped and its runner job cancelled.
+  SweRank (CC-BY-NC-4.0) stays out unless the owner OKs it. No localizer arm is live.

@@ -277,6 +277,8 @@ fi
 fi
 
 # ---------------------------------------------------------------------------------------------
+# Historical step (early 11-2026 batch). Since 11-12 the runner is published by offload-repo-sync to frindle/llm-offload
+# (image ghcr.io/frindle/llm-offload-cpu-runner); frindle/dispatch-cpu-runner is retired, so this step no longer applies.
 if want runner; then
 say "4. dispatch-cpu-runner: feat/runner-caps-python -> main, CI, Unraid commands"
 cd "$RUN"

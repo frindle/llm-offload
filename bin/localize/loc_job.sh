@@ -86,6 +86,11 @@ run_arm() {
       timeout 600 sweet-search "$q" --json --no-banner -k "$top" >"$ART/sweet.search.out" 2>"$ART/sweet.search.err"; echo $? >"$ART/sweet.search.rc"; t2=$(now)
       timeout 60 sweet-search daemon stop >"$ART/sweet.daemon-stop.out" 2>&1
       ;;
+    sweetfast)   # sweet-search without its late-interaction index (the slow phase on this CPU: 22% of conan1 in 50 min)
+      t0=$(now); timeout 3000 sweet-search index --no-late-interaction >"$ART/sweetfast.index.out" 2>&1; echo $? >"$ART/sweetfast.index.rc"; t1=$(now)
+      timeout 600 sweet-search "$q" --json --no-banner --no-late-interaction -k "$top" >"$ART/sweetfast.search.out" 2>"$ART/sweetfast.search.err"; echo $? >"$ART/sweetfast.search.rc"; t2=$(now)
+      timeout 60 sweet-search daemon stop >"$ART/sweetfast.daemon-stop.out" 2>&1
+      ;;
   esac
   printf '{"arm":"%s","index_s":%s,"search_s":%s}\n' "$arm" "$(elapsed "$t0" "$t1")" "$(elapsed "$t1" "$t2")" >"$ART/$arm.times.json"
   rm -rf "$idx"
