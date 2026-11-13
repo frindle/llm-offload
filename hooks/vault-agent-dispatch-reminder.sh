@@ -21,10 +21,6 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9._-')"
 [ -n "$sid" ] && date +%s > "$STATE_DIR/vault-sess-$sid-durable" 2>/dev/null
 
-LOGNOTE="Claude/Agent-Dispatch-Log-$(date -u +%Y-%m).md"
-printf '%s' "$input" | jq -c --arg ln "$LOGNOTE" '{
-  hookSpecificOutput: {
-    hookEventName: "PostToolUse",
-    additionalContext: ("VAULT REMINDER: an Agent dispatch just completed (task: " + (.tool_input.description // "n/a") + "; subagent_type: " + (.tool_input.subagent_type // "general-purpose") + "; model: " + (.tool_input.model // "default") + "). Log this dispatch now to the vault note " + $ln + " (create the note if it does not exist yet -- appending to a missing month 404s, so the first entry of a month must be a create/PUT) before moving on to anything else -- this is not optional and not to be batched for later.")
-  }
-}'
+# JOB 1 retired 2026-11-13: ~/bin/dispatch-log-hook.py (PostToolUse Agent + SubagentStop, async)
+# now writes the dispatch-log line itself, so this hook no longer asks the model to.
+echo '{}'

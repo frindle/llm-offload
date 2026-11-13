@@ -13,6 +13,8 @@
 # exempt (physical/hardware steps, applying an already-reviewed qwen-produced
 # fix, genuine one-liners, orchestration/dispatch-mechanism code itself where
 # the bootstrapping is awkward) and Claude's own judgment still decides.
+# 2026-11-13: routing text changed by ~/bin/install-coding-route.py (issue-driven fixes -> Sonnet; local
+# model only with a check that exists before the job). Undo: python3 -I ~/bin/install-coding-route.py --uninstall
 input="$(cat)"
 path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_response.filePath // empty')"
 
@@ -30,6 +32,6 @@ esac
 jq -n --arg path "$path" '{
   hookSpecificOutput: {
     hookEventName: "PostToolUse",
-    additionalContext: ("DISPATCH REMINDER: just edited " + $path + " directly. Standing rule (memory feedback_dispatch_coding_to_goose): UFN, qwen should write coding work by default, not Claude -- was this edit actually exempt (physical/hardware step, applying an already-reviewed qwen fix, a genuine one-liner, or the dispatch mechanism itself), or should this have gone through qwen-dispatch.sh first? (Advisory size rule of thumb, never a block: delegation costs ~600-900 cloud tokens of overhead, so one-liners and edits under ~40 lines are cheaper done directly; anything bigger dispatches.) If it was not exempt and nothing was dispatched, say so to the user rather than letting it pass silently.")
+    additionalContext: ("ROUTING REMINDER: just edited " + $path + " directly. Coding routing since 2026-11-13 (measured; see ~/Desktop/Claude Plans/Local LLM Usage Plan.md): (1) a bug fix that starts from an issue, an error report or a symptom goes to a Sonnet agent (fixer-sonnet, or the ladder skill), not to the local model: on these projects a local fix cost at least $5.95 of Claude per landed fix vs about $2.3-3.8 via Sonnet, and about 3 in 10 local passes hid a real bug; (2) the local model (qwen-dispatch.sh) gets only work whose check exists before the job: an existing failing test to make pass, lint, type or format errors, or a refactor that existing tests cover; every 5th local pass gets a spot audit, and if more than 1 in 20 audited passes has a real bug, stop using the lane and tell the user; (3) edits under about 40 lines are cheaper done directly. Was this edit one of those? If it should have gone to Sonnet or the local lane, say so to the user rather than letting it pass silently.")
   }
 }'
