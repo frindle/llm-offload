@@ -235,7 +235,7 @@ def test_launch_wait_names_the_unreadable_cache_and_the_lock():
     assert n["waiting_on"]["cause"] == "model-cache-unreadable"
     q._DB_VIEW["locked"] = False
     n = q.darkbloom_launch_wait(M, now, ready=False)
-    assert "check the volume is mounted and readable" in n["sentence"] and "fix: needs the owner if it persists" in n["sentence"]
+    assert "check the volume is mounted and readable" in n["sentence"] and "fix: needs %s if it persists" % q.queue_config.operator_name() in n["sentence"]
 
 
 def test_launch_wait_without_a_view_keeps_the_old_reason():
@@ -488,7 +488,7 @@ def test_held_with_the_screen_unlocked_raises_one_infra_row(env, hung):
     assert key == "path-access" and tag == "INFRA" and hung.held in msg and "with the screen unlocked" in msg
     assert not any(ch.isdigit() for ch in msg.replace(hung.held, "").replace("2+ min", "")), "no timestamps"
     n = q.path_access_wait(hung.job, t0 + 200)
-    assert "needs the owner if it persists" in n["sentence"] and n["waiting_on"]["screen_locked"] is False
+    assert "needs %s if it persists" % q.queue_config.operator_name() in n["sentence"] and n["waiting_on"]["screen_locked"] is False
     hung.release()
     _until_exits(hung.k)
     q.prime_path_access(t0 + 300, jobs=[hung.job], locked=False)

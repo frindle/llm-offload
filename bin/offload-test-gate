@@ -3,7 +3,7 @@
 compare the pass/fail list with the last green baseline. Called by offload-repo-sync before it pushes.
 
 Steps: (1) the sandbox holds no `hidden` benchmark data (else exit 3, nothing run); (2) `git archive <commit>` of ~/bin and
-HEAD of the dashboard repo are unpacked into ~/work/test-gate on the sandbox; (3) every test-*.py and
+--dash-commit (default HEAD) of the dashboard repo are unpacked into ~/work/test-gate on the sandbox; (3) every test-*.py and
 `ollama-queue.py --self-test` runs there with ~/venv314/bin/python (python 3.14 + PyYAML), 8 at a time, 300 s each, in a temp
 HOME whose `bin` links to the shipped tree; (4) the result list is compared with ~/.ollama-dispatch/test-gate-baseline.json.
 
@@ -12,7 +12,7 @@ Exit: 0 pass (no newly failing test) | 1 a test newly fails | 2 no baseline (run
 A test that failed in the baseline and still fails is listed but does not block. A test that now passes is moved to
 passing in the baseline (only on an overall pass). A test missing from the baseline that fails blocks like a new fail.
 
-Usage: offload-test-gate [--take-baseline] [--commit SHA] [--json] [--keep]
+Usage: offload-test-gate [--take-baseline] [--commit SHA] [--dash-commit SHA] [--json] [--keep]
 Env (tests): OFFLOAD_GATE_BIN, OFFLOAD_GATE_DASH, OFFLOAD_GATE_BASELINE, OFFLOAD_GATE_HOST (default claude-sandbox).
 The tests themselves run only on the sandbox; here we only run ssh and git archive.
 """
@@ -176,7 +176,7 @@ def ship(repo, rev, sub):
         raise GateError("shipping %s failed (ssh %d): %s" % (sub, rc, err.strip()[-200:]))
 
 
-def run_gate(commit, keep):
+def run_gate(commit, keep, dash_commit="HEAD"):
     """-> (state, results); state 'ok' | 'hidden'. Raises GateError."""
     rc, out, err = ssh(HIDDEN_CMD, timeout=60)
     n = hidden_count(out) if rc == 0 else None
@@ -188,7 +188,7 @@ def run_gate(commit, keep):
     try:
         ssh("rm -rf %s" % WORK, timeout=120)
         ship(BIN, sha, "bin")
-        ship(DASH, "HEAD", "dash")
+        ship(DASH, dash_commit, "dash")
         rc, out, err = ssh("python3 - ", data=RUNNER.encode(), timeout=3600)
         if rc:
             raise GateError("the test run failed (ssh %d): %s" % (rc, (err or out).strip()[-300:]))
@@ -202,6 +202,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="offload-test-gate", description="test gate before the GitHub sync")
     ap.add_argument("--take-baseline", action="store_true", help="run, then write the baseline")
     ap.add_argument("--commit", default="HEAD", help="~/bin commit to test (default HEAD)")
+    ap.add_argument("--dash-commit", default="HEAD", help="dashboard repo commit to test with it (default HEAD)")
     ap.add_argument("--json", action="store_true", help="machine-readable summary on stdout")
     ap.add_argument("--keep", action="store_true", help="keep the sandbox dir")
     try:
@@ -222,7 +223,7 @@ def main(argv=None):
         return 2
     t0 = time.time()
     try:
-        state, res = run_gate(a.commit, a.keep)
+        state, res = run_gate(a.commit, a.keep, a.dash_commit)
         sha = git(BIN, "rev-parse", a.commit).stdout.decode().strip()[:12]
     except GateError as e:
         print("test gate error: %s" % e, file=sys.stderr)

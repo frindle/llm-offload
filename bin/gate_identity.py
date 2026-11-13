@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gate_identity.py -- WHAT a gate verdict judged, and whether it still holds.
 
-WHY (2026-10-06 gate audit, the owner: "get the gate issues worked out"). None of the
+WHY (2026-10-06 gate audit, the operator: "get the gate issues worked out"). None of the
 1,687 historical .gate.json records named the code they judged beyond a job id
 and a launch-baseline head. The two live consequences:
 

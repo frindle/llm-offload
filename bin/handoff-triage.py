@@ -39,7 +39,12 @@ BIN = HOME / "bin"
 EMIT = BIN / "handoff-emit.py"
 STATE = BIN / "ollama-queue-state.json"
 RESULTS = HOME / ".ollama-dispatch" / "triage" / "handoff-triage.jsonl"
-BASE = "http://127.0.0.1:8000/v1"
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
+BASE = queue_config.darkbloom_endpoint()[0].removesuffix("/v1") + "/v1"
 MODEL = "gemma-4-26b-qat-4bit"
 SAMPLING = {"temperature": 0.3, "top_p": 0.9, "max_tokens": 2048}
 
@@ -168,6 +173,9 @@ def api_key():
             return _k
     except Exception:         # noqa: BLE001
         pass
+    _k = queue_config.darkbloom_endpoint()[1]
+    if _k:
+        return _k
     d = json.load(open(HOME / ".darkbloom" / "local.json"))
     for k in ("api_key", "key", "token", "apiKey"):
         if d.get(k):
@@ -298,7 +306,9 @@ def main():
     data = emit_json()
     out_dir = Path(data["out_dir"])
     items = data["complete"]
-    state = json.load(open(STATE))
+    state = queue_config.load_queue_state(STATE)
+    if state is None:
+        sys.exit("handoff-triage: cannot read the queue state")
     live, bundle_of = live_bundles(state)
     by_cwd_pass = {}
     for i in items:

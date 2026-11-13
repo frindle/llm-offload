@@ -351,7 +351,7 @@ The compose file and appdata stay where they are now. The owner applies updates 
 6. **Hooks and state:**
    - SessionStart, Stop and the queue watcher read through the API instead of local files.
    - `ESCALATIONS.md`, the handoff panel and the ledgers move into the container volume and are read via the API.
-7. **Notifications:** `notify-owner.py` runs from the container.
+7. **Notifications:** `notify-operator.py` runs from the container.
 
 **Rollout, to avoid the churn cycle:**
 1. Build the image.

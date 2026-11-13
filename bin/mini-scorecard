@@ -44,6 +44,11 @@ until enough clean reviews bring its reject rate back to 10% or less, and while 
 are rejects (at least 20 of them) every pass that finishes after that switch turns on is reviewed (2026-11-03: the first 53
 reviews rejected 16, 30%). Both come from the state file.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import glob
 import hashlib
@@ -57,7 +62,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path(os.environ.get("OFFLOAD_HOME") or os.path.expanduser("~/.ollama-dispatch"))
-QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or os.path.expanduser("~/bin/ollama-queue-logs"))
+QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or str(queue_config.state_dir() / "ollama-queue-logs"))
 RUNS = Path(os.environ.get("OFFLOAD_RUNS") or HOME / "mini-runs")
 LEDGER, REVIEWS, STATE = HOME / "landed.jsonl", HOME / "reviews.jsonl", HOME / "offload-throttle.json"
 EXCLUDED = HOME / "excluded.jsonl"

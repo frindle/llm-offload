@@ -24,6 +24,11 @@ Automatic runs (qctl close/retire, escalation-watcher daily sweep) only APPLY wh
 enable flag exists: ~/.ollama-dispatch/worktree-cleanup.enabled. Without it they dry-run
 and log "would remove". Log: ~/.ollama-dispatch/worktree-cleanup.log.jsonl
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import importlib.machinery
 import importlib.util
@@ -49,8 +54,8 @@ PROTECTED_BRANCHES = ("main", "master")
 BRANCH_PREFIXES = ("dispatch/", "slice/", "fix/", "wt-", "draft/", "refine/", "auto/")
 ENABLE_FLAG = os.path.join(HOME, ".ollama-dispatch", "worktree-cleanup.enabled")
 LOG_PATH = os.path.join(HOME, ".ollama-dispatch", "worktree-cleanup.log.jsonl")
-QUEUE_STATE = os.path.join(BIN, "ollama-queue-state.json")
-QUEUE_LOGS = os.path.join(BIN, "ollama-queue-logs")
+QUEUE_STATE = os.path.join(str(queue_config.state_dir()), "ollama-queue-state.json")
+QUEUE_LOGS = os.path.join(str(queue_config.state_dir()), "ollama-queue-logs")
 MAX_DEPTH = 2  # root/<x> or root/<group>/<x>
 
 

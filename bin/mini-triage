@@ -12,6 +12,11 @@ fixes the right thing (design: ~/.ollama-dispatch/mini-swe-workflow-design.md). 
 Prints `CLASS <X>` plus the matching evidence lines; --write DIR appends a TRIAGE.md entry there.
 queue-submit requires TRIAGE.md before relaunching a task family.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import os
 import re
@@ -19,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-LIVE = Path(os.environ.get("MINI_LIVELOG_DIR") or Path.home() / "bin" / "ollama-queue-livelogs")
+LIVE = Path(os.environ.get("MINI_LIVELOG_DIR") or queue_config.state_dir() / "ollama-queue-livelogs")
 SIGS = [  # (class, regex) checked in order; an explicit class= tag from the runner wins
     ("INFRA", r"Connection refused|ECONNREFUSED|model .* not found|ollama.*(?:error|unreachable)|CUDA|out of memory|host down|SIGKILL"),
     ("SPEC", r"precheck FAIL|bad spec|bad cwd|cwd_guard|class=SPEC"),

@@ -580,8 +580,23 @@ def test_backend_selection():
         os.environ.pop("GOOSE_CHAT_BACKEND", None)
     ok("no flag and no env -> the documented default, not a guess",
        m.make_backend().name == m.DEFAULT_BACKEND)
-    ok("each backend's endpoint is a CONSTANT, not read from the environment",
-       m.UnraidBackend.URL == "http://198.51.100.145:11434", m.UnraidBackend.URL)
+    # The Unraid endpoint comes from the config FILE only; an exported env var must not move it.
+    cfg = Path(tempfile.mkdtemp(prefix="goose-cfg-")) / "config.toml"
+    cfg.write_text('[ollama]\nunraid_url = "http://192.0.2.10:11434/"\n')
+    saved = {k: os.environ.get(k) for k in ("QUEUE_CONFIG", "QUEUE_OLLAMA_UNRAID_URL", "OLLAMA_UNRAID_URL")}
+    os.environ["QUEUE_CONFIG"] = str(cfg)
+    os.environ["QUEUE_OLLAMA_UNRAID_URL"] = os.environ["OLLAMA_UNRAID_URL"] = "http://192.0.2.99:11434"
+    try:
+        mc = _load(PROXY_SRC, f"goose_chat_proxy_cfg_{os.getpid()}")
+        url = mc.UnraidBackend.URL
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    ok("each backend's endpoint is fixed by the config file, not read from the environment",
+       url == "http://192.0.2.10:11434", url)
     # A bad selection must still bind a port and explain itself, or goose-darkbloom.sh
     # just reports "failed to start" with no reason.
     ready = threading.Event()
@@ -604,6 +619,37 @@ def test_backend_selection():
 
 
 # ---------------------------------------------------------------- the MCP server
+def test_darkbloom_pin():
+    print("== GUARD 6 the darkbloom backend only talks to THIS machine (loopback or its own bind address) ==")
+    m = _load(PROXY_SRC, f"goose_chat_proxy_pin_{int(time.time() * 1000) % 10 ** 6}")
+    for url, want in (("http://127.0.0.1:8000/v1", True), ("http://[::1]:8000", True),
+                      ("http://0.0.0.0:8000/v1", False), ("http://localhost:8000/v1", False),
+                      ("http://127.0.0.1.example.test:8000/v1", False), ("http://u@127.0.0.1:8000/v1", False),
+                      ("ftp://127.0.0.1:8000", False), ("http://192.0.2.55:8000/v1", False), ("", False)):
+        ok(f"on_this_host({url!r}) is {want}", m.on_this_host(url) is want, m.on_this_host(url))
+    own = None
+    try:                                   # this machine's outbound address (UDP connect sends nothing)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            own = s.getsockname()[0]
+    except OSError:
+        pass
+    if own and not own.startswith("127."):
+        ok("an address this machine owns counts as this machine", m.on_this_host(f"http://{own}:8000/v1") is True, own)
+    else:
+        print("  skip own-address case (no non-loopback route here)")
+    be = m.DarkbloomBackend.__new__(m.DarkbloomBackend)
+    be._dbk = type("D", (), {"base_url": staticmethod(lambda: "http://192.0.2.55:8000")})()
+    refused = None
+    try:
+        be.base_url()
+    except m.Refused as e:
+        refused = str(e)
+    ok("GUARD 6 an off-host darkbloom base_url is REFUSED", refused and "off-host" in refused, refused)
+    be._dbk = type("D", (), {"base_url": staticmethod(lambda: "http://127.0.0.1:8000")})()
+    ok("a loopback darkbloom base_url is used", be.base_url() == "http://127.0.0.1:8000")
+
+
 def test_mcp(tmp):
     print("== mcp: the chat's entire tool surface ==")
     m = _load(MCP_SRC, "goose_queue_mcp_t")
@@ -773,6 +819,10 @@ REVERTS = [
      r"raise Refused\(f\"unknown chat backend",
      "cls = BACKENDS[DEFAULT_BACKEND]  # GUARD 5 REVERTED\n        return cls()\n        raise Refused(f\"unknown chat backend",
      "an unknown backend is REFUSED"),
+    ("GUARD 6 darkbloom pinned to this machine",
+     r"if not on_this_host\(b\):",
+     "if False:  # GUARD 6 REVERTED",
+     "an off-host darkbloom base_url is REFUSED"),
 ]
 
 
@@ -812,6 +862,8 @@ def main():
         test_proxy_unraid()
         print()
         test_backend_selection()
+        print()
+        test_darkbloom_pin()
         print()
         test_mcp(tmp)
         print()

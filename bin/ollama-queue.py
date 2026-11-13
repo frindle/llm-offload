@@ -11,7 +11,7 @@ chain also queuing work on the same host, because neither could see the
 other's state.
 
 This tool is the shared state those chains were missing. It is
-deliberately a plain FIFO, not a priority-preemption scheduler -- the owner's
+deliberately a plain FIFO, not a priority-preemption scheduler -- the operator's
 call the night this was scoped: an LLM dispatch doesn't checkpoint/resume
 cleanly mid-run, so "preemption" really means "kill and redo," which stays
 a judgment call, not something to hand to a scheduling algorithm.
@@ -112,6 +112,11 @@ it can't sit stuck as "running" forever waiting for a third restart.
 pick_host() only knows the two native-Ollama endpoints, not an ad-hoc
 llama-server port), so auto-routing is refused for it here too.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import copy
 import errno
@@ -192,7 +197,7 @@ ALLOWED_RUNNERS = {
     str(Path.home() / "bin" / "txt2img-render.py"),
     str(Path.home() / "bin" / "img2vid-render.py"),
     str(Path.home() / "bin" / "bakeoff-runner.py"),
-    # 2026-10-01 (the owner: "goose needs to run through queue for everything, even chat"):
+    # 2026-10-01 (the operator: "goose needs to run through queue for everything, even chat"):
     # serves ONE OpenAI chat-completions request for goose via ~/bin/goose-queue-proxy.py,
     # so an interactive chat turn is a normal one-job-per-lane studio-db row instead of a
     # Darkbloom slot no queue row explains.
@@ -320,8 +325,8 @@ def gpu_exclusive_launch_decision(job, jobs):
     return True, f"lane {lane} free, no gate waiting for it"
 
 
-STATE_PATH = Path.home() / "bin" / "ollama-queue-state.json"
-LOCK_PATH = Path.home() / "bin" / "ollama-queue-state.lock"
+STATE_PATH = queue_config.state_dir() / "ollama-queue-state.json"
+LOCK_PATH = queue_config.state_dir() / "ollama-queue-state.lock"
 
 # --- VERIFY SANDBOX (2026-10-05) -------------------------------------------------
 # Code under verification must never reach the REAL queue. chat-frontend-plan
@@ -373,7 +378,7 @@ def refuse_if_verify_sandboxed(cmd: str) -> None:
           file=sys.stderr)
     sys.exit(VERIFY_SANDBOX_RC)
 
-# --- Dashboard-as-worklist retention (the owner 2026-09-07) -------------------------
+# --- Dashboard-as-worklist retention (operator 2026-09-07) -------------------------
 # The dashboard is a worklist of what still needs handling, not a log. A finished
 # job clears only when it is genuinely handled:
 #   - failed / done_unconverged -> stay until an explicit `resolve` (I acted on it)
@@ -381,13 +386,13 @@ def refuse_if_verify_sandboxed(cmd: str) -> None:
 #                                   shown below the failures; resolve clears it on merge)
 #   - plain `done` (non-gate)    -> NOT saved: cleared as soon as it finishes. The dispatch's
 #                                   value lives on in its persisted gate-<id> result, not the
-#                                   done row. (the owner 2026-09-07: "Done shouldn't be saved.")
+#                                   done row. (operator 2026-09-07: "Done shouldn't be saved.")
 #   - running / pending / paused -> never auto-pruned
 # Only `prune_finished_jobs` auto-removes; everything else clears via resolve/cancel.
 RETAIN_DONE_RECENT = 0
 _GATE_LABEL_RE = re.compile(r"^(?:gate|regate)-")
 
-# --- Escalation lane: park a job for a later Opus pass (the owner 2026-09-17) --------
+# --- Escalation lane: park a job for a later Opus pass (operator 2026-09-17) --------
 # The dispatch pipeline is normally coordinated by Opus, but a fallback path runs it
 # under Sonnet when Opus session limits are exhausted. The /ollama-dispatch skill
 # bounds the judgment Sonnet must make and names three cases it must NOT decide
@@ -402,14 +407,14 @@ _GATE_LABEL_RE = re.compile(r"^(?:gate|regate)-")
 # requeues RUNNING jobs -- none of them touch a needs_opus job), its downstream deps
 # cascade to `blocked` rather than proceeding on an unresolved upstream, and every
 # pointer an Opus pass needs to decide later is snapshotted onto the job. It is
-# fully recoverable: a draining Opus/the owner session drains it via `resume` (un-park),
+# fully recoverable: a draining Opus/operator session drains it via `resume` (un-park),
 # `resolve` (handled out-of-band), or `cancel`. Escalation is an ADDITIVE safety
 # valve, never a bypass -- it does NOT clear DRAFT_UNCONFIRMED and does NOT approve a
 # relevance review; an UNPROVEN escalation parks the job for Opus to JUDGE, it never
 # marks it confirmed.
 ESCALATION_STATUS = "needs_opus"
 
-# --- PLANNED rows: the whole DAG, visible up front (the owner 2026-09-18) ----------
+# --- PLANNED rows: the whole DAG, visible up front (operator 2026-09-18) ----------
 # "i want everything showing in the queue so i see what we're working on ... one
 # job creates the next". A slice plan used to reveal ONE job at a time: the next
 # slice did not exist anywhere until the current one committed, so the queue never
@@ -447,7 +452,7 @@ def _is_worklist_job(job):
     itself is an internal review-runner nothing consumes downstream
     (handoff-emit filters gate-*/regate-* labels), and keeping it forever is what
     buried the dashboard under hundreds of near-identical rows. So a clean-`done`
-    gate/regate prunes like any other clean done job. (the owner 2026-09-18: the
+    gate/regate prunes like any other clean done job. (operator 2026-09-18: the
     dashboard is the dispatch source-of-truth; gate runners are not dispatches.
     Was: every gate/regate label counted as a worklist item regardless of
     outcome, so 317 done gate/regate rows accumulated and never cleared.)"""
@@ -470,7 +475,7 @@ def prune_finished_jobs(jobs):
     untouched -- they clear only via `resolve`/`cancel`. Pure; ordered by
     enqueued_at (single lane -> finish order ~ enqueue order)."""
     prunable = [j for j in jobs if j.get("status") == "done" and not _is_worklist_job(j)]
-    # Bug (2026-09-19, the owner: "the bundle disappeared then reappeared with the gate,
+    # Bug (2026-09-19, the operator: "the bundle disappeared then reappeared with the gate,
     # but not the job that just finished"): RETAIN_DONE_RECENT=0 means a plan-member
     # job is dropped on the very NEXT tick after it finishes -- but the slicer's
     # external --execute driver (which records the slice done in its own run-state
@@ -499,7 +504,7 @@ def prune_finished_jobs(jobs):
             return None
         return _root_plan_key(_reverse[base], _reverse)
 
-    # Bug (2026-09-19, the owner: "I just want it to show as done or pending gate and not
+    # Bug (2026-09-19, the operator: "I just want it to show as done or pending gate and not
     # disappear" -- the original "only row" guard below still pruned a finished slice's
     # OWN row the moment any sibling went live, which is most of the time): a job with
     # a CONFIRMED group key (a label the slicer's own plan file actually knows about,
@@ -514,7 +519,7 @@ def prune_finished_jobs(jobs):
     # handful of slices, so the retained set stays small. Non-plan jobs are unaffected
     # and still prune under RETAIN_DONE_RECENT as before.
     prunable = [j for j in prunable if not _confirmed_group_key(j)]
-    # Bug (2026-09-19, the owner: "why is the gate pending if it's going on Unraid" / "we
+    # Bug (2026-09-19, the operator: "why is the gate pending if it's going on Unraid" / "we
     # need to be showing s3, not have it disappear"): a job can go DONE and get pruned
     # here before its own post-completion gate/regate row exists yet or before that
     # gate is resolved -- a gate's label is `gate-<PARENT JOB ID>` (see
@@ -667,8 +672,8 @@ def _mark_superseded(jobs, new_job, now=None):
     return out
 
 
-# --- WIP-minimizing queue priority (the owner 2026-09-17) ---------------------------
-# The owner's ask: "finish the closest-to-done chain before starting a fresh one."
+# --- WIP-minimizing queue priority (operator 2026-09-17) ---------------------------
+# the operator's ask: "finish the closest-to-done chain before starting a fresh one."
 # Work-in-progress is the thing to minimize, so a job that CONTINUES an already
 # started chain (its gate, its regate, an auto-refine round, a revision/auto-fix
 # round) outranks a brand-new piece of work (auto-author-*, draft-*, a fresh
@@ -684,7 +689,7 @@ def _mark_superseded(jobs, new_job, now=None):
 # SUBORDINATE key: within one tier the launch loop sees exactly the order it saw
 # before. A stable sort is what makes that true.
 #
-# CODING AHEAD OF AUTHORING (the owner 2026-09-18: "get those code jobs promoted to the
+# CODING AHEAD OF AUTHORING (operator 2026-09-18: "get those code jobs promoted to the
 # front ahead of the author tasks"). The slice pipeline enqueues a slice's real
 # CODING job (bare <label>) the moment its harness converges, while N fresh
 # auto-author-* jobs for later slices may already be queued. If the coding job
@@ -707,7 +712,7 @@ _FOLLOWUP_MARKER = re.compile(r"[\[(]\s*(auto-fix|auto-refine|refine|revision|re
                               re.IGNORECASE)
 # HARNESS AUTHORING: authors/refines the fixture, it does not land product code.
 # auto-refine- lives HERE (not in _FOLLOWUP_PREFIXES, where it used to sit): it is
-# a refine round of an AUTHORING job, and the owner's rule is that a ready coding job
+# a refine round of an AUTHORING job, and the operator's rule is that a ready coding job
 # outranks authoring of every kind.
 _AUTHORING_PREFIXES = ("auto-author-", "auto-refine-", "draft-")
 # Explicitly fresh (bake-off arms, probes), even if some future label happens to
@@ -788,7 +793,7 @@ def enqueue_bundle_key(job, jobs, reverse=None, log_dir=None):
     anything else gets the key the scheduler would compute for it right now."""
     lab = str((job or {}).get("label") or "")
     by_id = {j.get("id"): j for j in (jobs or []) if j.get("id")}
-    # EVERY JOB BELONGS TO A BUNDLE (the owner 2026-10-02). secondop-<parent> is a child
+    # EVERY JOB BELONGS TO A BUNDLE (operator 2026-10-02). secondop-<parent> is a child
     # of its parent exactly like gate-/regate-; esc-review-<ts>-<slug> is a child of
     # the slice/job it reviews (the watcher passes --bundle; this is the fallback).
     m = re.match(r"^(?:gate|regate|secondop)-(.+)$", lab)
@@ -936,7 +941,7 @@ def _launch_plan_key(job, reverse, jobs_by_id=None):
     that suffix is a job id, NOT a slice label -- so job_group_key can't resolve it and
     the gate used to become its own bucket, which meant a RUNNING gate on Unraid did not
     pin its bundle as the focus and the scheduler jumped to another bundle mid-gate
-    (the owner, 2026-09-18). So: strip the prefix, and if the suffix is a known job id,
+    (the operator, 2026-09-18). So: strip the prefix, and if the suffix is a known job id,
     resolve THAT parent's plan (recursing once through this same resolver); only if it
     isn't a job id do we fall back to treating the suffix as a slice label. Falls back
     to the label/id so an ungrouped job is its own bucket (a group of one), never
@@ -1094,7 +1099,7 @@ def _fairshare_rerank(pending, pk, plan_rank, running_plans, pinned_group, fair)
 def pending_launch_order(jobs, pinned_group=None, fair=None):
     """The order the launch loop should CONSIDER pending jobs in.
 
-    DEPTH-FIRST BY BUNDLE (the owner 2026-09-18): finish one whole plan/bundle before
+    DEPTH-FIRST BY BUNDLE (operator 2026-09-18): finish one whole plan/bundle before
     starting the next -- "get all of one step done, then the next, without doing
     step 1 of 15 different pieces then step 2". So the PLAN is the primary key: a
     bundle's jobs cluster, and the oldest-queued (= furthest-along) plan is the
@@ -1116,7 +1121,7 @@ def pending_launch_order(jobs, pinned_group=None, fair=None):
     appears, it is a brand-new entry APPENDED to state["jobs"], so it is first-seen
     LAST and ranks behind every other bundle's already-pending backlog. promote-group
     only reorders jobs that exist AT THAT MOMENT, so it could not fix this: the very
-    next slice would fall behind again (the owner: "Web UI went to the bottom of the queue
+    next slice would fall behind again (the operator: "Web UI went to the bottom of the queue
     again" -- happened repeatedly to bg-webui, a bundle that needed a manual fix on
     nearly every slice). pinned_group is a STICKY override, independent of list
     position or first-seen order: whatever bundle key the caller passes here always
@@ -1175,7 +1180,7 @@ def continuation_insert_index(jobs):
     already queued ahead, which would run first anyway), ahead of every other pending
     job regardless of tier or enqueue time. None -> nothing pending, append.
 
-    The owner 2026-09-24, on the bake-off's refine r1 landing 5th: "even then it should have
+    operator 2026-09-24, on the bake-off's refine r1 landing 5th: "even then it should have
     gone to 2nd, not 5th." The follow-up-tier insertion in cmd_enqueue puts an
     auto-refine-* row behind every pending auto-author-* row (same AUTHORING_TIER), and
     plain FIFO-by-enqueue-time put it behind two unrelated jobs enqueued WHILE its own
@@ -1190,7 +1195,7 @@ def continuation_insert_index(jobs):
     return None
 
 
-# --- Bundle-focus scheduling (the owner 2026-09-18) --------------------------------
+# --- Bundle-focus scheduling (operator 2026-09-18) --------------------------------
 # "Keep the whole bundle intact until the whole bundle is done -- like a checklist
 # we work down." Depth-first ordering (above) is necessary but not sufficient: each
 # bundle exposes only ONE runnable slice at a time (a slice authors only after the
@@ -1208,7 +1213,7 @@ FOCUS_AUTOFEED_GRACE = 30.0   # seconds to hold an empty bundle so an auto-fed n
                               # by gate-on-complete and an auto-fed slice's author appears
                               # within seconds, so this only has to bridge that brief gap --
                               # NOT stall the whole queue. (Was 120s; a done bundle with no
-                              # next slice would freeze all other work for 2 min -- the owner saw
+                              # next slice would freeze all other work for 2 min -- the operator saw
                               # "nothing shows running" after a gate finished, 2026-09-18.)
 # A job in any of these states means its bundle still has work coming (planned/held
 # slices count -- that's what "the bundle isn't done yet" means during the gap).
@@ -1275,7 +1280,7 @@ def focus_decision(active, active_running, active_launchable, active_incomplete,
       - running or launchable now    -> hold (keep the lane on it), reset the wait.
       - empty (nothing running/launchable this tick):
           * FIRST empty tick         -> hold and START the grace clock. This is what
-            covers the owner's last-slice case: the final slice's gate on Unraid has just
+            covers the operator's last-slice case: the final slice's gate on Unraid has just
             gone terminal, the bundle looks empty, but a FAIL still has to enqueue its
             regate -- so we do NOT declare the bundle done and jump to the next one
             until the window proves no regate is coming.
@@ -1296,7 +1301,7 @@ def focus_decision(active, active_running, active_launchable, active_incomplete,
     return False, wait_since
 
 
-# --- The slicer's OWN view of a bundle's progress (the owner 2026-09-23/24) --------------
+# --- The slicer's OWN view of a bundle's progress (operator 2026-09-23/24) --------------
 # ROOT CAUSE of "the queue keeps changing bundles between slices": every "is this
 # bundle still incomplete?" test looks ONLY at queue rows (_counts_as_incomplete over
 # state["jobs"]). A sliced plan never has planned/held rows -- ollama-dispatch-slice
@@ -1410,7 +1415,7 @@ def slice_plan_progress(key, runs_dir=None, alive=None, now=None, lock_max_age_s
     return out
 
 
-# --- A plain ollama-dispatch-auto CHAIN's own view of its progress (the owner 2026-09-24) --
+# --- A plain ollama-dispatch-auto CHAIN's own view of its progress (operator 2026-09-24) --
 # "This is why we need more bundling. Auto author should have been first slice in
 # that bundle so bake off would continue." A plain `ollama-dispatch-auto` run is a
 # CHAIN: auto-author-<L> [-> auto-author-<L>-cN] -> auto-refine-<L>-r1..rN -> (the
@@ -1584,7 +1589,7 @@ def sticky_active(running_key, sticky_key, sticky_empty, top_pending_key, now,
                   grace=FOCUS_AUTOFEED_GRACE, sticky_incomplete=False,
                   ceiling=FOCUS_STALL_CEILING, driver_live=False):
     """PURE. Which bundle OWNS the lanes this tick, made STICKY across the on-demand
-    author/gate gap. This closes the bug the owner reported ("a job finished and instead of
+    author/gate gap. This closes the bug the operator reported ("a job finished and instead of
     the next slice in the bundle it jumped to another bundle"): a slice's next step is
     authored only AFTER the prior one gates+commits, so during that window the focus
     bundle has ZERO jobs in the queue -- it would vanish from contention and the old
@@ -1597,7 +1602,7 @@ def sticky_active(running_key, sticky_key, sticky_empty, top_pending_key, now,
         authored on-demand and simply is not in the queue yet, so we must NOT jump away;
       - else if the sticky bundle still has INCOMPLETE work (planned/held slices that are
         not in the queue as `pending` yet), keep holding it up to the stall ceiling. This
-        is the bundle-order bug the owner reported repeatedly ("the queue [isn't] running things
+        is the bundle-order bug the operator reported repeatedly ("the queue [isn't] running things
         in the bundle order", 2026-09-19): focus_decision() already had an `active_incomplete`
         branch documented to "keep holding: more slices are definitely coming", but it could
         NEVER fire, because THIS function dropped the bundle on the grace clock alone before
@@ -1629,7 +1634,7 @@ def sticky_active(running_key, sticky_key, sticky_empty, top_pending_key, now,
     return top_pending_key
 
 
-# --- Manual focus override (the owner 2026-09-20, "move a job ahead of the current one AND
+# --- Manual focus override (operator 2026-09-20, "move a job ahead of the current one AND
 # switch focus to it") ---------------------------------------------------------------
 # `promote` alone only reorders FIFO position; sticky_active() still keeps the OLD
 # bundle active via its grace window / sticky_incomplete ceiling (up to FOCUS_STALL_
@@ -1665,7 +1670,7 @@ def live_focus_override_key(override, now, ttl=FOCUS_OVERRIDE_TTL):
     return resolve_focus_override(None, override, now, ttl=ttl)
 
 
-# --- Bounded focus (the owner 2026-09-27, "failed after 8 hours") ------------------------
+# --- Bounded focus (operator 2026-09-27, "failed after 8 hours") ------------------------
 # Live 09-27: a ↑↑ (promote_group_for_job -> preempt + take_focus) on sidecar-bfmr-
 # login-fetch paused auto-author-bg-automate-optout-form-submission (0b130de503d8) at
 # iteration 16. The bfmr bundle then sat in a retry loop -- its s2 author/refine jobs
@@ -1680,7 +1685,7 @@ def live_focus_override_key(override, now, ttl=FOCUS_OVERRIDE_TTL):
 # window): an auto-author/auto-refine round that ends `done` is a STEP of a chain, not
 # an outcome -- a healthy chain is author + several refine rounds before its coding job,
 # and counting those would pull focus off healthy bundles mid-chain (breaking the
-# depth-first order the owner asked for). Its gate verdict is `skipped`, or `pass` for a
+# depth-first order the operator asked for). Its gate verdict is `skipped`, or `pass` for a
 # refine round's harness diff, which is not slice progress either. So:
 #   +1     a work job that ends failed/done_unconverged/needs_opus/blocked, or a
 #          CODING job whose gate verdict is `fail`;
@@ -1856,14 +1861,14 @@ def release_exhausted_focus(active, running_key, candidate_keys, exhausted):
     return active, None
 
 
-# --- BUNDLE COMMITMENT (the owner 2026-09-27) --------------------------------------------
+# --- BUNDLE COMMITMENT (operator 2026-09-27) --------------------------------------------
 # "Once we start a bundle, we work that bundle to completion. We don't change to
 # another bundle after one slice was done in a different bundle." And, refined:
 # "stay on the started bundle as long as ANYTHING in it can still run -- including
 # slices/jobs that don't depend on the failed one, and mechanical self-heals/retries
 # of the failed one. Only when every remaining item in the bundle is blocked by
 # failures does the queue move on -- and it alerts loudly that bundle X is parked on
-# failures, needs the owner. When the blocker is cleared, that bundle's remaining work
+# failures, needs the operator. When the blocker is cleared, that bundle's remaining work
 # resumes before any NEW bundle starts, because it was started first."
 #
 # Every earlier focus rule was a HEURISTIC for "is this bundle done?" and each one
@@ -1896,7 +1901,7 @@ def release_exhausted_focus(active, running_key, candidate_keys, exhausted):
 #   * "working" but nothing has moved for BUNDLE_IDLE_CEILING -> parked as stalled
 #     (also a failure, also alerted) -- the queue can never wedge on a dead driver.
 #
-# IDLE-LANE BACKFILL, SAME BUNDLE ONLY (the owner 2026-10-05, supersedes the 2026-10-01
+# IDLE-LANE BACKFILL, SAME BUNDLE ONLY (operator 2026-10-05, supersedes the 2026-10-01
 # cross-bundle relaxation). While the committed bundle is BETWEEN steps and no job is
 # running, the idle lane may take ONE job -- but only a job that CARRIES the
 # committed bundle's own tag. No job of any other bundle ever takes a lane while a
@@ -2430,7 +2435,7 @@ def chain_final_nonpass(key, chain, accepted=None, since=None, log_dir=None):
         return None
 
 
-# NEXT-STEP DECLARATION (the owner 2026-10-09, smoke order-mismatch). When a job reaches a terminal
+# NEXT-STEP DECLARATION (operator 2026-10-09, smoke order-mismatch). When a job reaches a terminal
 # state the queue records, in the SAME state write, what happens NEXT for its bundle, instead of
 # inferring it from whether a row happens to exist yet. state["_bundle_next"][bundle] =
 #   {"kind": "continue"|"done"|"park"|"blocked", "actor": "ollama-dispatch-auto"|None, "job": id,
@@ -2586,7 +2591,7 @@ def row_runnable_in_principle(j, by_id, _depth=0):
 def heal_continuation_live(j, by_id):
     """PURE. A parked (needs_opus) row that already has a LIVE continuation / re-spec row
     (named by superseded_by / continued_by, or a row whose `continues` is it): the bundle is
-    working on it, so it must not read 'needs the owner'."""
+    working on it, so it must not read 'needs the operator'."""
     jid = j.get("id")
     named = {x for x in [j.get("superseded_by")] + list(j.get("continued_by") or []) if x}
     named |= {o.get("id") for o in by_id.values() if o.get("continues") == jid}
@@ -2712,7 +2717,7 @@ def _bundle_commit_status_core(key, jobs, pk, plan=None, chain=None, settling=No
         return "working", f"waiting for gate verdict of {_ids} (runs off-lane)", True
     if plan.get("driver_live"):
         # SLICER GAP (2026-10-09): nothing running, no live row, no gate settling -- the advance is
-        # CPU/driver work. Past SLICER_GAP_YIELD_S it holds no GPU lane (the owner: the GPU must not wait on
+        # CPU/driver work. Past SLICER_GAP_YIELD_S it holds no GPU lane (the operator: the GPU must not wait on
         # CPU work); bundle_commit_step parks it and resumes it first when its next row appears.
         _since = plan.get("driver_since")
         _gap = (_now_t - _since) if _since else 0.0
@@ -2767,7 +2772,7 @@ def _bundle_commit_status_core(key, jobs, pk, plan=None, chain=None, settling=No
                                f"(no job, no live driver) -- holds no GPU lane"), False
         return "working", f"{len(plan['live'])} runnable slice(s) (next {sid} {stt})", False
     # JOB LADDER (2026-10-05, rt-bg-commitments-fix): a needs_opus row whose
-    # continuation already PASSED parked its bundle "needs the owner" 25 min after the
+    # continuation already PASSED parked its bundle "needs the operator" 25 min after the
     # continuation (3f75be3df79a, VERIFY_OK) had handled it.
     _esc_rows, _esc_pending = [], []
     for j in rows:
@@ -2872,7 +2877,7 @@ def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
     events = []
     _ls = BUNDLE_LEASE_S if lease_s is None else float(lease_s)
     parked = parked if parked is not None else {}
-    # HUMAN OVERRIDE (the owner 2026-09-27: "the commitment governs automatic scheduling,
+    # HUMAN OVERRIDE (operator 2026-09-27: "the commitment governs automatic scheduling,
     # but a human can always release or override"). A ↑↑ / `promote --take-focus` /
     # `focus` names a bundle; if it has runnable work it becomes the committed bundle
     # NOW -- the running job keeps its lane (nothing is preempted here), only the next
@@ -3059,9 +3064,9 @@ def backfill_focus_note(backfill_ok, commit_key):
 
 def commit_backfill_ok(commit_key, commit_launchable, running_keys, backfilled=False):
     """PURE. May the idle lane take ONE job this tick that the bundle-focus skip would
-    otherwise hold? ("idle-lane backfill", the owner 2026-10-01.)
+    otherwise hold? ("idle-lane backfill", operator 2026-10-01.)
 
-    SAME BUNDLE ONLY (the owner 2026-10-05). This only says the LANE is idle and the
+    SAME BUNDLE ONLY (operator 2026-10-05). This only says the LANE is idle and the
     committed bundle's resolved rows have nothing launchable; focus_skips_job then
     admits a candidate ONLY if it carries the committed bundle's own tag (a row whose
     label resolution differs from its stamped bundle). A job of ANY other bundle is
@@ -3105,17 +3110,17 @@ def focus_skips_job(job, job_key, active, hold, commit_key, barrier_exempt_ids,
     """PURE. Must the launch loop skip `job` this tick because another bundle owns
     the lanes? Under a COMMITMENT (commit_key set) only the committed bundle launches,
     plus a gate a held job of it is barrier-waiting on -- no yield-resume or
-    cross-lane exemption for other bundles (the owner 2026-09-27: no interleaving). Without
+    cross-lane exemption for other bundles (operator 2026-09-27: no interleaving). Without
     one, the older focus rules apply unchanged.
     `backfill_ok` (see commit_backfill_ok) admits ONLY a job STAMPED with the
-    committed bundle's tag (the owner 2026-10-05: backfill stays, same bundle only). A
+    committed bundle's tag (operator 2026-10-05: backfill stays, same bundle only). A
     job of another bundle is skipped whatever backfill_ok says."""
     if not hold or job_key == active or job.get("id") in (barrier_exempt_ids or ()):
         return False
     if commit_key is not None:
         tag = job.get(BUNDLE_FIELD)
         same = isinstance(tag, str) and tag.strip() == commit_key
-        # GATE PRIORITY (the owner 2026-10-06): a gate/regate/secondop/review row is never
+        # GATE PRIORITY (operator 2026-10-06): a gate/regate/secondop/review row is never
         # held by the commitment. A foreign bundle's gate is then confined to an idle,
         # non-conflicting lane by the launch loop (foreign_gate_lane_ok).
         if gate_ok and is_bundle_gate_job(job):
@@ -3126,7 +3131,7 @@ def focus_skips_job(job, job_key, active, hold, commit_key, barrier_exempt_ids,
     return active_lane is None or job_lane is None or job_lane == active_lane
 
 
-# ---- GATE PRIORITY UNDER A COMMITMENT (the owner 2026-10-06) ----------------------------
+# ---- GATE PRIORITY UNDER A COMMITMENT (operator 2026-10-06) ----------------------------
 # Gates are fast review jobs. The committed bundle's gates (gate-/regate-/secondop-/
 # esc-review- rows that resolve to it) go FIRST -- ahead of its own coding jobs, other
 # bundles' gates and everything else -- and are never held by the commitment, the
@@ -3216,7 +3221,7 @@ def gate_alt_lane_urls(job, w):
     return out
 
 
-# ---- STUDIO-DB SLOT MODEL (the owner 2026-10-06): studio-db (Darkbloom) has N slots with KINDS,
+# ---- STUDIO-DB SLOT MODEL (operator 2026-10-06): studio-db (Darkbloom) has N slots with KINDS,
 # coding(1) + gate(1) by default. One warm model serves both (serving cap 4, shared with
 # the public fleet, so the queue takes at most 2 in total). `gate_slots` in
 # ~/.ollama-dispatch/queue-slots.json (re-read every tick) is the config; 0 = the old
@@ -3417,13 +3422,13 @@ def slot_measure_update(seen, running, now, rate_of, emit, every=30.0):
               "dur_s": round(now - s["since"], 1), "conc": s["conc"]})
 
 
-# ---- QUEUE WAIT STATE (the owner 2026-10-06: "the queue looks idle while jobs are pending and
+# ---- QUEUE WAIT STATE (operator 2026-10-06: "the queue looks idle while jobs are pending and
 # I can't see why"). The daemon already DECIDED and LOGGED every reason; this threads the
 # reason out of those same code paths into a small machine-readable file that `status` and
 # the dashboard read. The hold logic is NOT re-derived anywhere else: the launch loop records
 # a note at each place it skips a job (`_wait_note`), and build_wait_state only aggregates.
 WAIT_STATE_PATH = Path.home() / ".ollama-dispatch" / "queue-wait.json"
-DAEMON_LOG_PATH = Path.home() / "bin" / "ollama-queue-daemon.log"
+DAEMON_LOG_PATH = queue_config.state_dir() / "ollama-queue-daemon.log"
 WAIT_LANES = ("studio", "studio-db", "unraid")
 WAIT_STUCK_S = 300          # idle + pending + the SAME reason this long => possible stuck seam
 WAIT_HEARTBEAT_S = 60       # rewrite an unchanged file at most this stale (so readers can tell
@@ -3703,7 +3708,7 @@ def _park_row_open(idx, key, why):
     """True when ESCALATIONS.md already holds an UNCHECKED BUNDLE PARKED row for this
     bundle with this exact (truncated) reason. Unreadable index -> False (alert)."""
     head = f"- [ ] `{key}` **BUNDLE PARKED** Q - "
-    body = f" - parked on failures, needs the owner: {str(why)[:400]} - "
+    body = f" - parked on failures, needs {queue_config.operator_name()}: {str(why)[:400]} - "
     try:
         return any(l.startswith(head) and body in l
                    for l in Path(idx).read_text().splitlines())
@@ -3715,7 +3720,7 @@ def _bundle_park_alert(key, why, now=None):
     """LOUD: an unchecked row in ESCALATIONS.md (the index every SessionStart reads)
     plus a desktop notification. Never raises."""
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now or time.time()))
-    line = (f"- [ ] `{key}` **BUNDLE PARKED** Q - {ts} - parked on failures, needs the owner: "
+    line = (f"- [ ] `{key}` **BUNDLE PARKED** Q - {ts} - parked on failures, needs {queue_config.operator_name()}: "
             f"{str(why)[:400]} - the queue moved to the next bundle; this one resumes "
             f"FIRST the moment anything in it can run again\n")
     # DEDUPE (2026-10-03): the same park was appended 2-4x a minute apart
@@ -3735,7 +3740,7 @@ def _bundle_park_alert(key, why, now=None):
     if os.environ.get("OLLAMA_QUEUE_NO_NOTIFY"):
         return
     try:
-        msg = f"bundle {key} parked on failures -- needs the owner".replace('"', "'")
+        msg = f"bundle {key} parked on failures -- needs {queue_config.operator_name()}".replace('"', "'")
         subprocess.Popen(["osascript", "-e",
                           f'display notification "{msg}" with title "ollama-queue" sound name "Basso"'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -3755,7 +3760,7 @@ _CONTROL_ALERT_LOCK = threading.Lock()
 
 def _control_alert(key, msg, now=None, idx=None, tag=None):
     """LOUD, like _bundle_park_alert, for the queue's BloomGauge control (2026-11-02): an unchecked
-    ESCALATIONS.md row "- [ ] `<key>` **BLOOMGAUGE CONTROL** Q - <ts> - needs the owner: <msg>" plus a
+    ESCALATIONS.md row "- [ ] `<key>` **BLOOMGAUGE CONTROL** Q - <ts> - needs the operator: <msg>" plus a
     desktop notification (none with OLLAMA_QUEUE_NO_NOTIFY). Keys: bloomgauge-control-pick /
     bloomgauge-control-manager (writes failed ALERT_STREAK times in a row), bloomgauge-control-log
     (the activity log unreadable 30+ min while BloomGauge answers) and darkbloom-drift
@@ -3767,7 +3772,7 @@ def _control_alert(key, msg, now=None, idx=None, tag=None):
     tag = tag or CONTROL_ALERT_TAG
     idx = Path(idx) if idx else Path.home() / ".ollama-dispatch" / "escalations" / "ESCALATIONS.md"
     head = f"- [ ] `{key}` **{tag}** Q - "
-    body = f" - needs the owner: {' '.join(str(msg).split())[:600]}"
+    body = f" - needs {queue_config.operator_name()}: {' '.join(str(msg).split())[:600]}"
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now or time.time()))
     with _CONTROL_ALERT_LOCK:
         try:
@@ -3784,7 +3789,7 @@ def _control_alert(key, msg, now=None, idx=None, tag=None):
     if not os.environ.get("OLLAMA_QUEUE_NO_NOTIFY"):
         try:
             note = (f"BloomGauge control: {key}" if tag == CONTROL_ALERT_TAG else f"{tag}: {key}")
-            note = f"{note} -- needs the owner".replace('"', "'")
+            note = f"{note} -- needs {queue_config.operator_name()}".replace('"', "'")
             subprocess.Popen(["osascript", "-e",
                               f'display notification "{note}" with title "ollama-queue" sound name "Basso"'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -3951,7 +3956,7 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
     # STALE-PARK SWEEP (2026-10-05). bundle_commit_step only re-reads parked bundles
     # when no commitment holds the lanes, so a parked bundle whose blocker was cleared
     # (rt-bg-commitments-fix: the needs_opus row it parked on was resolved after its
-    # continuation passed) stayed in _bundle_parked -- and its "needs the owner" row open --
+    # continuation passed) stayed in _bundle_parked -- and its "needs the operator" row open --
     # for as long as ANOTHER bundle stayed committed (hours), and `accept-bundle`'s
     # "dropped on the next tick" was not true either. A parked bundle that now reads
     # COMPLETE is dropped here every tick; one that can run again still waits its turn
@@ -4070,7 +4075,7 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
         if bool(commit.get("waiting_on_failure")) != _wf:
             print(f"[queue] bundle-commit: {k} "
                   + ("is WAITING ON A FAILURE (next slice failed/escalated/parked, nothing "
-                     "queued) -- it STILL holds the lanes (the owner 2026-10-05: no other bundle "
+                     "queued) -- it STILL holds the lanes (operator 2026-10-05: no other bundle "
                      "runs under a commitment); a heal that never comes parks it loudly at "
                      "the idle ceiling" if _wf else "has queued work again -- holding the lanes"))
         commit["waiting_on_failure"] = _wf
@@ -4081,7 +4086,7 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
 
 def commit_hold_decision(commit):
     """PURE. Does a recorded commitment hold the lanes for its bundle? Always, when
-    there is one (the owner 2026-10-05: hold unconditionally under a commitment).
+    there is one (operator 2026-10-05: hold unconditionally under a commitment).
     `waiting_on_failure` is informational only -- it no longer releases the hold."""
     return bool(commit) and commit.get("key") is not None
 
@@ -4096,7 +4101,7 @@ def commit_waiting_on_failure(key, jobs, pk, plan):
     NOTHING queued -- no running/pending/held/paused row of its own, gates included
     (a gate keeps the hold: gates are exempt from this release) -- no live slicer
     driver or completion marker, and every slice the slicer still counts as runnable
-    is FAILED / ESCALATED / PARKED (the owner 2026-10-02: such a bundle must not hold a
+    is FAILED / ESCALATED / PARKED (operator 2026-10-02: such a bundle must not hold a
     lane). The commitment itself stays; only the hold is lifted."""
     if key is None:
         return False
@@ -4154,7 +4159,7 @@ def yield_resume_first(order, override, now, pk, ttl=FOCUS_OVERRIDE_TTL):
     return first + rest
 
 
-# --- Chain dependencies + chain-final gating (the owner 2026-09-07) -----------------
+# --- Chain dependencies + chain-final gating (operator 2026-09-07) -----------------
 # A split fix can be enqueued as an ordered chain: each job carries `after` (the
 # full id of the job it must follow), an optional `chain` group tag, and
 # `chain_final` on the last step. The daemon launches a job only once its `after`
@@ -4276,7 +4281,7 @@ def _placeholder_label_matches(placeholder_label, real_label):
     matter how many real rounds run, fail, or escalate. Confirmed 2026-09-19
     against esim-global-s1-parse-global (real job escalated per its slice-run
     state; queue status still showed the placeholder as fresh/untouched --
-    looked to the owner like the job "went backwards" from running to planned)."""
+    looked to the operator like the job "went backwards" from running to planned)."""
     if placeholder_label == real_label:
         return True
     if real_label == f"auto-author-{placeholder_label}":
@@ -4332,7 +4337,7 @@ def _is_ungateable_job(job):
         sealed worktree. Whatever the runner touched in the repo is not an
         attributable dispatch diff, so the gate can only ever score it `fail`.
 
-    WHY THIS MATTERS (the owner 2026-09-18, live incident a3ada445c578 / e2ce30b0fb5b):
+    WHY THIS MATTERS (operator 2026-09-18, live incident a3ada445c578 / e2ce30b0fb5b):
     the bonsai ternary bake-off is task_kind=research run via
     --runner bakeoff-runner.py. On FAILURE the gate scored it
     `verdict=fail code_high=1` purely from "verify-exit" (the runner's own exit
@@ -4354,7 +4359,7 @@ def _is_ungateable_job(job):
     return False
 
 
-# --- Event-driven gate preemption (2026-09-14, the owner's design) ----------------
+# --- Event-driven gate preemption (2026-09-14, the operator's design) ----------------
 # REPLACES the old time-based GATE_HOLD reservation (removed). That scheme held a
 # long author/coding job OFF the regate lane for up to a fixed 180s window, hoping
 # an imminent gate/regate would claim the lane first -- a TIMER that left the lane
@@ -4387,7 +4392,7 @@ REGATE_LANE = os.environ.get("GATE_REGATE_HOST", "studio-db")  # lane a re-gate 
 # hand-resume). See _apply_gate_preempt_override + _gate_preempt_*.
 GATE_PREEMPT_REASON = "gate_preempt"
 
-# Same idea for a manual `promote --preempt` (2026-09-19, the owner: bg-actions s4 sat
+# Same idea for a manual `promote --preempt` (2026-09-19, the operator: bg-actions s4 sat
 # paused needing a hand `resume` after a promote bumped it -- "if we promote
 # something else the job should automatically resume ... when it gets back to
 # it"). promote_job() stamps this as preempt_intent on the victim at SIGTERM time;
@@ -4539,8 +4544,8 @@ def _settle_recovered_pause(job):
     return "paused"
 
 
-# --- Hard hold on regate (2026-09-17, the owner's decision) ------------------------
-# The owner's rule, verbatim intent: once a dispatch job FINISHES and its two-tier
+# --- Hard hold on regate (2026-09-17, the operator's decision) ------------------------
+# the operator's rule, verbatim intent: once a dispatch job FINISHES and its two-tier
 # gate/regate (the second-tier verify review) is enqueued or running, the
 # scheduler must NOT start any FRESH authoring/refine job until that gate reaches
 # a TERMINAL verdict. The gate/regate itself (and the cheap first-tier pre-gate)
@@ -4591,7 +4596,7 @@ def _gate_firing_this_tick_hold(job, gated_jobs):
     """PURE. True if this pending job must NOT launch in THIS tick because a job
     reaped earlier in the SAME tick is about to have its gate enqueued.
 
-    Bug (2026-09-19, the owner: "this is why we're supposed to be holding the next run
+    Bug (2026-09-19, the operator: "this is why we're supposed to be holding the next run
     until we know about gates"). The hard hold is keyed on gate ROWS in the queue,
     but the tick order is: reap (collect `gated_jobs`) -> reconcile holds -> LAUNCH
     -> release lock -> _fire_gate_on_complete (which is what enqueues the gate row).
@@ -4683,7 +4688,7 @@ def _pending_gate_hold(job, jobs):
     no gate qualifies -- so a resolved/failed/missing regate never holds (and
     never deadlocks) the queue.
 
-    2026-09-21, the owner: 'within a bundle we don't need to hold the next job for a
+    2026-09-21, the operator: 'within a bundle we don't need to hold the next job for a
     gate. we should only be holding the next bundle for a gate if this would
     finish out the current bundle.' The original 2026-09-17 hard-hold held EVERY
     fresh authoring job globally the instant ANY gate was unresolved -- including
@@ -4699,7 +4704,7 @@ def _pending_gate_hold(job, jobs):
          use the lane right away instead of waiting on a gate whose bundle has
          more work coming regardless of this verdict.
     When several gates qualify, names the authoritative re-gate if present (that
-    is the second-tier verdict the owner waits on), else the first qualifying gate."""
+    is the second-tier verdict the operator waits on), else the first qualifying gate."""
     if not _is_fresh_authoring_job(job):
         return (False, None)
     gates = _unresolved_gate_jobs(jobs)
@@ -4785,7 +4790,7 @@ def _auto_pipeline_sweep_candidate(job) -> bool:
     return True
 
 
-# --- STARTUP REAP of orphaned slicer advance drivers (the owner 2026-09-24) ------------
+# --- STARTUP REAP of orphaned slicer advance drivers (operator 2026-09-24) ------------
 # `launchctl kickstart -k` SIGTERMs the daemon; its in-flight WORKERS are recovered on
 # restart (adopt-or-requeue in cmd_run). But a slicer --advance-detached chain is NOT
 # a daemon child (start_new_session=True, spawned by gate-on-complete), so it can
@@ -4882,10 +4887,10 @@ def reap_orphaned_advance_locks(runs_dir=None, alive=None, kill=None, cmdline=No
 
 
 # ------------------------------------------------------------------------------
-DAEMON_LOCK_PATH = Path.home() / "bin" / "ollama-queue-daemon.lock"
-LOG_DIR = Path.home() / "bin" / "ollama-queue-logs"
+DAEMON_LOCK_PATH = queue_config.state_dir() / "ollama-queue-daemon.lock"
+LOG_DIR = queue_config.state_dir() / "ollama-queue-logs"
 
-LIVE_LOG_DIR = Path.home() / "bin" / "ollama-queue-livelogs"  # added 2026-08-29: per-job
+LIVE_LOG_DIR = queue_config.state_dir() / "ollama-queue-livelogs"  # added 2026-08-29: per-job
 # live-streaming status logs (separate dir from LOG_DIR's plain logs), wired through to
 # ollama-worker.py's --live-log/--dispatch-tag flags so a queued job can be tailed live.
 
@@ -4904,7 +4909,7 @@ def safe_label(label, maxlen=80):
 
 
 # --------------------------------------------------------------------------
-# NUMBERED RERUNS WITH A VISIBLE CAUSE (the owner, 2026-10-01)
+# NUMBERED RERUNS WITH A VISIBLE CAUSE (the operator, 2026-10-01)
 # --------------------------------------------------------------------------
 # A continuation/refine/regate round used to be indistinguishable from a first
 # attempt: same-looking label, a livelog that opens mid-story, and a dashboard row
@@ -5112,7 +5117,7 @@ def iters_flag(job_max_iters):
 #     native Ollama. Bonsai is on a DIFFERENT physical box, so it gets its own
 #     lane and must NOT be serialized against Studio (or against Unraid's native
 #     Ollama endpoint -- that is a separate process with its own GPU allocation;
-#     The owner is standing the container up separately and owns that contention).
+#     The operator is standing the container up separately and owns that contention).
 #   * OpenAI protocol. llama-server speaks /v1/chat/completions, so any job that
 #     lands on this lane is forced to --api openai regardless of what it was
 #     enqueued with, exactly as the qwen3.8 bypass already does.
@@ -5120,11 +5125,12 @@ def iters_flag(job_max_iters):
 #     (confirmed live, see Claude/Projects/bonsai-bakeoff.md). Jobs on this lane
 #     get ollama-worker.py's --preserve-reasoning so that field is not dropped.
 #
-# CONFIGURATION (the one thing the owner must supply once the container is up):
+# CONFIGURATION (the one thing the operator must supply once the container is up):
 # the endpoint is NOT hardcoded -- there is no default and no guessed IP.
 # Resolution order, first hit wins:
-#   1. $BONSAI_SERVER_URL          e.g. http://198.51.100.145:8092
-#   2. ~/.config/ollama-queue/bonsai-host   (a file containing just that URL)
+#   1. $BONSAI_SERVER_URL          e.g. http://192.0.2.10:8092
+#   2. config key bonsai.url (queue_config: env QUEUE_BONSAI_URL or config.toml)
+#   3. ~/.config/ollama-queue/bonsai-host   (a file containing just that URL)
 # Unset/empty/absent => _bonsai_url() returns None => Bonsai is NOT routable and
 # every branch below is inert. The file fallback exists because the queue daemon
 # runs as a LaunchAgent, where exporting an env var means editing a plist.
@@ -5141,6 +5147,8 @@ def _bonsai_url():
     """The configured Bonsai llama-server endpoint, or None when Bonsai is not
     configured (the default). Never raises, never guesses a host."""
     u = (os.environ.get("BONSAI_SERVER_URL") or "").strip()
+    if not u:
+        u = queue_config.get_str("bonsai.url", "").strip()
     if not u:
         try:
             u = BONSAI_URL_FILE.read_text().strip()
@@ -5182,7 +5190,7 @@ def _bonsai_healthy():
 # ===========================================================================
 # DARKBLOOM LANE -- the ONE local inference lane (2026-10-01)
 # ===========================================================================
-# The owner moved all local inference from Studio's Ollama + the llama-server bypass
+# The operator moved all local inference from Studio's Ollama + the llama-server bypass
 # onto Darkbloom (MLX, running in UNIFIED mode: the same loaded models serve the
 # public fleet and this machine's own OpenAI endpoint). See memory
 # project_darkbloom_queue_migration.
@@ -5201,7 +5209,7 @@ def _bonsai_healthy():
 #     are rewritten to the Darkbloom model that actually runs. Qwen3.8-27B cannot
 #     run on this M4 Max (needs M5/NAX), so the default is Qwen3.6-35B-A3B.
 DARKBLOOM_HOST_NAME = "darkbloom"
-# The lane name jobs carry when routed through the Darkbloom app (2026-10-01, the owner: "studio-db").
+# The lane name jobs carry when routed through the Darkbloom app (2026-10-01, the operator: "studio-db").
 # `studio` and `darkbloom` stay accepted as --host aliases; they all land on this lane.
 DARKBLOOM_LANE = "studio-db"
 DARKBLOOM_DEFAULT_MODEL = os.environ.get("DARKBLOOM_DEFAULT_MODEL",
@@ -5251,9 +5259,10 @@ DARKBLOOM_PREFS = ("auto", "studio", DARKBLOOM_LANE, DARKBLOOM_HOST_NAME)
 def _darkbloom_record():
     try:
         rec = json.loads(DARKBLOOM_LOCAL_JSON.read_text())
-        return rec if isinstance(rec, dict) else {}
+        rec = rec if isinstance(rec, dict) else {}
     except (OSError, ValueError):
-        return {}
+        rec = {}
+    return queue_config.darkbloom_apply_env(rec)      # unchanged unless DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY is set
 
 
 # Darkbloom 0.9.17 rewrites local.json with ONLY `api_key` (no `base_url`); this
@@ -5262,8 +5271,12 @@ def _darkbloom_record():
 # 27de99a9d14c, 1977f33a6919, 759f2ebc2ea1, edf9e823be47 crashed there on a pull).
 # An api_key-bearing record IS the local endpoint being on; its address is the
 # fixed local port. Same rule as darkbloom_chat.base_from_record.
-DARKBLOOM_DEFAULT_BASE = (os.environ.get("DARKBLOOM_BASE_URL")
-                          or "http://127.0.0.1:8000").rstrip("/")
+DARKBLOOM_DEFAULT_BASE = queue_config.get_str("darkbloom.base_url", "http://127.0.0.1:8000",
+                                              env="DARKBLOOM_BASE_URL").rstrip("/")
+# The big-memory ("studio") host's native Ollama. Loopback is the real meaning when the queue
+# runs on that host; a queue running elsewhere sets ollama.studio_url (env OLLAMA_STUDIO_URL).
+STUDIO_OLLAMA_URL = queue_config.get_str("ollama.studio_url", "http://127.0.0.1:11434",
+                                         env="OLLAMA_STUDIO_URL").rstrip("/")
 
 
 def _darkbloom_base_from_record(rec):
@@ -5395,17 +5408,20 @@ def _darkbloom_served_models():
     """Lower-cased ids Darkbloom serves (provider.toml enabled/preload_models +
     loaded-models.json). Empty set when unreadable. Never raises."""
     out = set()
-    try:
-        txt = DARKBLOOM_PROVIDER_TOML.read_text()
-        for m in re.finditer(r"(?m)^\s*(?:enabled_models|preload_models)\s*=\s*\[([^\]]*)\]", txt):
-            out |= {x.lower() for x in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))}
-    except OSError:
-        pass
-    try:
-        out |= {str(x).lower() for x in
-                (json.loads(DARKBLOOM_LOADED_JSON.read_text()).get("models") or []) if x}
-    except (OSError, ValueError, AttributeError):
-        pass
+    if queue_config.agent_url():
+        out = {x.lower() for x in _agent_served_exact()}      # container: the Mac files, via the status service
+    else:
+        try:
+            txt = DARKBLOOM_PROVIDER_TOML.read_text()
+            for m in re.finditer(r"(?m)^\s*(?:enabled_models|preload_models)\s*=\s*\[([^\]]*)\]", txt):
+                out |= {x.lower() for x in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))}
+        except OSError:
+            pass
+        try:
+            out |= {str(x).lower() for x in
+                    (json.loads(DARKBLOOM_LOADED_JSON.read_text()).get("models") or []) if x}
+        except (OSError, ValueError, AttributeError):
+            pass
     # same restart window as local.json (see DARKBLOOM_STICKY_S): an EMPTY read right after a
     # good one is the rewrite, not "Darkbloom serves nothing".
     if out:
@@ -5475,6 +5491,41 @@ def _darkbloom_model(model):
 _DARKBLOOM_EXACT_CACHE = [0.0, []]
 
 
+_AGENT_LANE_FACTS = {"at": 0.0, "facts": None, "tried": None}
+AGENT_FACTS_TTL_S = 10.0
+
+
+def _agent_lane_facts(refresh=True):
+    """The Mac status service's /v1/lane-plan `facts` (provider.toml / loaded-models.json contents), cached
+    AGENT_FACTS_TTL_S. Only fetched outside the state lock (no network I/O under it): under the lock the last answer
+    stands. None when the agent is unset or has never answered."""
+    now = time.monotonic()
+    c = _AGENT_LANE_FACTS
+    # "tried" also counts failed asks: while the Mac does not answer, each lookup must not wait out another 3 s
+    # timeout (a poll makes several), so a failure is retried only after the same TTL as a success.
+    if (refresh and _STATE_LOCK_DEPTH <= 0 and (c["facts"] is None or now - c["at"] >= AGENT_FACTS_TTL_S)
+            and (c.get("tried") is None or not 0 <= now - c["tried"] < AGENT_FACTS_TTL_S)):
+        c["tried"] = now
+        doc = queue_config.agent_get("/v1/lane-plan", timeout=3)
+        f = doc.get("facts") if isinstance(doc, dict) else None
+        if isinstance(f, dict):
+            c["facts"], c["at"] = f, now
+        elif c["facts"] is not None and now - c["at"] >= DARKBLOOM_STICKY_S:
+            c["facts"] = None             # an agent that stays silent past the sticky window = "no files"
+    return c["facts"]
+
+
+def _agent_served_exact():
+    """Served ids in exact casing as the Mac files list them: provider.toml enabled/preload models, then
+    loaded-models.json (the same union model_profile.served_exact_ids builds from the files). [] when unknown."""
+    f = _agent_lane_facts() or {}
+    out = [str(x) for x in f.get("provider_toml_served") or [] if x]
+    lm = f.get("loaded_models")
+    if isinstance(lm, dict):
+        out += [str(x) for x in (lm.get("models") or []) if x]
+    return list(dict.fromkeys(out))
+
+
 def _darkbloom_served_exact():
     """Served ids in exact casing (see model_profile.served_exact_ids), cached 2s so the per-job
     _darkbloom_model calls in a poll do not re-read two files each. An EMPTY read inside
@@ -5483,7 +5534,10 @@ def _darkbloom_served_exact():
     if _DARKBLOOM_EXACT_CACHE[1] and now - _DARKBLOOM_EXACT_CACHE[0] < 2.0:
         return _DARKBLOOM_EXACT_CACHE[1]
     import model_profile as _mp
-    cur = _mp.served_exact_ids(DARKBLOOM_PROVIDER_TOML, DARKBLOOM_LOADED_JSON)
+    if queue_config.agent_url():
+        cur = _agent_served_exact()
+    else:
+        cur = _mp.served_exact_ids(DARKBLOOM_PROVIDER_TOML, DARKBLOOM_LOADED_JSON)
     if cur:
         _DARKBLOOM_EXACT_CACHE[0], _DARKBLOOM_EXACT_CACHE[1] = now, cur
         return cur
@@ -5667,6 +5721,13 @@ def _darkbloom_bin(which=None):
 
 
 def _darkbloom_status_cli(timeout=8):
+    if queue_config.agent_url():
+        # container: the Mac status service runs the CLI (GET /v1/darkbloom-status). Unreachable = "" = CLI failed.
+        t = queue_config.agent_get("/v1/darkbloom-status", timeout=min(timeout, 5), text=True)
+        try:
+            return str((json.loads(t) or {}).get("text") or "") if t else ""
+        except ValueError:
+            return ""
     b = _darkbloom_bin()
     if not b:
         return ""
@@ -5925,7 +5986,7 @@ DB_PROBE_DOWN_TTL = 30.0
 #  * Darkbloom lends the machine to sandbox jobs (the io.darkbloom.sandbox addon): the provider
 #    drains, unloads the model and renews a 60 s lease until the job ends -- and /v1/models KEEPS
 #    LISTING the model the whole time (checked live during a hold), so the launch check said ready
-#    and a job could only meet modelNotLoaded. The owner: "we need to be able to wait for it to release
+#    and a job could only meet modelNotLoaded. The operator: "we need to be able to wait for it to release
 #    the machine for llm usage".
 #  * When it stopped answering, the INFRA WAIT said only "not serving": 21:16-21:37 every provider
 #    restart failed "Failed to read cache directory /Volumes/NVMe-Models/hf-cache" (macOS held the
@@ -6049,11 +6110,26 @@ def _sandbox_slots_jobs(now, path=None):
         return None
 
 
+def _agent_darkbloom_view(now):
+    """Container: the view the Mac status service built from provider.log and sandbox-slots.log (/v1/hold). "at" is
+    this process's receive time (the Mac clock is not trusted here); log_age_s was computed on the Mac. An agent that
+    does not answer gives the same view as an unreadable log: not held (fail-open)."""
+    doc = queue_config.agent_get("/v1/hold", timeout=3)
+    v = doc.get("view") if isinstance(doc, dict) else None
+    if not isinstance(v, dict):
+        return {"cause": None, "hold": False, "unreadable": True, "at": now, "sandbox_jobs": None}
+    v = dict(v)
+    v["at"] = now
+    return v
+
+
 def darkbloom_view(now=None, log_path=None, slots_path=None):
     """darkbloom_down_cause_text() of the provider log's last DB_LOG_TAIL_BYTES, plus "at" (when),
     "log_age_s" and "sandbox_jobs" (_sandbox_slots_jobs). {"cause": None, "hold": False,
     "unreadable": True, "at": now, ...} when the log cannot be read. Never raises."""
     now = time.time() if now is None else now
+    if queue_config.agent_url() and log_path is None and slots_path is None:
+        return _agent_darkbloom_view(now)
     p = Path(log_path) if log_path else DARKBLOOM_PROVIDER_LOG
     try:
         age = max(0.0, now - p.stat().st_mtime)
@@ -6166,6 +6242,8 @@ def prime_darkbloom_view(now=None, fetch=None, view=None):
         if _STATE_LOCK_DEPTH > 0 or _darkbloom_url() is None:
             return {}
         now = time.time() if now is None else now
+        if queue_config.agent_url():
+            _agent_lane_facts()          # container: keep the served-model facts fresh, outside the state lock
         v = dict(darkbloom_view(now) if view is None else view)
         v.setdefault("at", now)
         if v.get("cause") == "model-cache-unreadable":
@@ -6321,6 +6399,102 @@ def bloom_queue_work_remaining(state, pk, now=None, hooks=None, runs_dir=None, c
 
 
 
+def _bloomgauge_work(state, pk, now):
+    """{"busy", "why", "target"} for the BloomGauge control step (bloomgauge_hook's rules, below). Never raises."""
+    try:
+        busy, why = bloom_queue_work_remaining(state, pk, now)
+    except Exception as e:
+        busy, why = True, f"work check failed ({type(e).__name__}): fail toward busy"
+    _head = bloom_lane_head(state.get("jobs") or [])
+    model = _head.get("model") if _head is not None else None
+    target = model if model and ":" not in str(model) else None
+    if model and target is None:
+        # An Ollama-style tag on the Darkbloom lane runs as the Darkbloom model it maps to (its
+        # profile alias, e.g. CLAUDE.md's qwen3.8:27b-q4_K_M): pin that one (2026-11-02).
+        try:
+            if _darkbloom_url() is not None:
+                _m = _darkbloom_model(model)
+                target = _m if _m and ":" not in str(_m) else None
+        except Exception:
+            target = None
+    return {"busy": bool(busy), "why": why, "target": target}
+
+
+# The queue runs away from the Mac (QUEUE_AGENT_URL set, 2026-11-12): the control step needs the BloomGauge app on the
+# Mac's loopback, so the Mac status service (queue-agent.py POST /v1/bloomgauge-tick) runs it. This side sends the work
+# at most every BG_REMOTE_EVERY_S from a thread (the tick never waits on the network) and writes the alerts the service
+# hands back (each once: ack = the highest alert seq seen within the service's epoch).
+_BG_REMOTE = {"thread": None, "last": None, "ack": 0, "epoch": None, "fails": 0}
+BG_REMOTE_EVERY_S = 10.0
+BG_REMOTE_TIMEOUT_S = 10.0
+
+
+def _bloomgauge_remote_round(work, post=None):
+    """One exchange with the Mac status service: POST work plus {ack, epoch}; record the mode it reports (the
+    control's mode lives on the Mac) and raise each new alert through _control_alert. -> alerts raised, or None
+    when the service did not answer (logged on the 1st, 30th and every 360th miss in a row). Never raises."""
+    post = post or queue_config.agent_post
+    body = dict(work, ack=int(_BG_REMOTE["ack"]), epoch=_BG_REMOTE["epoch"])
+    try:
+        doc = post("/v1/bloomgauge-tick", body, timeout=BG_REMOTE_TIMEOUT_S)
+    except Exception:
+        doc = None
+    if not isinstance(doc, dict):
+        _BG_REMOTE["fails"] += 1
+        n = _BG_REMOTE["fails"]
+        if n in (1, 30) or n % 360 == 0:
+            print(f"[queue] bloomgauge-control: the Mac status service did not answer ({n} in a row); "
+                  f"the control step is not running", file=sys.stderr)
+        return None
+    _BG_REMOTE["fails"] = 0
+    mode = doc.get("mode")
+    if mode in ("off", "shadow", "on"):
+        _BG_MODE.update(at=time.time(), mode=mode)
+    epoch = doc.get("epoch")
+    if isinstance(epoch, str) and epoch != _BG_REMOTE["epoch"]:
+        _BG_REMOTE.update(epoch=epoch, ack=0)        # the service restarted: its alert numbers start again
+    raised = 0
+    alerts = [a for a in (doc.get("alerts") or []) if isinstance(a, dict)
+              and isinstance(a.get("seq"), int) and not isinstance(a.get("seq"), bool)]
+    for a in sorted(alerts, key=lambda a: a["seq"]):
+        if a["seq"] <= _BG_REMOTE["ack"]:
+            continue
+        key, msg = a.get("key"), a.get("msg")
+        if isinstance(msg, str) and msg.strip():
+            key = key if isinstance(key, str) and key else "bloomgauge-control"
+            print(f"[queue] !!! bloomgauge-control: {msg}", file=sys.stderr)
+            try:
+                _control_alert(key, msg)
+            except Exception as e:
+                print(f"[queue] bloomgauge-control: alert error {type(e).__name__}: {e}", file=sys.stderr)
+            raised += 1
+        _BG_REMOTE["ack"] = a["seq"]
+    return raised
+
+
+def _bloomgauge_hook_remote(state, pk, now, post=None):
+    """bloomgauge_hook when the queue runs away from the Mac: at most one exchange in flight and one per
+    BG_REMOTE_EVERY_S, on a daemon thread. -> the work sent, or None when skipped."""
+    th = _BG_REMOTE["thread"]
+    if th is not None and th.is_alive():
+        return None
+    last = _BG_REMOTE["last"]
+    if last is not None and 0 <= now - last < BG_REMOTE_EVERY_S:
+        return None
+    work = _bloomgauge_work(state, pk, now)
+    _BG_REMOTE["last"] = now
+
+    def _worker():
+        try:
+            _bloomgauge_remote_round(work, post)
+        except Exception as e:
+            print(f"[queue] bloomgauge-control: remote error {type(e).__name__}: {e}", file=sys.stderr)
+    th = threading.Thread(target=_worker, name="bloomgauge-remote", daemon=True)
+    _BG_REMOTE["thread"] = th
+    th.start()
+    return work
+
+
 def bloomgauge_hook(state, pk, now=None, bgt=None):
     """Queue-driven BloomGauge control hook, called once per daemon tick right after the plan-key
     map (design: queue_bloomgauge_control_design.md, 2026-10-31). bgt is the bloomgauge_tick module
@@ -6333,7 +6507,15 @@ def bloomgauge_hook(state, pk, now=None, bgt=None):
     bgt.run_async(work, now) with work = {"busy": bool, "why": str, "target": str|None}; a raise
     there is printed, never propagated. Before it, sets bgt._STATE['deliver'] = _control_alert (the
     control thread raises its alerts through it at once); then pops bgt._STATE['alert'] (an alert the
-    thread could not deliver) into _control_alert. Never blocks the tick on BloomGauge. -> work or None."""
+    thread could not deliver) into _control_alert. Never blocks the tick on BloomGauge. -> work or None.
+    With QUEUE_AGENT_URL set (the queue runs away from the Mac) and no bgt given: _bloomgauge_hook_remote."""
+    if bgt is None:
+        try:
+            if queue_config.agent_url():
+                return _bloomgauge_hook_remote(state, pk, time.time() if now is None else now)
+        except Exception as e:
+            print(f"[queue] bloomgauge-control: remote hook error {type(e).__name__}: {e}", file=sys.stderr)
+            return None
     try:
         if bgt is None:
             _dir = str(Path(__file__).resolve().parent)
@@ -6353,23 +6535,7 @@ def bloomgauge_hook(state, pk, now=None, bgt=None):
         return None
     if now is None:
         now = time.time()
-    try:
-        busy, why = bloom_queue_work_remaining(state, pk, now)
-    except Exception as e:
-        busy, why = True, f"work check failed ({type(e).__name__}): fail toward busy"
-    _head = bloom_lane_head(state.get("jobs") or [])
-    model = _head.get("model") if _head is not None else None
-    target = model if model and ":" not in str(model) else None
-    if model and target is None:
-        # An Ollama-style tag on the Darkbloom lane runs as the Darkbloom model it maps to (its
-        # profile alias, e.g. CLAUDE.md's qwen3.8:27b-q4_K_M): pin that one (2026-11-02).
-        try:
-            if _darkbloom_url() is not None:
-                _m = _darkbloom_model(model)
-                target = _m if _m and ":" not in str(_m) else None
-        except Exception:
-            target = None
-    work = {"busy": bool(busy), "why": why, "target": target}
+    work = _bloomgauge_work(state, pk, now)
     try:
         # The control thread raises its alerts through this at once (bloomgauge_tick._raise), so an
         # alert is not lost when the daemon dies before the pop below (2026-11-02).
@@ -6720,7 +6886,7 @@ def darkbloom_launch_wait(dbm, now, ready=None, url=None):
         if _DB_VIEW.get("cause") == "model-cache-unreadable" and _cause:
             _dbfix = ("nothing to run: the provider retries by itself and serves once macOS lets it read the "
                       "volume again (unlocking the screen does it)" if _DB_VIEW.get("locked") is True else
-                      "needs the owner if it persists: the provider cannot read its model volume")
+                      f"needs {queue_config.operator_name()} if it persists: the provider cannot read its model volume")
         return wait_note(
             "infra-darkbloom", f"darkbloom not serving {dbm} -- fix: {_dbfix}",
             f"INFRA WAIT: darkbloom not serving {dbm} at {url or _darkbloom_url()} "
@@ -6733,14 +6899,14 @@ def darkbloom_launch_wait(dbm, now, ready=None, url=None):
     if _cg:
         return wait_note(
             "infra-darkbloom", f"darkbloom cannot load {dbm}: {_cg}",
-            f"INFRA WAIT: darkbloom cannot load {dbm}: {_cg} -- needs the owner if it persists "
+            f"INFRA WAIT: darkbloom cannot load {dbm}: {_cg} -- needs {queue_config.operator_name()} if it persists "
             f"(free memory on the M4); launches when it loads, nothing to run",
             {"kind": "infra", "detail": f"darkbloom cannot load {dbm}: {_cg}"})
     return None
 
 
 def darkbloom_fix_command(models):
-    """The raw provider command that would serve `models`. FOR OWNER ONLY, never shown as a fix:
+    """The raw provider command that would serve `models`. FOR OPERATOR ONLY, never shown as a fix:
     BloomGauge runs Darkbloom, and a hand-run `darkbloom start` fights it (darkbloom_fix_hint)."""
     keep = [m for m in os.environ.get("DARKBLOOM_KEEP_MODELS", "Qwen3.5-9B").split(",") if m]
     ms = sorted(set(models)) + [m for m in keep if m not in models]
@@ -6759,11 +6925,18 @@ def _bloomgauge_control_mode(now=None):
         return _BG_MODE["mode"]
     mode = "off"
     try:
-        _dir = str(Path(__file__).resolve().parent)
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
-        import bloomgauge_control as _bgc
-        mode = str(_bgc.config().get("mode") or "off")
+        if queue_config.agent_url():
+            # The control runs on the Mac (queue-agent.py): its mode is the one that counts. The remote hook
+            # refreshes this cache every BG_REMOTE_EVERY_S; this read only covers a cold cache (a CLI run).
+            doc = queue_config.agent_get("/v1/bloomgauge-tick", timeout=3)
+            m = doc.get("mode") if isinstance(doc, dict) else None
+            mode = m if m in ("off", "shadow", "on") else "off"
+        else:
+            _dir = str(Path(__file__).resolve().parent)
+            if _dir not in sys.path:
+                sys.path.insert(0, _dir)
+            import bloomgauge_control as _bgc
+            mode = str(_bgc.config().get("mode") or "off")
     except Exception:
         mode = "off"
     _BG_MODE.update(at=now, mode=mode)
@@ -6774,14 +6947,14 @@ def darkbloom_fix_hint(models, mode=None):
     """What to do when Darkbloom does not serve `models` (2026-11-02). BloomGauge runs Darkbloom, so
     never a command: a hand-run `darkbloom` or BloomGauge write fights the queue's control and burns
     BloomGauge's hourly change budget (2 picks, 6 Manager changes), the failures seen before. Control
-    'on' (mode None = read it): nothing to do, the control pins the model. Else the owner picks it."""
+    'on' (mode None = read it): nothing to do, the control pins the model. Else the operator picks it."""
     ms = ", ".join(sorted({str(m) for m in (models or ())})) or "the model"
     mode = _bloomgauge_control_mode() if mode is None else mode
     if mode == "on":
         return (f"nothing to run: the queue's BloomGauge control pins {ms} (Manager off + a pick, "
                 f"at most 2 picks an hour); jobs launch once it is served. Never run darkbloom or "
                 f"BloomGauge write tools by hand")
-    return (f"needs the owner: pick {ms} in BloomGauge (or turn on the queue's BloomGauge control); "
+    return (f"needs {queue_config.operator_name()}: pick {ms} in BloomGauge (or turn on the queue's BloomGauge control); "
             f"never run darkbloom or BloomGauge write tools by hand")
 
 
@@ -6795,8 +6968,8 @@ def darkbloom_drift_need(jobs, on_lane, model_of):
     """The Darkbloom models the drift check holds Darkbloom to: the model of bloom_lane_head(jobs),
     the row the queue's BloomGauge control pins the model for, when on_lane(row) says it runs on
     the Darkbloom lane; else none. Until 2026-11-07 every pending and running lane row counted, so
-    rows queued behind a long run on another model raised the 75-min needs-the owner alert though
-    nothing was wrong (the owner: "run them in order and worry about 1 run at a time"). A later run's
+    rows queued behind a long run on another model raised the 75-min needs-operator alert though
+    nothing was wrong (the operator: "run them in order and worry about 1 run at a time"). A later run's
     model is checked when its turn comes. model_of maps a job's model to the Darkbloom id; an
     on_lane that raises counts as not on the lane. -> set."""
     head = bloom_lane_head(jobs)
@@ -8154,7 +8327,7 @@ NSAMPLE_DEFAULT_GPU_CAP_S = 3600
 NSAMPLE_DEFAULT_TEMPS = (0.6, 0.7, 0.8, 0.6)
 NSAMPLE_CLASSES = ("model", "nonconvergence_progressing")
 NSAMPLE_BRIEF_MAX_LINES = 15
-NSAMPLE_TASK_DIR = Path.home() / "bin" / "ollama-queue-logs" / "nsample-tasks"
+NSAMPLE_TASK_DIR = queue_config.state_dir() / "ollama-queue-logs" / "nsample-tasks"
 
 
 def nsample_load(path=None):
@@ -8728,7 +8901,7 @@ def _persist_job_completion(job):
 
 
 def _fire_gate_on_complete(job, bundle=None):
-    """Advisory auto-gate hook (2026-08-31, the owner's "wire the gate to run automatically").
+    """Advisory auto-gate hook (2026-08-31, the operator's "wire the gate to run automatically").
     Fire-and-forget the Studio gate on a completed job. gate-on-complete.py runs the
     decidable checks (scope/completeness/verify-quality) inline and ENQUEUES the model
     review as a --runner job -- so the GPU work serialises through the queue and respects
@@ -9028,7 +9201,7 @@ def _log_only_result(job_id, ld):
         # A CLEARED job: the dashboard's clear moved its .done.json/.gate.json into
         # archive/ and left the run log for inspection. Without this check a cleared
         # research/diagnosis job came straight back as a log-only row (2026-11-09:
-        # 4 diag rows reappeared after the owner's full clean-up).
+        # 4 diag rows reappeared after the operator's full clean-up).
         arch = Path(ld) / "archive"
         if (arch / f"{job_id}.done.json").exists() or (arch / f"{job_id}.gate.json").exists():
             return None
@@ -9165,7 +9338,7 @@ def _host_url_for(w, name, default=None):
 
 
 def _big_host_url(w):
-    """URL of the big-budget host (the owner's Studio), or None if the user's table
+    """URL of the big-budget host (the operator's Studio), or None if the user's table
     has no host under that name."""
     return _host_url_for(w, _big_host_name(w))
 
@@ -9234,7 +9407,7 @@ def _lane_name(url):
     if _darkbloom_url() is not None and (
             url == _darkbloom_url()
             or url in ("studio", DARKBLOOM_LANE, DARKBLOOM_HOST_NAME,
-                   "http://127.0.0.1:11434", "http://localhost:11434")):
+                   STUDIO_OLLAMA_URL, "http://127.0.0.1:11434", "http://localhost:11434")):
         return DARKBLOOM_LANE
     # BONSAI: a DIFFERENT physical box from Studio, so unlike the qwen3.8 bypass
     # it gets a lane of its own and is never serialized against Studio's pool.
@@ -9247,7 +9420,7 @@ def _lane_name(url):
     return url
 
 
-# Auto-resume watchdog (added 2026-08-29, the owner's request: "I want you to be able to handle
+# Auto-resume watchdog (added 2026-08-29, the operator's request: "I want you to be able to handle
 # it autonomously so jobs don't just hang endlessly"). A paused job used to require a human
 # or Claude to notice the pause, judge whether more room is warranted, and manually bump
 # --num-ctx/--max-iters before resuming -- confirmed live tonight (wire-live-log-queue paused
@@ -9283,7 +9456,7 @@ AUTO_RESUME_MAX_ITERS = 60
 AUTO_RESUME_MIN_ITER_BUMP = 5
 
 
-# --- Auto num-ctx sizing + auto split/recombination (the owner 2026-09-08) ----------
+# --- Auto num-ctx sizing + auto split/recombination (operator 2026-09-08) ----------
 # Replaces the two wrong defaults (worker's flat DEFAULT_NUM_CTX and the hand-passed
 # 65536) with a computed START value. Under-estimating is SAFE: ollama-queue.py's
 # auto-resume bump (see AUTO_RESUME_* above, ~line 750) doubles num_ctx UPWARD and
@@ -9318,7 +9491,7 @@ CTX_HEADROOM_PCT = 40
 CODING_DRAFT_CTX_FLOOR = 32768
 CODING_DRAFT_KINDS = ("coding", "draft")
 
-# --- HARD context requirement + gate (the owner 2026-09-17) -------------------------
+# --- HARD context requirement + gate (operator 2026-09-17) -------------------------
 # The sizing above only ever ran when --num-ctx was OMITTED, and it sized to a
 # *start* bucket on the theory that auto-resume would grow a starved job. Two holes
 # that theory did not cover, both observed:
@@ -9364,7 +9537,7 @@ _CTX_CODE_FILE_RE = re.compile(
     r'c|cc|cpp|cxx|h|hpp|rb|php|cs|swift|css|scss|html|htm|xml|yml|yaml|toml|ini|sql))\b'
 )
 
-# --- Investigation/diagnosis context FLOOR (the owner 2026-09-08) --------------------
+# --- Investigation/diagnosis context FLOOR (operator 2026-09-08) --------------------
 # A diagnosis dispatch (a model reading a repo to write DIAGNOSIS.md) reads many
 # files and accumulates tool output, so a small window walls it: a real one thrashed
 # -- re-issuing near-identical greps against the same files -- and PAUSED at iteration
@@ -9918,7 +10091,7 @@ def _auto_resume_paused_jobs():
             lock.save(state)
 
 
-# --- Stranded-pause watchdog (2026-09-24, the owner: "a paused job is never picked up") -----
+# --- Stranded-pause watchdog (2026-09-24, the operator: "a paused job is never picked up") -----
 # Live that night: dc88f2f7a5c1 (aw-sched-routes s7) sat status=paused for ~5.2h and
 # 98477b5e4843 (arr-codec-floor s4-r1, pause_reason=reasoning_loop) for ~2.4h. Both
 # were hand-resumed. Nothing else was ever going to touch them: the daemon's launch
@@ -10253,7 +10426,7 @@ def _validate_host(host):
             return
         sys.exit(f"invalid --host {DARKBLOOM_HOST_NAME!r}: Darkbloom is not serving a local "
                  f"endpoint ({DARKBLOOM_LOCAL_JSON} absent). BloomGauge runs Darkbloom: submit with --host auto, "
-                 f"or ask the owner to start it in BloomGauge. Never run darkbloom by hand")
+                 f"or ask {queue_config.operator_name()} to start it in BloomGauge. Never run darkbloom by hand")
     # BONSAI: accepted as a routing keyword ONLY while the evaluation lane is
     # actually configured. Unconfigured it stays a typo -- and the message says
     # what to set, rather than the generic "must be auto, studio, unraid".
@@ -10262,7 +10435,7 @@ def _validate_host(host):
             return
         sys.exit(f"invalid --host {BONSAI_HOST_NAME!r}: the Bonsai evaluation lane is not "
                  f"configured. Set BONSAI_SERVER_URL, or write the llama-server endpoint "
-                 f"(e.g. http://198.51.100.145:8092) to {BONSAI_URL_FILE}.")
+                 f"(e.g. http://192.0.2.10:8092) to {BONSAI_URL_FILE}.")
     if host.startswith("http://") or host.startswith("https://"):
         return
     sys.exit(f"invalid --host {host!r}: must be auto, studio, unraid, or an explicit http(s) URL")
@@ -10891,7 +11064,7 @@ def seal_prev_round_baseline(job: dict) -> dict | None:
     failed bg-dashboard-s3 and esim-global-s3 despite verify.sh being GREEN at HEAD,
     and the rt-costco cascade where each chained job ran into the one before it.
 
-    This is the TRUE-SOURCE fix the owner asked for: the guard is NOT loosened (external
+    This is the TRUE-SOURCE fix the operator asked for: the guard is NOT loosened (external
     dirt on a first round still flags -- see _is_continuation_round); only the
     harness's OWN carried-forward output, on a round that provably continues an
     earlier one, is sealed. The set committed is EXACTLY _real_dirty_paths() -- the
@@ -11411,7 +11584,7 @@ def cmd_enqueue(args):
                   f"context pressure; consider a bigger-window host/model.",
                   file=sys.stderr)
 
-    # --- CONTEXT GATE (the owner 2026-09-17) ----------------------------------------
+    # --- CONTEXT GATE (operator 2026-09-17) ----------------------------------------
     # Runs on EVERY enqueue, on whatever num_ctx survived the paths above -- auto,
     # explicit, --no-auto-ctx, diagnosis-floored -- because the failure it catches
     # (an under-provisioned agentic job that read/analyze loops and reports
@@ -11607,7 +11780,7 @@ def cmd_enqueue(args):
             # subtraction (for a scored arm the baseline failures ARE the task). Also lands in
             # dispatch-metrics.jsonl so scored and unscored runs are never pooled in the tracker.
             "scored_arm": args.scored_arm,
-            # Bug #9: an owner-approved hard-host override honors --host even when the
+            # Bug #9: a operator-approved hard-host override honors --host even when the
             # model does not fit it (bakeoff arms are honored via scored_arm/label).
             "host_override_approved": bool(getattr(args, "host_approved", False)),
             "num_ctx": _computed_num_ctx,
@@ -11798,7 +11971,7 @@ def cmd_enqueue(args):
             else:
                 state["jobs"].append(job)
         elif job.get("continues") and _continuation_same_bundle(job, state["jobs"]):
-            # --continues: a round that resumes a chain already in flight (the owner
+            # --continues: a round that resumes a chain already in flight (the operator
             # 2026-09-24, "it should have gone to 2nd, not 5th") lands right behind
             # whatever is running -- see continuation_insert_index. Only when the named
             # round really is in this job's bundle; otherwise normal placement below.
@@ -11808,7 +11981,7 @@ def cmd_enqueue(args):
             else:
                 state["jobs"].append(job)
         elif followup_tier(job) == FOLLOWUP_TIER:
-            # WIP-minimization (the owner 2026-09-17): a completing job enqueuing its own
+            # WIP-minimization (operator 2026-09-17): a completing job enqueuing its own
             # gate/regate/refine/auto-fix round lands AHEAD of already-queued fresh
             # work instead of at the tail, so the closest-to-done chain finishes
             # first. It goes behind any pending follow-up already queued (FIFO within
@@ -11830,7 +12003,7 @@ def cmd_enqueue(args):
         print(f"  live log: tail -f {job['live_log_path']}")
 
 
-# --- Durable job-RESULTS store (2026-09-14, the owner's "better storage for job results") ---
+# --- Durable job-RESULTS store (2026-09-14, the operator's "better storage for job results") ---
 # There is NO separate results DB. The terminal outcome of every gated dispatch is
 # already frozen across per-job sidecars in LOG_DIR that are NEVER pruned (unlike the
 # live row in ollama-queue-state.json, which RETAIN_DONE_RECENT=0 drops on the next
@@ -12047,7 +12220,7 @@ def status_display_order(jobs):
     Returns [(job, depth)] -- depth 0 for a bundle's own rows, depth 1 for a gate
     row printed under its source dispatch.
 
-    The bug this fixes (the owner, live report): cmd_status was a flat loop over
+    The bug this fixes (the operator, live report): cmd_status was a flat loop over
     state["jobs"] in raw insertion order, so `gate-<id>` / `regate-<id>` rows
     printed wherever they happened to have been appended -- routinely several
     unrelated bundles away from the slice they gate. Nothing about WHICH rows exist
@@ -12254,11 +12427,11 @@ def cmd_plan_add(args):
         if args.after:
             after_id = _resolve_after_target(state["jobs"], args.after)
             if not after_id:
-                # ROOT CAUSE (2026-09-21, the owner: "we should already have a planned
+                # ROOT CAUSE (2026-09-21, the operator: "we should already have a planned
                 # placeholder that should be getting used" -- esim-global-s4 had
                 # NO row at all, live or planned, though it was still `blocked`).
                 # This used to sys.exit here, which DROPPED THE ENTIRE ROW: a
-                # worklist item the owner was promised visibility into vanished just
+                # worklist item the operator was promised visibility into vanished just
                 # because its dependency edge couldn't be resolved (its `after`
                 # target already reaped, or a publish-order race). publish_dag()
                 # calls this once per slice and unconditionally marks the whole
@@ -12266,7 +12439,7 @@ def cmd_plan_add(args):
                 # row here was gone for the rest of the chain's life -- nothing
                 # ever re-published it. Publish it anyway, as a ROOT placeholder
                 # (no dependency edge): a visible row with a stale edge is still
-                # the worklist item the owner asked to see; a silently missing row is
+                # the worklist item the operator asked to see; a silently missing row is
                 # not.
                 after_unresolved = args.after
         job = build_planned_job(args.label, after=after_id, note=args.note,
@@ -12303,23 +12476,66 @@ def cmd_plan_clear(args):
     print(f"cleared {len(gone)} planned row(s)" + (f": {', '.join(gone)}" if gone else ""))
 
 
-def cmd_results(args):
-    """Query the durable job-RESULTS store (the never-pruned <id>.done.json/.gate.json/.diff
-    sidecars). Unlike `status`, which shows only the LIVE queue rows, this surfaces the
-    FINAL verdict of jobs long since reaped from ollama-queue-state.json."""
-    results = _iter_job_results()
-    want = (args.verdict or "").lower() or None
+def _filter_results(results, verdict=None, label=None, limit=0):
+    """PURE. `results`' --verdict / --label / --limit filter (newest-first input stays in order). The queue API's
+    /api/results route applies the same filter, so a remote `results` prints exactly what a local one would."""
+    want = (verdict or "").lower() or None
     if want:
         # PENDING is a synthetic tag for a completed-but-ungated job (verdict is None).
         if want == "pending":
             results = [r for r in results if _verdict_tag(r) == "PENDING"]
         else:
             results = [r for r in results if str(r.get("verdict") or "").lower() == want]
-    if args.label:
-        needle = args.label.lower()
+    if label:
+        needle = label.lower()
         results = [r for r in results if needle in str(r.get("label") or "").lower()]
-    if args.limit and args.limit > 0:
-        results = results[:args.limit]
+    if limit and limit > 0:
+        results = results[:limit]
+    return results
+
+
+def _reads_remote():
+    """True when a read-only subcommand (results, needs-opus) must read the queue over its API: the queue runs on
+    another machine and OLLAMA_QUEUE_FORCE_LOCAL=1 (the same switch that turns off forwarding) is not set."""
+    return os.environ.get("OLLAMA_QUEUE_FORCE_LOCAL") != "1" and queue_config.queue_is_remote()
+
+
+def _remote_results(verdict=None, label=None, limit=0):
+    """The result records from the queue API (GET /api/results, token-gated) when the queue runs on another machine:
+    its log dir is not on this disk. Exits with a message when the API can't be read; never prints the token."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    base = queue_config.queue_api()[0]
+    q = {k: v for k, v in (("verdict", verdict), ("label", label)) if v}
+    if limit and limit > 0:
+        q["limit"] = limit
+    url = base + "/api/results" + ("?" + urllib.parse.urlencode(q) if q else "")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=queue_config.queue_api_headers()),
+                                    timeout=60) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"[queue] results: HTTP {e.code} from the queue API at {base}")
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"[queue] cannot reach the queue API at {base}: {type(e).__name__}")
+    except ValueError:
+        sys.exit(f"[queue] results: the queue API at {base} sent no JSON")
+    rows = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        sys.exit(f"[queue] results: unexpected answer from the queue API at {base}")
+    return [r for r in rows if isinstance(r, dict) and r.get("id")]
+
+
+def cmd_results(args):
+    """Query the durable job-RESULTS store (the never-pruned <id>.done.json/.gate.json/.diff
+    sidecars). Unlike `status`, which shows only the LIVE queue rows, this surfaces the
+    FINAL verdict of jobs long since reaped from ollama-queue-state.json. With the queue on
+    another machine the records come from its API (paths in them are on the queue host)."""
+    remote = _reads_remote()
+    results = (_remote_results(args.verdict, args.label, args.limit) if remote
+               else _iter_job_results())
+    results = _filter_results(results, args.verdict, args.label, args.limit)
 
     if args.json:
         print(json.dumps(results, indent=1))
@@ -12353,6 +12569,8 @@ def cmd_results(args):
             if r.get("answer_path"):
                 print(f"           answer_md: {r['answer_path']}")
         if args.verbose:
+            if remote and r is results[0]:
+                print("           (paths below are on the queue host)")
             if r.get("review_verdict"):
                 print(f"           review={r['review_verdict']}  authority={r.get('gate_authority')}  counts={r.get('counts')}")
             if r.get("changed_files"):
@@ -12384,7 +12602,7 @@ PATH_PROBE_MAX_PROCS = 24        # probe processes alive at once, held ones incl
                                  # sleeping process, freed at unlock); past this no probe starts
 PATH_PROBE_STALE_S = 6 * 3600.0  # a probe hung this long is killed; it stays tracked until it exits
 PATH_PRIME_STALE_S = 120.0       # no prime this recent: the gate fails open
-PATH_ALERT_AFTER_S = 120.0       # held this long with the screen UNLOCKED: an INFRA row for the owner
+PATH_ALERT_AFTER_S = 120.0       # held this long with the screen UNLOCKED: an INFRA row for the operator
 # The folders macOS asks about per process (TCC): ~/Desktop, ~/Documents, ~/Downloads, and each volume
 # under /Volumes. With the screen locked, one probe held under such a folder means every new process's
 # first touch there is held too, so later probes stop at that folder instead of joining the hang.
@@ -12613,7 +12831,7 @@ def prime_path_access(now=None, jobs=None, locked=None):
     locked, a held probe stands for its whole folder (_path_root): later probes are told that folder
     and stop before it (blocked, via the folder) instead of joining the hang; those verdicts stand while
     a probe is held there, and are asked again once none is (or the screen unlocks). An INFRA row for
-    The owner when a path stays held PATH_ALERT_AFTER_S with the screen UNLOCKED (an access prompt, or a
+    The operator when a path stays held PATH_ALERT_AFTER_S with the screen UNLOCKED (an access prompt, or a
     disk not answering). `jobs` defaults to a lockless read of the state file; locked = the screen
     state (None: ask). -> {key: state}. Never raises."""
     import select as _sel
@@ -12721,7 +12939,7 @@ def path_access_wait(job, now=None):
                "locked; the job would freeze at its first git call. It launches when a probe gets "
                "through (at unlock); nothing to run" if locked is True else
                "still held with the screen unlocked: macOS may be showing an access prompt for Python, "
-               "or the disk is not answering -- needs the owner if it persists")
+               f"or the disk is not answering -- needs {queue_config.operator_name()} if it persists")
         return wait_note(
             "infra-path-access", f"infra: a new process cannot open {h} (since {when})",
             f"INFRA WAIT: a new process cannot open {h} since {when} -- {why}",
@@ -12814,7 +13032,9 @@ def _build_cmd(job, host_url):
                 "--model", (_darkbloom_model(job["model"]) if _is_darkbloom_host(host_url)
                             else job["model"]), "--host", host_url,
                 "--num-ctx", str(job["num_ctx"]),
-                "--cwd", job["cwd"], "--task-file", job["task_file"]]
+                "--cwd", job["cwd"], "--task-file", job["task_file"],
+                # runner_args: set only by an upload (queue_upload.RUNNER_FLAGS allowlist), e.g. mini-finish's remote check
+                *[str(x) for x in (job.get("runner_args") or []) if isinstance(x, str)]]
     task_text = Path(job["task_file"]).read_text()
     cmd = [
         "python3", str(WORKER_PATH),
@@ -12955,7 +13175,7 @@ def _model_size_cached(w, model):
 # a hard-coded fit table at dispatch: a requested host that cannot hold the model's
 # footprint is auto-rerouted to one that can (logged, never crashes); a job is held
 # only when NO host fits. A hard-host request is honored WITHOUT reroute ONLY for a
-# bakeoff-tagged or an owner-approved job (refuse-by-default).
+# bakeoff-tagged or a operator-approved job (refuse-by-default).
 #
 # Unraid: 3080, 12GB VRAM (~9.6GB usable). Holds dense models up to ~14B and the
 # measured MoE exceptions; 20B+ dense and the 27B go to Studio (64GB unified).
@@ -12990,7 +13210,7 @@ def _fits_host_pure(model, known_size, usable_bytes, param_cap_b, is_unraid):
 
 def _host_override_allowed(job):
     """PURE. May this job's hard-host request bypass fit-reroute? ONLY a bakeoff-tagged
-    (scored_arm, or a bo-/bakeoff- label) or an explicitly owner-approved job. Everything
+    (scored_arm, or a bo-/bakeoff- label) or an explicitly operator-approved job. Everything
     else is refuse-by-default: a plain --host that does not fit gets rerouted."""
     if job.get("scored_arm"):
         return True
@@ -13012,7 +13232,7 @@ def _host_override_allowed(job):
 # answering diagnosis questions on a 14B with no evidence behind it.
 #
 # So this routing needs BOTH:
-#   1. QUEUE_RESEARCH_UNRAID=1 (default OFF -- nothing changes until the owner says so), and
+#   1. QUEUE_RESEARCH_UNRAID=1 (default OFF -- nothing changes until the operator says so), and
 #   2. a MEASUREMENT ON RECORD at ~/.ollama-dispatch/unraid-research-quality.json,
 #      written by the seeded diagnosis check (see the dispatch spec in the report),
 #      shaped {"model": ..., "n": <int>, "pass_rate": <0..1>, "measured_at": ...},
@@ -13140,13 +13360,13 @@ def _fit_route_decision(model, host_pref, override_allowed,
         return (host_pref, f"fits {host_pref}", False)
     # Requested host does not fit.
     if override_allowed:
-        return (host_pref, f"override honored (bakeoff/owner-approved) despite {model} "
+        return (host_pref, f"override honored (bakeoff/operator-approved) despite {model} "
                            f"not fitting {host_pref}", True)
     # Reroute to a fitting host (prefer studio, the big-budget host).
     for alt in ("studio", "unraid", *extra_order):
         if alt != host_pref and fits.get(alt):
             return (alt, f"{model} does not fit {host_pref}; rerouted to {alt} "
-                         f"(refuse-by-default; tag bakeoff or get the owner approval to force)", False)
+                         f"(refuse-by-default; tag bakeoff or get operator approval to force)", False)
     return (None, f"{model} fits no available host -- held (never crashed)", False)
 
 
@@ -13343,7 +13563,7 @@ def _lane_slot_capacity(lane_url):
 
     (2026-10-01) The only lane that ever returned >=2 was the llama-server bypass
     (/props total_slots); it is retired. Darkbloom can serve up to 4 concurrent
-    requests per model, but that cap is shared with the public fleet, and the owner's call
+    requests per model, but that cap is shared with the public fleet, and the operator's call
     is to keep ONE queue job per lane. Anything that opens a second slot must add a
     positively-confirmed signal here first -- never an optimistic guess."""
     return 1
@@ -13355,7 +13575,7 @@ def _second_slot_vram_fits(lane_url, new_num_ctx):
 
 
 def _safe_label(label):
-    """Log filenames must survive whatever --label the owner typed."""
+    """Log filenames must survive whatever --label the operator typed."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", label) or "job"
 
 
@@ -13501,7 +13721,7 @@ def _gate_preempt_victim(gate_job, jobs, w):
                    and _lane_name(j.get("lane")) == REGATE_LANE), None)
     if victim is None or not _preempt_min_progress_ok(victim):
         return None
-    # BUNDLE-ORDER INVARIANT (the owner 2026-09-21: "a job in bundle C should never be
+    # BUNDLE-ORDER INVARIANT (operator 2026-09-21: "a job in bundle C should never be
     # able to have a task above anything in bundle A or B"). Without this check a
     # gate only ever asked "is Studio busy with a long job", never "does MY bundle
     # actually outrank that job's bundle" -- so a low-priority bundle's own gate
@@ -13608,7 +13828,7 @@ def _promote_preempt_should_resume(job, jobs, w, beneficiary_bundle_busy=False):
         beneficiary = next((j for j in jobs if j.get("id") == beneficiary_id), None)
         if beneficiary is not None and beneficiary.get("status") == "pending":
             return False
-    # BUNDLE, not job (the owner 2026-09-24: "one bundle from start to finish"). The
+    # BUNDLE, not job (operator 2026-09-24: "one bundle from start to finish"). The
     # beneficiary of a promote --preempt is one ROUND of a chain (live 09-24: the
     # bake-off's auto-author-bo-O-... a3e1d170918f). The instant that round finished,
     # the victim (auto-author-rt-dashboard-pl-unsubmitted-cc, 2ae41f0549e8) resumed on
@@ -13649,7 +13869,7 @@ def _write_focus_override(state, bundle_key, now=None):
     """Record a HUMAN focus override on `bundle_key` in `state` (caller holds the lock).
     The daemon's next tick commits to it (bundle_commit_step's override), parking the
     committed bundle as `yielded`. A sticky pin on a DIFFERENT bundle is superseded --
-    the latest human intent wins (the owner 2026-09-27: a pin must never beat a focus)."""
+    the latest human intent wins (operator 2026-09-27: a pin must never beat a focus)."""
     state["_focus_override"] = {"key": bundle_key, "by": "human",
                                 "set_at": now if now is not None
                                 else datetime.now(timezone.utc).timestamp()}
@@ -13753,7 +13973,7 @@ def promote_job(job_id, preempt=False, force=False, take_focus=False, run_now=Fa
     ollama-queue-api.py; raises QueueActionError (not sys.exit) on user-facing errors -- see
     that class for why.
 
-    run_now=True (implies take_focus): the bundle "run NOW" (the owner 2026-10-30). The ONE
+    run_now=True (implies take_focus): the bundle "run NOW" (operator 2026-10-30). The ONE
     lever that may pause a COMMITTED bundle's running job for another bundle -- an
     explicit human choice, so the bundle-commitment veto below does not apply. Nothing
     else is relaxed: the min-progress guard still refuses a job in warm-up (no force),
@@ -13824,7 +14044,7 @@ def promote_job(job_id, preempt=False, force=False, take_focus=False, run_now=Fa
                                and _lane_name(j.get("lane")) == name), None)
                 if victim is not None:
                     break
-        # BUNDLE COMMITMENT (the owner 2026-09-27): promote chooses WHICH bundle goes next;
+        # BUNDLE COMMITMENT (operator 2026-09-27): promote chooses WHICH bundle goes next;
         # it never preempts a started bundle. A victim of the committed bundle keeps
         # its lane when the promoted job belongs to a different bundle -- the promote
         # still moves the job to the front, so its bundle is the next one committed.
@@ -13870,11 +14090,11 @@ def promote_job(job_id, preempt=False, force=False, take_focus=False, run_now=Fa
             victim["preempt_escalated"] = False
             # promote_preempt: reap re-stamps this into pause_reason (_apply_gate_preempt_
             # override) so the victim auto-resumes once its lane idles again, instead of
-            # sitting paused for a manual `resume` (the owner, 2026-09-19).
+            # sitting paused for a manual `resume` (the operator, 2026-09-19).
             victim["preempt_intent"] = PROMOTE_PREEMPT_REASON
             # Names the job this preempt exists to serve, so the resume check can refuse
             # to hand the lane back to the victim before ITS turn happens
-            # (_promote_preempt_should_resume, the owner 2026-09-19 thrash fix).
+            # (_promote_preempt_should_resume, operator 2026-09-19 thrash fix).
             victim["preempted_by"] = job["id"]
         if take_focus:
             # Same key logic as the standalone set_focus_override(), inlined here
@@ -13925,7 +14145,7 @@ def promote_job(job_id, preempt=False, force=False, take_focus=False, run_now=Fa
             "victim_status": final_status if victim_id else None, "truth": truth}
 
 
-# --- whole-job (all slices) promotion (2026-09-18, the owner: "promoting a multi-slice
+# --- whole-job (all slices) promotion (2026-09-18, the operator: "promoting a multi-slice
 # job means clicking every slice") -------------------------------------------------
 # A sliced dispatch enqueues one queue job PER SLICE, labelled
 # auto-author-<project>-<sliceid>[-rN] (e.g. auto-author-aw-transfer-partners-s2-use-
@@ -14025,7 +14245,7 @@ def _root_plan_key(key, reverse, _max_depth=12):
     Iterating `reverse` therefore walks child -> parent -> ... -> root; it strictly
     shortens each step (suffix removed) so it always terminates. Without this the
     scheduler saw bg-state, bg-state-s1-init-db and bg-state-s1-init-db-s3-... as three
-    DIFFERENT bundles and bounced between them (the owner 2026-09-18: "not running the bundle
+    DIFFERENT bundles and bounced between them (operator 2026-09-18: "not running the bundle
     in order... bouncing around"; the sub-plans ARE the same feature and belong together).
     """
     seen = set()
@@ -14050,7 +14270,7 @@ def job_group_key(job, reverse=None):
     group of one -- so group-promoting it is just a plain front-jump, never a surprise
     sweep of unrelated jobs.
 
-    EXPLICIT BUNDLE TAG (2026-09-23, the owner: three independent resell-tracker fixes --
+    EXPLICIT BUNDLE TAG (2026-09-23, the operator: three independent resell-tracker fixes --
     rt-bfmr-pending-sync-scope (auto-sliced), rt-walmart-store-tracking-gate and
     rt-bfmr-mytrackerid-preserve (single jobs) -- "should be treated as ONE bundle in
     the queue UI, not separate standalone rows"). The slice index can only cluster
@@ -14080,7 +14300,7 @@ def job_group_key(job, reverse=None):
     # FIRST '-sN-'), not up to the LAST slice segment. Greedy '(.+)' split
     # 'bg-eraser-s1-invoke-s2-...' into 'bg-eraser-s1-invoke', fragmenting ONE bundle
     # into several keys, so bundle-focus saw fragments as different bundles and bounced
-    # between them (the owner 2026-09-18: "not running the bundle in order, bouncing around").
+    # between them (operator 2026-09-18: "not running the bundle in order, bouncing around").
     m = re.match(r"^(.+?)-(s\d+-.+)$", base)
     if m:
         return _root_plan_key(m.group(1), reverse)
@@ -14170,7 +14390,7 @@ def promote_group(group_key, reverse=None):
         if not movable:
             # PIN-ONLY (2026-09-23). A bundle whose work is all running/planned/
             # done right now has nothing to reorder, but the sticky pin below is
-            # still the lever the owner reaches for ("make sure these land first"): a
+            # still the lever the operator reaches for ("make sure these land first"): a
             # slice chain's NEXT row does not exist yet, and without the pin it
             # would rank behind every already-pending bundle when it appears.
             # Refusing here forced a second call at exactly the wrong moment.
@@ -14185,7 +14405,7 @@ def promote_group(group_key, reverse=None):
                     "running_left_alone": running, "pinned_only": True}
         moved = {id(j) for j in movable}
         state["jobs"] = movable + [j for j in jobs if id(j) not in moved]
-        # Sticky pin (the owner, 2026-09-21: "Web UI went to the bottom of the queue
+        # Sticky pin (the operator, 2026-09-21: "Web UI went to the bottom of the queue
         # again"). The reorder above is a one-time snapshot -- it only touches jobs
         # that exist RIGHT NOW. A slice chain's next job is a brand-new entry
         # appended to state["jobs"] only after its predecessor converges (which can
@@ -14215,7 +14435,7 @@ def promote_group_for_job(job_id, reverse=None, preempt=False, take_focus=False,
     with preempt+take_focus, which pauses whatever holds its lane and makes this
     bundle the active focus -- but never a COMMITTED bundle's job (promote_job's veto).
 
-    run_now=True is the bundle "Run now" (the owner 2026-10-30): the same, WITH that veto
+    run_now=True is the bundle "Run now" (operator 2026-10-30): the same, WITH that veto
     lifted -- the running bundle is paused gracefully (its job resumable, the bundle
     parked `yielded`) and both resume on their own once this bundle is done."""
     with _Locked() as lock:
@@ -14247,7 +14467,7 @@ def promote_group_for_job(job_id, reverse=None, preempt=False, take_focus=False,
         result["preempt"] = promote_job(result["promoted"][0], preempt=True,
                                         take_focus=True, run_now=run_now)
     elif take_focus:
-        # The bundle ↑↑ (the owner 2026-09-27: "that's why we have arrows"): make THIS the
+        # The bundle ↑↑ (operator 2026-09-27: "that's why we have arrows"): make THIS the
         # next bundle that launches, even over a committed or pinned one. Nothing is
         # preempted -- the running job finishes first; the committed bundle yields
         # and resumes right after.
@@ -14444,7 +14664,7 @@ def resume_job(job_id, force=False):
 def _job_has_ever_run(job):
     """True iff this job has actually EXECUTED at some point -- it has a launch
     timestamp, a pid, a worker transcript, or a queue log on disk. Such a row is
-    HISTORY and must never be removed from the queue state (the owner, twice: historical
+    HISTORY and must never be removed from the queue state (the operator, twice: historical
     and superseded records stay visible). A row that fails this test is a genuinely
     never-run placeholder (pending/planned/blocked that never got a lane), which is
     what `cancel` is for."""
@@ -14545,7 +14765,7 @@ def cancel_job(job_id, explicit=False, mark_plan=False):
                 f"only pending/done/failed/paused/blocked/held/needs_opus/planned jobs can be "
                 f"cancelled (this one is "
                 f"{job.get('status')!r} -- a running job must be killed by pid, not cancelled)")
-        # DASHBOARD "remove" DID NOTHING (the owner 2026-09-19). The has-ever-run guard below
+        # DASHBOARD "remove" DID NOTHING (operator 2026-09-19). The has-ever-run guard below
         # was added 2026-09-18 to stop `cancel` erasing history -- correct in intent, but
         # it silently broke the ONE path that is supposed to clear a finished row. The
         # dashboard offers "remove" for exactly done / done_unconverged / failed, and
@@ -14668,7 +14888,7 @@ def stop_job(job_id):
     'running' state by the time stop_job took the lock (a reap/pause landing in that
     window) therefore had its whole record ERASED by the sanctioned `stop` command --
     including a job that had already run for 13 minutes and produced logs. That
-    destroys exactly the historical record the owner has twice said must stay visible
+    destroys exactly the historical record the operator has twice said must stay visible
     ("never delete/resolve a live or terminal job record"), and it is unrecoverable:
     there is no state backup. `cancel` is only for genuinely NEVER-RUN placeholders.
     A job that has ever launched is now recorded terminal-in-place instead
@@ -14762,6 +14982,30 @@ def cmd_resolve(args):
         sys.exit(f"[queue] {e}")
 
 
+def cmd_clear_card(args):
+    """Clear a job's dashboard run card (POST /api/runs/<id>/clear on the queue API, with the API token when one is
+    set). The same call works whether the queue runs here or on another machine; hooks use it instead of a curl to
+    127.0.0.1:7684. Never with an override: a job whose required sign-off is open stays (409)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    base = queue_config.queue_api()[0]
+    url = base + "/api/runs/%s/clear" % urllib.parse.quote(str(args.job_id), safe="")
+    req = urllib.request.Request(url, data=b"{}", method="POST",
+                                 headers=dict(queue_config.queue_api_headers(), **{"Content-Type": "application/json"}))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print(r.read().decode("utf-8", "replace").strip() or "[queue] card cleared")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace").strip()
+        if e.code == 404:
+            print(f"[queue] no run card for {args.job_id} (already cleared)")
+            return
+        sys.exit(f"[queue] clear-card {args.job_id}: HTTP {e.code}: {body[:300]}")
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"[queue] cannot reach the queue API at {base}: {type(e).__name__}")
+
+
 def _resolve_job_id(state, job_id):
     """Resolve an exact-or-unambiguous-prefix job id against live state. Returns the
     job dict (exact match preferred) or raises QueueActionError."""
@@ -14789,7 +15033,7 @@ def _discover_coordinator_model():
 
 def escalate_job(job_id, reason, category="other", next_command=None,
                  gate_output=None, coordinator_model=None):
-    """Park a job in the needs_opus escalation lane for a later Opus/the owner pass.
+    """Park a job in the needs_opus escalation lane for a later Opus/operator pass.
 
     The Sonnet-as-coordinator safety valve (see ESCALATION_STATUS block up top):
     when the weaker coordinator hits one of the three bounded cases it must NOT
@@ -14859,7 +15103,7 @@ def escalate_job(job_id, reason, category="other", next_command=None,
         print(f"[queue]   coordinator={model}")
     for bid in newly_blocked:
         print(f"[queue]   {bid} BLOCKED (cascade: upstream {job_id} parked for Opus)")
-    print(f"[queue]   parked for a draining Opus/the owner pass -- see: "
+    print(f"[queue]   parked for a draining Opus/operator pass -- see: "
           f"python3 ~/bin/ollama-queue.py needs-opus")
     return {"escalated": job_id, "category": category, "blocked_downstream": newly_blocked}
 
@@ -14973,7 +15217,7 @@ def create_parked_job(reason, category="other", next_command=None, gate_output=N
     if model:
         print(f"[queue]   coordinator={model}")
     print(f"[queue]   next_command: {next_command.strip()}")
-    print(f"[queue]   parked for a draining Opus/the owner pass -- see: "
+    print(f"[queue]   parked for a draining Opus/operator pass -- see: "
           f"python3 ~/bin/ollama-queue.py needs-opus")
     return {"parked": job["id"], "category": category}
 
@@ -15041,12 +15285,19 @@ def cmd_retag_bundles(args):
 def cmd_needs_opus(args):
     """Escalation worklist: every job parked in needs_opus, with reason/category and
     the resume/worktree pointers a draining Opus pass needs. Mirrors the handoff
-    panel's role -- a draining Opus/the owner session should read it EARLY, like the
+    panel's role -- a draining Opus/operator session should read it EARLY, like the
     handoff panel, to see what a weaker coordinator deferred on purpose. Greppable
-    text by default; --json for a session to process programmatically."""
-    with _Locked() as lock:
-        state = lock.load()
-    parked = [j for j in state["jobs"] if j.get("status") == ESCALATION_STATUS]
+    text by default; --json for a session to process programmatically. With the queue on
+    another machine the rows come from its API (/api/state); worktree/log paths are on that host."""
+    if _reads_remote():
+        state = queue_config.load_queue_state()
+        if not isinstance(state, dict) or not isinstance(state.get("jobs"), list):
+            sys.exit("[queue] needs-opus: cannot read the queue state from the queue API at "
+                     f"{queue_config.queue_api()[0]}")
+    else:
+        with _Locked() as lock:
+            state = lock.load()
+    parked = [j for j in state["jobs"] if isinstance(j, dict) and j.get("status") == ESCALATION_STATUS]
     parked.sort(key=lambda j: (j.get("escalation") or {}).get("escalated_at") or "")
     if args.json:
         print(json.dumps([_escalation_row(j) for j in parked], indent=2))
@@ -15054,7 +15305,7 @@ def cmd_needs_opus(args):
     if not parked:
         print("(no jobs parked for Opus -- escalation lane empty)")
         return
-    print(f"=== ESCALATION PANEL: {len(parked)} job(s) parked for a draining Opus/the owner pass ===")
+    print(f"=== ESCALATION PANEL: {len(parked)} job(s) parked for a draining Opus/operator pass ===")
     print("(read this EARLY, like the handoff panel; each was deferred ON PURPOSE by a weaker "
           "coordinator that must NOT decide it)")
     for j in parked:
@@ -15523,7 +15774,7 @@ def cmd_run(args):
     while True:
         # Warm the (10s-TTL) `darkbloom status` cache OUTSIDE the state lock: the studio-db
         # gate slot decision reads memory headroom / in-flight count from it, and the
-        # lock forbids subprocess I/O (the owner 2026-10-06). Best-effort.
+        # lock forbids subprocess I/O (operator 2026-10-06). Best-effort.
         try:
             if load_slot_config().get("gate_slots", 0) > 0 and _darkbloom_url() is not None:
                 darkbloom_status()
@@ -15871,12 +16122,12 @@ def cmd_run(args):
                 _victim = _gate_preempt_victim(_gj, state["jobs"], w)
                 if _victim is None:
                     continue
-                # A started bundle is never paused for ANOTHER bundle's gate (the owner
+                # A started bundle is never paused for ANOTHER bundle's gate (the operator
                 # 2026-09-27: no interleaving). That gate cannot launch under the
                 # commitment anyway, so the preemption would only idle the lane.
                 if _commit_blocks_preempt(state, _gj, _victim):
                     continue
-                # GATE PRIORITY (the owner 2026-10-06): never pause a job when the gate can run
+                # GATE PRIORITY (operator 2026-10-06): never pause a job when the gate can run
                 # beside it (studio-db gate slot / an idle fitting lane), and another
                 # bundle's gate under a commitment never preempts anything.
                 try:
@@ -15948,7 +16199,7 @@ def cmd_run(args):
 
             # Auto-resume any promote-preempted job now that its lane is idle again --
             # same event-driven pattern as the gate-preempt resume above, generalized to
-            # a manual `promote --preempt` (2026-09-19, the owner: bg-actions s4 sat paused
+            # a manual `promote --preempt` (2026-09-19, the operator: bg-actions s4 sat paused
             # needing a hand `resume` after a promote bumped it off Studio; a
             # promote-preempted job should rejoin the queue on its own once the lane it
             # was bumped from frees up, not sit paused indefinitely).
@@ -15978,7 +16229,7 @@ def cmd_run(args):
                           f"({_pj2['label']}) from "
                           f"{_pj2.get('resume_transcript') or 'scratch (no transcript recorded)'}")
 
-            # Hard hold on regate (the owner 2026-09-17): reconcile the 'held' status of
+            # Hard hold on regate (operator 2026-09-17): reconcile the 'held' status of
             # every fresh authoring/refine job BEFORE the launch loop. A candidate is
             # HELD (status='held', reason 'pending gate') while any gate/regate is
             # unresolved, and RELEASED back to 'pending' the moment none remains -- so
@@ -16037,7 +16288,7 @@ def cmd_run(args):
             # queue OWNS placement: a pending job whose requested host cannot hold the
             # model footprint is rerouted to a fitting host (logged once), or HELD if
             # no host fits -- never launched to crash. A hard-host request is honored
-            # only for a bakeoff-tagged/owner-approved job (refuse-by-default). Done once
+            # only for a bakeoff-tagged/operator-approved job (refuse-by-default). Done once
             # per job (fit_checked) so host_pref settles and the log does not repeat.
             for _fj in state["jobs"]:
                 if _fj.get("status") != "pending" or _fj.get("fit_checked"):
@@ -16068,7 +16319,7 @@ def cmd_run(args):
                     print(f"[queue] fit: {_fj['id']} ({_fj['label']}) -- {_r}.")
 
             _jobs_by_id = {j["id"]: j for j in state["jobs"]}
-            # BUNDLE FOCUS (the owner 2026-09-18, "keep the whole bundle intact until it's
+            # BUNDLE FOCUS (operator 2026-09-18, "keep the whole bundle intact until it's
             # done -- like a checklist"): pin ONE bundle and launch nothing outside it
             # until it is finished, so we never jump to another bundle while this one's
             # slice is gating on Unraid (nor before a passed final gate proves it needs
@@ -16100,6 +16351,8 @@ def cmd_run(args):
                 _fair = {}
             _order = [_oj for _oj in pending_launch_order(state["jobs"], state.get("pinned_group"), _fair)
                       if not _is_gpu_exclusive_job(_oj)]
+            if queue_config.draining():       # fallback drain: launch nothing new; running jobs finish (see queue_standby)
+                _order = []
             _top_pending = _pk(_order[0]) if _order else None
             # PARKED bundles never own the lanes through sticky focus (focus_drop_parked).
             _parked_now = state.get("_bundle_parked") or {}
@@ -16125,7 +16378,7 @@ def cmd_run(args):
             # freeze the lanes forever.
             _focus_override = state.get("_focus_override")
             _active = resolve_focus_override(_sticky_result, _focus_override, _now)
-            # PINNED GROUP BEATS STICKY FOCUS TOO (2026-09-21, the owner: "Web UI isn't at
+            # PINNED GROUP BEATS STICKY FOCUS TOO (2026-09-21, the operator: "Web UI isn't at
             # top still" -- the pinned_group fix above only ranked a pinned bundle
             # first WITHIN pending_launch_order, which only ever supplies
             # sticky_active()'s top_pending_key fallback. sticky_active() tries
@@ -16144,7 +16397,7 @@ def cmd_run(args):
             # nothing is running, which is exactly the moment sticky/incomplete
             # would otherwise re-claim the old bundle instead of releasing to the pin.
             _pinned_group = state.get("pinned_group")
-            # precedence (the owner 2026-09-27): human override > commitment > pin > order.
+            # precedence (operator 2026-09-27): human override > commitment > pin > order.
             _override_live = live_focus_override_key(_focus_override, _now)
             if (_pinned_group is not None and _pinned_group != _active
                     and _running_key != _active and _override_live is None):
@@ -16195,7 +16448,7 @@ def cmd_run(args):
             _hold, _new_empty = focus_decision(
                 _active, _active_running, _active_launchable, _active_incomplete,
                 (_sticky_empty if _sticky_key == _active else None), _now)
-            # BUNDLE COMMITMENT (the owner 2026-09-27) -- see bundle_commit_step. It has the
+            # BUNDLE COMMITMENT (operator 2026-09-27) -- see bundle_commit_step. It has the
             # last word on which bundle owns the lanes: every heuristic above (grace,
             # stall ceiling, fail-streak/escalated release, ↑↑ override, pin) only
             # proposes; a started bundle is worked until nothing in it can run.
@@ -16227,7 +16480,7 @@ def cmd_run(args):
                 _commit_key = None
             if _commit_key is not None:
                 _active = _commit_key
-                # UNCONDITIONAL HOLD (the owner 2026-10-05). A committed bundle holds the
+                # UNCONDITIONAL HOLD (operator 2026-10-05). A committed bundle holds the
                 # lanes even while its next step is a FAILURE being dealt with
                 # (commit_waiting_on_failure stays a LOGGED state only). The old
                 # release here let other bundles run mid-bundle with no park and no
@@ -16270,7 +16523,7 @@ def cmd_run(args):
                         _active, state["jobs"], _pk)
                     _hold, _new_empty = focus_decision(
                         _active, _active_running, _active_launchable, _active_incomplete, None, _now)
-            # IDLE-LANE BACKFILL (the owner 2026-10-01) -- see commit_backfill_ok for the
+            # IDLE-LANE BACKFILL (operator 2026-10-01) -- see commit_backfill_ok for the
             # policy note. One job from another bundle may run while the committed
             # bundle is between steps and nothing is on a lane; the commitment is not
             # released, nothing running is preempted, and the committed bundle takes
@@ -16289,7 +16542,7 @@ def cmd_run(args):
                     state["_focus_override"] = None
                     _focus_override = None
                     changed = True
-            # ROOT-CAUSE FIX (2026-09-21, the owner: "everything shows held right now"):
+            # ROOT-CAUSE FIX (2026-09-21, the operator: "everything shows held right now"):
             # bundle focus (below, "skip every job that belongs to a DIFFERENT
             # bundle") and the pending-gate barrier (_hold_decision/HOLD_REASON
             # above) can deadlock each other. A HELD job in the ACTIVE bundle can
@@ -16314,7 +16567,7 @@ def cmd_run(args):
                         for _gj in state["jobs"]:
                             if _gj.get("id") == _on or _gj.get("label") == _on:
                                 _barrier_exempt_ids.add(_gj.get("id"))
-            # Cross-host collateral damage (the owner 2026-09-20, live 3x tonight): the hold
+            # Cross-host collateral damage (operator 2026-09-20, live 3x tonight): the hold
             # below is bundle-scoped only, with no lane check, so a bundle held active
             # on studio (e.g. still-running/incomplete) starves a pending job pinned to
             # a DIFFERENT concrete lane -- unraid, say -- even though that lane is idle
@@ -16336,7 +16589,7 @@ def cmd_run(args):
             # still working) so next tick can hold it sticky across the author gap
             state["_focus_wait"] = ({"key": _active, "empty_since": _new_empty}
                                     if _active is not None else {})
-            # FOCUS LOGGING (the owner 2026-09-19). The daemon logged NOTHING about focus, which
+            # FOCUS LOGGING (operator 2026-09-19). The daemon logged NOTHING about focus, which
             # is why "the queue isn't running things in bundle order" stayed anecdotal across
             # sessions and had to be diagnosed by reconstructing a tick from the state file.
             # Log only on a CHANGE (active bundle, hold/release flips, OR the reason
@@ -16441,7 +16694,7 @@ def cmd_run(args):
                     changed = True
             except Exception:
                 pass
-            # GATE PRIORITY (the owner 2026-10-06): the committed bundle's gates sort first.
+            # GATE PRIORITY (operator 2026-10-06): the committed bundle's gates sort first.
             for job in gate_priority_order(
                     yield_resume_first(pending_launch_order(state["jobs"], state.get("pinned_group"), _fair),
                                        _focus_override, _now, _pk),
@@ -16540,7 +16793,7 @@ def cmd_run(args):
                     running_here = [j for j in state["jobs"]
                                     if j.get("status") == "running" and j.get("lane")
                                     and _lane_name(j.get("lane")) == name]
-                    # GATE/SLOT ADMISSION (the owner 2026-10-06): another bundle's gate only on an
+                    # GATE/SLOT ADMISSION (operator 2026-10-06): another bundle's gate only on an
                     # idle non-conflicting lane; studio-db coding+gate second slot.
                     try:
                         _sg = lane_slot_gate(job, name, running_here, state["jobs"], _pk,
@@ -16836,7 +17089,7 @@ def cmd_run(args):
                         _wait_prev = _wnew
             except Exception as _we:
                 print(f"[queue] wait-state error (ignored): {_we!r}", file=sys.stderr)
-            # Slot measurement (the owner 2026-10-06): coder tok/s + gate duration, concurrent
+            # Slot measurement (operator 2026-10-06): coder tok/s + gate duration, concurrent
             # vs alone, into slot-measure.jsonl. Advisory; never touches scheduling.
             try:
                 def _slot_emit(_rec):
@@ -16856,7 +17109,7 @@ def cmd_run(args):
                     time.time(), _slot_rate, _slot_emit)
             except Exception as _se:
                 print(f"[queue] slot-measure error (ignored): {_se!r}", file=sys.stderr)
-            # LOUD idle-with-pending alert (the owner 2026-10-06: "nothing running for 949s").
+            # LOUD idle-with-pending alert (operator 2026-10-06: "nothing running for 949s").
             try:
                 if idle_pending_alert_due(
                         _IDLE_PENDING, any(_ij.get("status") == "running" for _ij in state["jobs"]),
@@ -16875,7 +17128,7 @@ def cmd_run(args):
             # next completion -- which is exactly how the dashboard filled with
             # hundreds of stale rows. prune is a cheap pure pass over ~state size;
             # we still only pay a save() when something actually changed or a row
-            # was dropped. (the owner 2026-09-18: keep the dashboard self-maintaining.)
+            # was dropped. (operator 2026-09-18: keep the dashboard self-maintaining.)
             pruned = prune_finished_jobs(state["jobs"])
             if changed or len(pruned) != len(state["jobs"]):
                 state["jobs"] = pruned
@@ -16931,6 +17184,8 @@ def _self_test():
     """Unit-test the pure dual-slot decision (slot_decision) -- no GPU, no I/O.
     Same convention as dispatch-ack-reconcile.py --self-test."""
     ok = True
+    # Hermetic Unraid lane: the worker seeds the "unraid" host only when an Unraid URL is configured.
+    os.environ.setdefault("OLLAMA_UNRAID_URL", "http://192.0.2.10:11434")
 
     # HERMETIC Darkbloom endpoint (2026-10-13 review item 1). The gate-preempt / lane-routing
     # checks below assume the shipped topology: auto/studio prefs resolve to the ONE local
@@ -17046,7 +17301,7 @@ def _self_test():
     check("gate is a follow-up", _tier("gate-1df5d24520b6"), FOLLOWUP_TIER)
     check("regate is a follow-up", _tier("regate-1df5d24520b6"), FOLLOWUP_TIER)
     # auto-refine refines a HARNESS: since 2026-09-18 it sits in the AUTHORING tier,
-    # BELOW a ready coding job (the owner: "get those code jobs promoted to the front
+    # BELOW a ready coding job (the operator: "get those code jobs promoted to the front
     # ahead of the author tasks"). It still outranks bake-off/unknown work.
     check("auto-refine round is authoring (below coding, above bake-off)",
           _tier("auto-refine-esim-global-s1-parse-global-r2"), AUTHORING_TIER)
@@ -17058,7 +17313,7 @@ def _self_test():
     check("bake-off arm is fresh", _tier("bo-slugify-qwen3"), FRESH_TIER)
     check("blank label is fresh (fail toward old behaviour)", _tier(""), FRESH_TIER)
 
-    # THE ordering assertion the owner asked for: a follow-up enqueued AFTER a fresh job
+    # THE ordering assertion the operator asked for: a follow-up enqueued AFTER a fresh job
     # is selected FIRST, and within a tier the original order is untouched (stable),
     # which is what preserves model-swap minimization + lane routing as the
     # subordinate key. Non-pending jobs never enter the launch order.
@@ -17071,7 +17326,7 @@ def _self_test():
         {"id": "u2", "status": "pending", "label": "gate-delta"},
     ]
     _order = [j["id"] for j in pending_launch_order(_q)]
-    # DEPTH-FIRST BY BUNDLE (the owner 2026-09-18): finish one whole plan before the
+    # DEPTH-FIRST BY BUNDLE (operator 2026-09-18): finish one whole plan before the
     # next. alpha has a RUNNING member (r0), so alpha is the focus and its pending
     # authoring (f1) leads; the rest follow in queue order. This SUPERSEDES the old
     # "a gate always outranks all authoring" cross-plan rule -- u2 (gate-delta, an
@@ -17086,7 +17341,7 @@ def _self_test():
     check("all-authoring queue is ordered exactly as before",
           [j["id"] for j in pending_launch_order(_q[1:3])], ["f1", "f2"])
 
-    # --- CODING AHEAD OF AUTHORING (the owner 2026-09-18) --------------------------
+    # --- CODING AHEAD OF AUTHORING (operator 2026-09-18) --------------------------
     # "get those code jobs promoted to the front ahead of the author tasks": a
     # converged slice's CODING job (bare label) must land before any new harness
     # authoring starts, however long the author jobs have been queued.
@@ -17127,7 +17382,7 @@ def _self_test():
     check("a running slice makes its whole bundle the focus (feat-b before feat-a)",
           [j["id"] for j in pending_launch_order(_mix2)], ["a2", "g1", "c1", "a1"])
 
-    # --- gate/regate -> parent bundle resolution (the owner 2026-09-18) -------------
+    # --- gate/regate -> parent bundle resolution (operator 2026-09-18) -------------
     # A gate row's label is `gate-<PARENT JOB ID>`; it must resolve to the PARENT's
     # bundle so a running gate pins its bundle as the focus (else the scheduler jumps
     # bundles mid-gate). Needs the jobs_by_id map to look the parent id up.
@@ -17152,7 +17407,7 @@ def _self_test():
           focus_decision("A", True, False, False, 5.0, 100.0), (True, None))
     check("active bundle launchable now -> hold",
           focus_decision("A", False, True, False, None, 100.0)[0], True)
-    # The owner's last-slice case: final gate just went terminal, bundle looks empty, but a
+    # the operator's last-slice case: final gate just went terminal, bundle looks empty, but a
     # FAIL must still enqueue its regate -- so the FIRST empty tick starts a grace clock
     # and holds (we do NOT start the next bundle yet).
     _h, _w = focus_decision("A", False, False, False, None, 100.0)
@@ -17166,7 +17421,7 @@ def _self_test():
           focus_decision("A", False, False, False, 100.0, 100.0 + G + 1)[0], False)
 
     # --- sticky_active: hold a bundle across the on-demand author/gate gap -----
-    # (the bug the owner reported: a slice finished and focus jumped to another bundle
+    # (the bug the operator reported: a slice finished and focus jumped to another bundle
     # because the next slice was not yet authored, so the bundle had no queue member)
     check("a running member pins its own bundle (ignores stickiness)",
           sticky_active("A", "B", 5.0, "C", 100.0), "A")
@@ -17181,7 +17436,7 @@ def _self_test():
     check("no sticky, no pending, nothing running -> None",
           sticky_active(None, None, None, None, 100.0), None)
 
-    # --- slicer-state bundle progress (the owner 2026-09-23/24: "one bundle start to
+    # --- slicer-state bundle progress (operator 2026-09-23/24: "one bundle start to
     # finish") -- the queue-row incompleteness signal does not exist for sliced plans.
     import tempfile as _tf
     with _tf.TemporaryDirectory() as _sd:
@@ -17308,7 +17563,7 @@ def _self_test():
               sticky_active(None, "planF", _T0, "aw-sched-routes", _T0 + _G - 1,
                             sticky_incomplete=_inc_f, driver_live=_drv_f), "planF")
 
-        # --- startup reap of orphaned advance-lock holders (the owner 2026-09-24) --------
+        # --- startup reap of orphaned advance-lock holders (operator 2026-09-24) --------
         _rd = _sdp / "reap"
         _rd.mkdir()
         _lk = lambda name, body: (_rd / f"{name}.advance.lock").write_text(body)
@@ -17324,8 +17579,8 @@ def _self_test():
             _kills.append((pid, int(sig)))
             if sig == signal.SIGKILL or (sig == signal.SIGTERM and pid == 101):
                 _live_pids.discard(pid)
-        _cmd = {101: "python3 /Users/user/bin/ollama-dispatch-slice plan.json --execute --release-lock-for pA",
-                102: "python3 /Users/user/bin/ollama-dispatch-slice plan.json --execute --release-lock-for pB",
+        _cmd = {101: "python3 /Users/example/bin/ollama-dispatch-slice plan.json --execute --release-lock-for pA",
+                102: "python3 /Users/example/bin/ollama-dispatch-slice plan.json --execute --release-lock-for pB",
                 104: "/usr/libexec/somethingelse"}
         _res = reap_orphaned_advance_locks(runs_dir=_rd, alive=lambda p: p in _live_pids,
                                            kill=_kill, cmdline=lambda p: _cmd.get(p, ""),
@@ -17348,7 +17603,7 @@ def _self_test():
         check("startup reap is wired into cmd_run BEFORE the first tick",
               0 < _cr.find("reap_orphaned_advance_locks(") < _cr.find("while True:"), True)
 
-    # --- Plain dispatch-auto CHAINS as bundles (the owner 2026-09-24) -----------------
+    # --- Plain dispatch-auto CHAINS as bundles (operator 2026-09-24) -----------------
     # "Auto author should have been first slice in that bundle so bake off would
     # continue." / "even then it should have gone to 2nd, not 5th." Five gaps, each
     # pinned BOTH WAYS: (1) `-cN` author continuation rows split off their chain; (2) a
@@ -17614,7 +17869,7 @@ def _self_test():
         _old.insert(_ff, _r1)
     else:
         _old.append(_r1)
-    check("position: the OLD rule put the same row 5th of pending (the owner's complaint, reproduced)",
+    check("position: the OLD rule put the same row 5th of pending (the operator's complaint, reproduced)",
           [j["id"] for j in _old if j["status"] == "pending"].index("0355e222860e"), 4)
     check("position: a pending gate/regate row ahead stays ahead (seconds-long; would run first anyway)",
           continuation_insert_index([{"status": "running"}, {"status": "pending", "label": "regate-abc"},
@@ -17633,7 +17888,7 @@ def _self_test():
     check("position: the -cN row now counts as the running bundle's own piece (grouping fix (1) wired)",
           _launch_plan_key(_live_rows[4], {}, {}), _launch_plan_key(_live_rows[0], {}, {}))
 
-    # --- sticky_active + bundle incompleteness (the owner 2026-09-19) ---------------
+    # --- sticky_active + bundle incompleteness (operator 2026-09-19) ---------------
     # THE BUG: focus_decision() has an `active_incomplete` branch documented to "keep
     # holding: more slices are definitely coming", but it could never fire, because
     # sticky_active dropped the bundle on the 30s grace clock BEFORE focus_decision was
@@ -17664,7 +17919,7 @@ def _self_test():
           sticky_active(None, "A", None, "B", 100.0, sticky_incomplete=True), "A")
 
     # --- _counts_as_incomplete: gate-preempt pause must NOT count as "more coming"
-    # (the owner 2026-09-21) --------------------------------------------------------
+    # (operator 2026-09-21) --------------------------------------------------------
     # THE BUG: a long job PAUSED for pause_reason=gate_preempt is deliberately stopped
     # to hand the lane to a DIFFERENT job right now -- the opposite of "more slices are
     # coming soon". _BUNDLE_INCOMPLETE_STATES alone counted it as incomplete anyway, so
@@ -17733,7 +17988,7 @@ def _self_test():
           len(_calls(_fn("_launch_plan_key"), "_pruned_job_label")), 1)
 
     # --- resolve_focus_override: `promote --take-focus` must win over sticky_active's
-    # own pick (the owner 2026-09-20: sticky_active can hold a DIFFERENT bundle for up to
+    # own pick (operator 2026-09-20: sticky_active can hold a DIFFERENT bundle for up to
     # FOCUS_STALL_CEILING even after its running job is preempted, if that bundle still
     # has more work coming -- starving a promoted job in another bundle for up to 10 min
     # with no way to force the switch). BOTH WAYS: identical inputs, only `override` differs.
@@ -17761,7 +18016,7 @@ def _self_test():
           bool(_fo) and len(_fo[0].args) > 1 and isinstance(_fo[0].args[1], _ast2.Name), True)
 
     # --- _root_plan_key: nested sub-plans collapse to their ROOT feature -------
-    # (the owner 2026-09-18: a too-big slice auto-slices into its own sub-plan, e.g.
+    # (operator 2026-09-18: a too-big slice auto-slices into its own sub-plan, e.g.
     # bg-state's 's1-init-db' slice -> plan 'bg-state-s1-init-db' with sub-slices, which
     # can spawn a grandchild. The slice index maps each '<parent>-<sid>' -> parent, so a
     # sub-plan LABEL is itself a key in the index; iterating it walks to the root. Without
@@ -17889,7 +18144,7 @@ def _self_test():
     check("release never touches a REAL job with the same label",
           (_release_planned_rows(_real, "alpha-s2", "X"), len(_real)), ([], 1))
 
-    # Bug (2026-09-19, the owner: "esim-global just went from running to planned when
+    # Bug (2026-09-19, the operator: "esim-global just went from running to planned when
     # the job finished") -- every slice going through ollama-dispatch-auto enqueues
     # its real job as `auto-author-<label>` / `auto-refine-<label>-r<N>`, never the
     # bare placeholder label, so the exact-match release above NEVER fired for any
@@ -18001,7 +18256,7 @@ def _self_test():
     # A 27B explicitly requested on unraid, no override -> REROUTED to studio.
     _t, _, _hon = _fit_route_decision("qwen3.8:27b-q4_K_M", "unraid", False, None, _UN, _ST)
     check("27B on unraid with no override -> rerouted to studio", (_t, _hon), ("studio", False))
-    # Same 27B on unraid WITH a bakeoff/the owner override -> host HONORED (no reroute).
+    # Same 27B on unraid WITH a bakeoff/operator override -> host HONORED (no reroute).
     _t2, _, _hon2 = _fit_route_decision("qwen3.8:27b-q4_K_M", "unraid", True, None, _UN, _ST)
     check("27B on unraid WITH override -> honored on unraid", (_t2, _hon2), ("unraid", True))
     # A 14B dense fits unraid -> unchanged.
@@ -18021,7 +18276,7 @@ def _self_test():
           _host_override_allowed({"scored_arm": True}), True)
     check("override allowed for a bo- labelled job",
           _host_override_allowed({"label": "bo-qwen-vs-llama"}), True)
-    check("override allowed when owner-approved",
+    check("override allowed when operator-approved",
           _host_override_allowed({"host_override_approved": True}), True)
     check("override REFUSED by default (plain --host request)",
           _host_override_allowed({"label": "sync-status-drag-resize"}), False)
@@ -18492,7 +18747,7 @@ def _self_test():
                 "model": "qwen3:14b", "host_pref": "unraid",
                 "lane": "unraid" if status == "running" else None, "pid": 999003}
 
-    # --- no-diff jobs must NEVER spawn a code gate/regate (the owner 2026-09-18) -----
+    # --- no-diff jobs must NEVER spawn a code gate/regate (operator 2026-09-18) -----
     # Regression guard for the bonsai bake-off incident: a research/--runner job
     # gated -> regate -> exclusive Studio gate lane -> ~10 auto-author jobs HELD.
     check("ungateable: task_kind=research is ungateable",
@@ -18501,11 +18756,11 @@ def _self_test():
     check("ungateable: a --runner job is ungateable",
           _is_ungateable_job({"id": "r2", "label": "bonsai-ternary-bakeoff",
                               "task_kind": "coding",
-                              "runner": "/Users/user/bin/bakeoff-runner.py"}), True)
+                              "runner": "/Users/example/bin/bakeoff-runner.py"}), True)
     check("ungateable: research AND runner is ungateable",
           _is_ungateable_job({"id": "r3", "label": "bonsai-ternary-bakeoff",
                               "task_kind": "research",
-                              "runner": "/Users/user/bin/bakeoff-runner.py"}), True)
+                              "runner": "/Users/example/bin/bakeoff-runner.py"}), True)
     # ...and a NORMAL coding dispatch is still gated exactly as before.
     check("ungateable: plain coding dispatch is STILL gated",
           _is_ungateable_job({"id": "c1", "label": "auto-author-demo",
@@ -18556,7 +18811,7 @@ def _self_test():
                                [_regate(), _longjob(status="paused", pause_reason=GATE_PREEMPT_REASON)], gw),
           None)
 
-    # 4d) BUNDLE-ORDER INVARIANT (the owner 2026-09-21): a gate must not preempt a running
+    # 4d) BUNDLE-ORDER INVARIANT (operator 2026-09-21): a gate must not preempt a running
     # long job from a HIGHER-priority (senior/earlier-queued) bundle -- only same-bundle
     # (the normal author->gate handoff) or a strictly LOWER-priority victim bundle.
     # "Priority" here is first-appearance order in the jobs list passed in, same as
@@ -18700,7 +18955,7 @@ def _self_test():
     check("adopted-orphan reap no longer stops at the gate-preempt override alone",
           "_apply_gate_preempt_override(job)  # keep a gate-preempt auto-resumable" in _cr_adopt[_a0:_a1], False)
 
-    # --- Stranded-pause watchdog (the owner 2026-09-24: "a paused job is never picked up") --
+    # --- Stranded-pause watchdog (operator 2026-09-24: "a paused job is never picked up") --
     # dc88f2f7a5c1 (5.2h) and 98477b5e4843 (reasoning_loop, 2.4h) sat paused with no
     # driver owning them while the launchd --sweep fired an advance every 20 min that
     # correctly declined ("a dispatch is already in flight"). Pin the ownership table
@@ -18842,7 +19097,7 @@ def _self_test():
           0 < _cr_sp.find("_auto_resume_paused_jobs()") < _cr_sp.find("_stranded_pause_watchdog()")
           < _cr_sp.find("time.sleep(args.poll_interval)"), True)
 
-    # --- promote --preempt auto-resume (the owner 2026-09-19) ---------------------------
+    # --- promote --preempt auto-resume (operator 2026-09-19) ---------------------------
     # bg-actions s4 sat PAUSED needing a hand `resume` after a promote bumped it off
     # Studio: "if we promote something else the job should automatically resume ...
     # when it gets back to it." Same override/resume machinery as gate_preempt, keyed
@@ -18868,7 +19123,7 @@ def _self_test():
           _promote_preempt_should_resume(_pnolane, [_pnolane], gw), True)
 
     # --- promote --preempt: don't hand the lane BACK before the beneficiary's turn
-    # (the owner 2026-09-19: bg-crypto vs. bfmr-split-reservation-diagnose thrash -- lane-idle
+    # (operator 2026-09-19: bg-crypto vs. bfmr-split-reservation-diagnose thrash -- lane-idle
     # alone let the victim win the FOCUS_AUTOFEED_GRACE window back from the still-pending
     # job that preempted it, forever). `preempted_by` names that job; resume must wait
     # for it to stop being pending.
@@ -18890,7 +19145,7 @@ def _self_test():
     check("promote-preempt: no beneficiary recorded -> plain lane-idle check governs",
           _promote_preempt_should_resume(_ppaused3, [_ppaused3], gw), True)
 
-    # --- Hard hold on regate (the owner 2026-09-17) -------------------------------------
+    # --- Hard hold on regate (operator 2026-09-17) -------------------------------------
     # Once a dispatch finishes and its gate/regate is enqueued/running, NO fresh
     # authoring/refine job starts until that gate reaches a TERMINAL verdict. Prove
     # the hold BITES (a pending new authoring job Y is NOT selected -> flipped to
@@ -18943,7 +19198,7 @@ def _self_test():
     check("hard-hold: held Y is skipped by the launch loop's pending-only guard",
           _Y["status"] != "pending", True)
 
-    # --- same-tick gate blind spot (2026-09-19, the owner: bg-state s4 -> s1) -----------
+    # --- same-tick gate blind spot (2026-09-19, the operator: bg-state s4 -> s1) -----------
     # Tick order is reap -> reconcile holds -> LAUNCH -> fire gate (which enqueues the
     # gate row). A job finishing at tick N therefore has NO gate row while tick N's
     # launch loop runs, so the row-keyed barrier is blind and the next job starts
@@ -19008,7 +19263,7 @@ def _self_test():
     check("hard-hold: a fresh author WAITING on a chain dep is not held (dep owns it)",
           _hold_decision(_chainY, _chain_jobs, {j["id"]: j for j in _chain_jobs})[0], "none")
 
-    # --- Bundle-scoped hold (2026-09-21, the owner: "within a bundle we don't need to
+    # --- Bundle-scoped hold (2026-09-21, the operator: "within a bundle we don't need to
     # hold the next job for a gate. we should only be holding the next bundle for
     # a gate if this would finish out the current bundle.") ------------------------
     _X2 = {"id": "bgwebui4done", "label": "auto-refine-bg-webui-s4-auth-token-r1",
@@ -19030,7 +19285,7 @@ def _self_test():
     # --- Bug #10: sticky operator hold survives a gate-barrier release ------------
     # A user-held pending job is never released by the reconciler even when NO gate
     # is pending (the exact condition that releases a gate hold). Only `resume` clears
-    # it. This is what lets the owner park the auto-author jobs until Bug #7 lands.
+    # it. This is what lets the operator park the auto-author jobs until Bug #7 lands.
     _uh = _freshY(status=HOLD_STATUS, user_hold=True, hold_reason=USER_HOLD_REASON)
     check("user-hold: reconciler leaves a user-held job alone (no auto-release)",
           _hold_decision(_uh, [_uh], {_uh["id"]: _uh})[0], "none")
@@ -19593,7 +19848,7 @@ def _self_test():
         # STALE ASSERTION REPAIRED (2026-09-19). This used to assert the done row
         # prunes once a live sibling exists -- the FIRST version of the fix, where
         # the guard was "don't prune a plan's ONLY row". prune_finished_jobs was then
-        # deliberately widened (same day, the owner: "I just want it to show as done or
+        # deliberately widened (same day, the operator: "I just want it to show as done or
         # pending gate and not disappear") so that ANY member of an INDEX-BACKED slice
         # plan is exempt from count-based pruning, sibling or not -- see the comment
         # on the `_confirmed_group_key` filter. The assertion was not updated with it,
@@ -19727,7 +19982,7 @@ def _self_test():
         # --- unconfigured: the feature must be completely inert ---------------
         os.environ.pop("BONSAI_SERVER_URL", None)
         # Point the file fallback at a path that cannot exist, so a real
-        # ~/.config/ollama-queue/bonsai-host on the owner's box can't make this test
+        # ~/.config/ollama-queue/bonsai-host on the operator's box can't make this test
         # pass or fail depending on machine state.
         BONSAI_URL_FILE = Path("/nonexistent/oq-selftest/bonsai-host")
         check("bonsai: unconfigured -> not routable", _bonsai_url(), None)
@@ -19750,7 +20005,7 @@ def _self_test():
               [_host_rc(h) for h in ("auto", "studio", "unraid")], [True, True, True])
 
         # --- configured -------------------------------------------------------
-        _BURL = "http://192.0.2.142:8092"
+        _BURL = "http://192.0.2.99:8092"
         os.environ["BONSAI_SERVER_URL"] = _BURL
         check("bonsai: env var configures the endpoint", _bonsai_url(), _BURL)
         os.environ["BONSAI_SERVER_URL"] = _BURL + "/"
@@ -19761,8 +20016,8 @@ def _self_test():
 
         class _W:   # stand-in for the worker module -- offline, no /api/tags calls
             KNOWN_OLLAMA_HOSTS = {
-                "unraid": {"url": "http://198.51.100.145:11434", "usable_bytes": 9 * 1024**3},
-                "studio": {"url": "http://127.0.0.1:11434", "usable_bytes": 44 * 1024**3},
+                "unraid": {"url": "http://192.0.2.143:11434", "usable_bytes": 9 * 1024**3},
+                "studio": {"url": STUDIO_OLLAMA_URL, "usable_bytes": 44 * 1024**3},
             }
             @staticmethod
             def _get_model_size_on_host(url, model):
@@ -19956,7 +20211,7 @@ def _self_test():
                    ctx_from_meta({"server": "mlx-server", "supports_chat_completions": True,
                                   "routes": [{"method": "GET", "path": "/props"}]})),
                   (None, None))
-            # DARKBLOOM_CTX stays an outright override (the owner: "make it overridable")
+            # DARKBLOOM_CTX stays an outright override (the operator: "make it overridable")
             _old_env = os.environ.get("DARKBLOOM_CTX")
             os.environ["DARKBLOOM_CTX"] = "40960"
             try:
@@ -20372,7 +20627,7 @@ def _self_test():
           "harness")
     check("harness: npm ci failed", classify_failure("nonconvergence", _it + "  FAIL: npm ci failed")[0], "harness")
     check("harness: worker crashed (traceback)",
-          classify_failure("crashed", "Traceback (most recent call last):\n  File \"/Users/user/bin/ollama-worker.py\", line 1")[0],
+          classify_failure("crashed", "Traceback (most recent call last):\n  File \"/Users/example/bin/ollama-worker.py\", line 1")[0],
           "harness")
     check("harness: no iterations ever ran",
           classify_failure("nonconvergence", "[worker] warming up qwen...\n", exit_code=2),
@@ -20577,7 +20832,7 @@ def _self_test():
     _accrue_active_s(_acj, now=9999.0)        # same launch: counted once
     check("active runtime: a run segment accrues once per launch", _acj["active_s"], 360.0)
 
-    # --- BUNDLE COMMITMENT (the owner 2026-09-27) -----------------------------------------
+    # --- BUNDLE COMMITMENT (operator 2026-09-27) -----------------------------------------
     # A has s1..s4; s3 depends on s2, s4 does not. s2 fails human-needed. The queue
     # must still run s4 (and any heal of s2), then and only then move to B -- with a
     # loud alert -- and A resumes before any NEW bundle once s2 is unblocked.
@@ -20725,7 +20980,7 @@ def _self_test():
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel as _pc
         _wA(s2="confirmed", s4="done")
-        _pc.mark_cancelled("bA", "the owner cancelled", runs_dir=_crd)
+        _pc.mark_cancelled("bA", f"{queue_config.operator_name()} cancelled", runs_dir=_crd)
         _k, _ev = _tick(9000.0)
         check("commit: a CANCELLED parked plan is dropped, never resumed",
               (_k, "unpark" in _ev, "bA" in _cst["_bundle_parked"]), (None, True, False))
@@ -20751,7 +21006,7 @@ def _self_test():
           False)
     check("commit: no commitment -> no veto",
           _commit_blocks_preempt({"jobs": []}, {"bundle": "x"}, {"bundle": "y"}, pk=_ppk), False)
-    # --- IDLE-LANE BACKFILL (the owner 2026-10-01) -- see commit_backfill_ok. Live bug it
+    # --- IDLE-LANE BACKFILL (operator 2026-10-01) -- see commit_backfill_ok. Live bug it
     # closes: committed bundle sidecar-bfmr-login-nudge held the single studio-db lane
     # with NOTHING running while ddc034e14fcd (diag:ladder-ok-le1) sat pending.
     _bfA = {"id": "a9", "label": "A-s9", "bundle": "A", "status": "pending"}
@@ -20763,7 +21018,7 @@ def _self_test():
     check("backfill: committed bundle has nothing launchable + idle lane -> backfill ON",
           _bf1, True)
     check("backfill: ...but ANOTHER bundle's job is still skipped (same-bundle only, "
-          "The owner 2026-10-05)",
+          "operator 2026-10-05)",
           [j["id"] for j in (_bfB,) if not focus_skips_job(
               j, _bfpk(j), "A", True, "A", set(), None, None, backfill_ok=_bf1)], [])
     _bfA2 = {"id": "a10", "label": "gate-zzz", "bundle": "A", "status": "pending"}
@@ -20824,7 +21079,7 @@ def _self_test():
            focus_skips_job({"id": "u"}, "B", "A", True, "A", set(), "studio", "unraid"),
            focus_skips_job({"id": "gx"}, "B", "A", True, "A", {"gx"}, None, None)),
           (True, True, False))
-    # --- HUMAN FOCUS beats the commitment (the owner 2026-09-27: "that's why we have
+    # --- HUMAN FOCUS beats the commitment (operator 2026-09-27: "that's why we have
     # arrows"). Live: promote --take-focus on mlx-smoke while sidecar-bfmr-login-fetch
     # was committed silently dropped the override; the commitment reclaimed the lanes.
     _hs = {}
@@ -20950,7 +21205,7 @@ def _self_test():
     check("bundle stamp: otherwise the scheduler's own key (never None)",
           bool(enqueue_bundle_key({"label": "standalone-fix"}, [], reverse={})), True)
 
-    # --- NUMBERED RERUNS (the owner 2026-10-01). Grounded in the REAL chain off
+    # --- NUMBERED RERUNS (operator 2026-10-01). Grounded in the REAL chain off
     # ~/bin/ollama-queue-state.json: dbcf30f84454 -> d96a71500b9b -> f059db0bce62
     # (all label auto-author-sidecar-bfmr-login-nudge*, bundle
     # sidecar-bfmr-login-nudge, failure_class model).
@@ -21193,7 +21448,7 @@ def main():
                         "off baseline-diagnostic subtraction, and tags the run in dispatch-metrics "
                         "so scored/unscored runs are never pooled.")
     e.add_argument("--host-approved", dest="host_approved", action="store_true",
-                   help="Bug #9: OWNER-APPROVED hard-host override. Honor the explicit --host even "
+                   help="Bug #9: OPERATOR-APPROVED hard-host override. Honor the explicit --host even "
                         "if the model does not fit it (bypasses the fit-reroute). Refuse-by-default: "
                         "without this (or a bakeoff tag) a --host that cannot hold the model is "
                         "auto-rerouted to one that can. Use only for a deliberate headroom test.")
@@ -21477,8 +21732,13 @@ def main():
     rv.add_argument("job_id")
     rv.set_defaults(func=cmd_resolve)
 
+    cc = sub.add_parser("clear-card", help="Clear a job's dashboard run card through the queue API (works when the "
+                        "queue runs on another machine). Pair with resolve for a handled failure.")
+    cc.add_argument("job_id")
+    cc.set_defaults(func=cmd_clear_card)
+
     es = sub.add_parser("escalate",
-                        help="Park a job in the needs_opus escalation lane for a later Opus/the owner "
+                        help="Park a job in the needs_opus escalation lane for a later Opus/operator "
                              "pass (the Sonnet-as-coordinator safety valve). Records reason + "
                              "category + recovery pointers, cascades downstream deps to blocked, "
                              "and is never auto-resumed. Recoverable via resume/resolve/cancel. "
@@ -21531,6 +21791,13 @@ def main():
 
     args = ap.parse_args()
     refuse_if_verify_sandboxed(args.cmd)
+    if os.environ.get("OLLAMA_QUEUE_FORCE_LOCAL") != "1":
+        try:
+            import queue_remote_cli
+        except ImportError:
+            queue_remote_cli = None
+        if queue_remote_cli is not None and queue_remote_cli.forward(args, sys.argv[1:]):
+            return
     args.func(args)
 
 

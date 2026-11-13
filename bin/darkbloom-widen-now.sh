@@ -5,6 +5,7 @@ if [ "${DARKBLOOM_BY_OWNER:-}" != "1" ]; then
   exit 2
 fi
 Q="python3 $HOME/bin/ollama-queue.py"
+DB=$(python3 "$HOME/bin/queue_config.py" darkbloom-base 2>/dev/null); DB=${DB:-http://127.0.0.1:8000}   # base from env / local.json / config
 HELD=/tmp/widen-held.ids; : > "$HELD"
 PAIR=(--model qwen3.6-35b-a3b-vl-mtp-mxfp8 --model Qwen3.5-9B)
 WIDE=("${PAIR[@]}" --model nvidia-nemotron-3.5-lightning --model qwen3.5-35b-a3b --model gemma-4-26b-qat-4bit)
@@ -24,7 +25,7 @@ darkbloom start "${WIDE[@]}" --local-endpoint 2>&1 | tail -5
 ok=0
 for i in $(seq 1 60); do
   sleep 10
-  if curl -s -m 5 http://127.0.0.1:8000/v1/models | grep -q 'qwen3.6-35b-a3b-vl-mtp-mxfp8' && curl -s -m 5 http://127.0.0.1:8000/v1/models | grep -qi 'qwen3.5-9b'; then ok=1; break; fi
+  if curl -s -m 5 "$DB/v1/models" | grep -q 'qwen3.6-35b-a3b-vl-mtp-mxfp8' && curl -s -m 5 "$DB/v1/models" | grep -qi 'qwen3.5-9b'; then ok=1; break; fi
 done
 if [ "$ok" -ne 1 ]; then
   echo "$(date -u +%T) WIDE FAILED -> rolling back to pair"

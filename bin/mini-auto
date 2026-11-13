@@ -34,6 +34,11 @@ Env: MINI_RUNS (run dirs, default ~/.ollama-dispatch/mini-runs), MINI_WT_ROOT (w
 MINI_AUTO_SUBMIT (the mini-submit command), OFFLOAD_QUEUE_LOGS / OFFLOAD_HOME (job records and reviews, as mini-scorecard).
 Kill switch: MINI_AUTO=off (mini-submit refuses auto specs).
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import importlib.util
 import json
@@ -48,7 +53,7 @@ from pathlib import Path
 
 HERE = Path(os.path.realpath(__file__)).parent
 RUNS = Path(os.environ.get("MINI_RUNS") or Path.home() / ".ollama-dispatch/mini-runs")
-QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or os.path.expanduser("~/bin/ollama-queue-logs"))
+QLOGS = Path(os.environ.get("OFFLOAD_QUEUE_LOGS") or str(queue_config.state_dir() / "ollama-queue-logs"))
 OHOME = Path(os.environ.get("OFFLOAD_HOME") or os.path.expanduser("~/.ollama-dispatch"))
 MODEL = os.environ.get("MINI_AUTO_MODEL") or "qwen3.6-35b-a3b-vl-mtp-mxfp8"
 NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")

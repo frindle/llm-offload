@@ -1,0 +1,8 @@
+# Allowlist for scan-private-info.py. Format: path-glob : regex-on-line (or sha1:<12 hex>) : reason
+# Keep this short. Every entry needs a reason.
+cpu_lane.py : connect\(\(\"10\.255\.255\.255\", 1\)\) : UDP connect() to a non-routable address only to learn the local source IP; no packet is sent
+model_profiles.yaml : card_sha256: : public model-card checksums, not secrets
+mini-swe-runner.py : @(pytest|m|mock)\. : decorator text inside a generated-test string, not an email
+infra_incidents.py : python@3\.x : Homebrew formula name, not an email
+mini_ext/mini_ctx.py : k-SECRET-SELFTEST : fake token inside a self-test assertion
+queue-image/scan-private-info.py : 100\.64\.0\.0/10 : the CGNAT network the scanner itself defines

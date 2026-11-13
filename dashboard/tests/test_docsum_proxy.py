@@ -37,9 +37,31 @@ def test_upstream_headers_drops_tunnel_and_proxy_headers():
            "Forwarded": "for=203.0.113.5", "Via": "1.1 x", "X-Real-IP": "203.0.113.5", "Authorization": "Bearer x", "Referer": "r"}
     assert dp.upstream_headers(bad) == {"Host": "127.0.0.1:7690"}
 
+def test_current_upstream_default_env_and_config():
+    try:
+        import queue_config  # noqa: F401  (on the queue host / sandbox overlay it sits beside the API)
+    except ImportError:
+        return
+    old = os.environ.pop("QUEUE_DOCSUM_UPSTREAM", None)
+    try:
+        assert dp.current_upstream() == ("127.0.0.1", 7690)
+        os.environ["QUEUE_DOCSUM_UPSTREAM"] = "docsum.example.test:7799"
+        assert dp.current_upstream() == ("docsum.example.test", 7799)
+        os.environ["QUEUE_DOCSUM_UPSTREAM"] = "garbage"
+        assert dp.current_upstream() == ("127.0.0.1", 7690)
+    finally:
+        os.environ.pop("QUEUE_DOCSUM_UPSTREAM", None)
+        if old is not None:
+            os.environ["QUEUE_DOCSUM_UPSTREAM"] = old
+
+
+def test_upstream_headers_takes_a_configured_upstream():
+    got = dp.upstream_headers({"Origin": "https://q.example.test", "Host": "q.example.test"}, ("docsum.example.test", 7799))
+    assert got == {"Host": "docsum.example.test:7799", "Origin": "http://docsum.example.test:7799"}
 
 TESTS = [test_origin_ok_absent_or_empty, test_origin_ok_same_and_different, test_upstream_headers_allowlist_and_host,
-         test_upstream_headers_rewrites_origin, test_upstream_headers_drops_tunnel_and_proxy_headers]
+         test_upstream_headers_rewrites_origin, test_upstream_headers_drops_tunnel_and_proxy_headers,
+         test_current_upstream_default_env_and_config, test_upstream_headers_takes_a_configured_upstream]
 
 if __name__ == "__main__":
     order = TESTS[::-1] if os.environ.get("TEST_ORDER") == "reverse" else TESTS
@@ -52,3 +74,4 @@ if __name__ == "__main__":
             bad += 1
             print(f"RESULT {t.__name__} FAIL {type(e).__name__}: {e}")
     sys.exit(1 if bad else 0)
+

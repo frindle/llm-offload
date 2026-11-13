@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- TEMPLATE. Never loaded from this folder. Replace __HOME__ with the home folder, then copy to
+     ~/Library/LaunchAgents/ at cutover (the owner's step). Bind address and port come from
+     ~/.config/ollama-queue/config.toml [queue_agent], not from this file.
+     The token is read from ~/.config/ollama-queue/agent-token (0600); the service will not start
+     without it unless bind is loopback.
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.queue-agent.plist
+    launchctl bootout   gui/$(id -u)/com.example.queue-agent -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.queue-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>__HOME__/bin/queue-agent.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__HOME__/bin/ollama-queue-logs/queue-agent.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/bin/ollama-queue-logs/queue-agent.log</string>
+</dict>
+</plist>

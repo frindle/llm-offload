@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""queue-cutover -- move the job queue to the container and back (Mac side; the owner runs it by hand).
+
+  queue-cutover [--dry-run] [--url URL] COMMAND
+
+  export [--wait MIN] [--replace]   refuse while any job runs (or wait up to MIN minutes), stop the 9 launchd jobs
+                                    (bootout; the plists stay), pack the small live state with a sqlite backup of the CPU
+                                    lane, write a manifest of sha256s and upload it to the container's
+                                    /api/standby/import, checking the hash it returns. A failure after the stop starts the
+                                    jobs again.
+  switch-clients                    set queue.api_url in the clients' config.toml to URL (old file backed up); lists the
+                                    files that set QUEUE_API (names only) for you to change by hand
+  fallback [--wait MIN] [--force]   drain the container (POST /api/admin/drain), wait until nothing runs, pull its export,
+                                    restore it here, put the old config back and bootstrap the 9 jobs again
+
+URL: --url or $QUEUE_CUTOVER_URL (the container's API, no default). Token: $QUEUE_API_TOKEN or the queue-api-token file
+(never printed). --dry-run prints each step and changes nothing (no launchctl change, no write, no upload).
+Every step is idempotent (launchctl state is checked first; progress is kept in the work dir) and logged to
+<work dir>/queue-cutover.log. Work dir: $QC_HOME, else ~/.queue-cutover.
+Test overrides: QC_LAUNCHCTL (command), QC_LAUNCH_AGENTS, QC_CONFIG, QC_UID.
+"""
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import queue_config  # noqa: E402
+import queue_standby  # noqa: E402
+
+JOBS = ("ollama-queue-daemon", "ollama-queue-api", "queue-event-log", "cpu-prefetch", "dispatch-ack-reconcile",
+        "dispatch-escalation-watcher", "verify-orphan-reap", "log-rotate", "docsum-ui")
+
+
+class Fail(Exception):
+    pass
+
+
+class Ctx:
+    def __init__(self, a):
+        self.dry = a.dry_run
+        self.url = (a.url or os.environ.get("QUEUE_CUTOVER_URL") or "").rstrip("/")
+        self.work = Path(os.environ.get("QC_HOME") or Path.home() / ".queue-cutover")
+        self.agents = Path(os.environ.get("QC_LAUNCH_AGENTS") or Path.home() / "Library" / "LaunchAgents")
+        self.launchctl = os.environ.get("QC_LAUNCHCTL") or "launchctl"
+        self.uid = os.environ.get("QC_UID") or str(os.getuid())
+        self.config = Path(os.environ.get("QC_CONFIG") or Path.home() / ".config" / "ollama-queue" / "config.toml")
+        self.state_dir = queue_config.state_dir()
+        self.disp = queue_config.dispatch_dir()
+        self.sf = self.work / "state.json"
+
+    # ---- log / state ------------------------------------------------------------------------------------------------
+    def say(self, msg):
+        line = time.strftime("%Y-%m-%d %H:%M:%S ") + ("[dry-run] " if self.dry else "") + msg
+        print(line, flush=True)
+        if not self.dry:
+            self.work.mkdir(parents=True, exist_ok=True)
+            with open(self.work / "queue-cutover.log", "a") as fh:
+                fh.write(line + "\n")
+
+    def load(self):
+        try:
+            return json.loads(self.sf.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, **kv):
+        if self.dry:
+            return
+        d = self.load()
+        d.update(kv)
+        self.work.mkdir(parents=True, exist_ok=True)
+        tmp = self.sf.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        os.replace(tmp, self.sf)
+
+    # ---- launchd ----------------------------------------------------------------------------------------------------
+    def prefix(self):
+        """The label prefix, found from the daemon's plist (nothing is hard-coded)."""
+        hits = sorted(self.agents.glob("*.ollama-queue-daemon.plist"))
+        if not hits:
+            raise Fail("no *.ollama-queue-daemon.plist in %s" % self.agents)
+        return hits[0].name[: -len("ollama-queue-daemon.plist")]
+
+    def jobs(self):
+        pre = self.prefix()
+        out = []
+        for j in JOBS:
+            p = self.agents / (pre + j + ".plist")
+            out.append((pre + j, p))
+        return out
+
+    def lc(self, *args):
+        r = subprocess.run([self.launchctl, *args], capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    def loaded(self, label):
+        return self.lc("print", "gui/%s/%s" % (self.uid, label))[0] == 0
+
+    def stop_jobs(self):
+        stopped = []
+        for label, plist in self.jobs():
+            if not plist.exists():
+                self.say("skip %s: no plist (not installed)" % label)
+                continue
+            if not self.loaded(label):
+                self.say("already stopped: %s" % label)
+                continue
+            if self.dry:
+                self.say("would boot out %s (plist kept)" % label)
+                continue
+            rc, out = self.lc("bootout", "gui/%s/%s" % (self.uid, label))
+            if rc != 0 and self.loaded(label):
+                raise Fail("bootout %s failed: %s" % (label, out[:200]))
+            self.say("booted out %s" % label)
+            stopped.append(label)
+        if stopped:
+            prev = self.load().get("stopped", [])
+            self.save(stopped=sorted(set(prev) | set(stopped)))
+
+    def start_jobs(self):
+        for label, plist in self.jobs():
+            if not plist.exists():
+                continue
+            if self.loaded(label):
+                self.say("already running: %s" % label)
+                continue
+            if self.dry:
+                self.say("would bootstrap %s" % label)
+                continue
+            rc, out = self.lc("bootstrap", "gui/%s" % self.uid, str(plist))
+            if rc != 0 and not self.loaded(label):
+                raise Fail("bootstrap %s failed: %s" % (label, out[:200]))
+            self.say("bootstrapped %s" % label)
+        self.save(stopped=[])
+
+    # ---- the container ----------------------------------------------------------------------------------------------
+    def token(self):
+        tok = queue_config.queue_api()[1]
+        if not tok:
+            raise Fail("no API token (set QUEUE_API_TOKEN or create the queue-api-token file, mode 0600)")
+        return tok
+
+    def need_url(self):
+        if not self.url:
+            raise Fail("no container URL: pass --url or set QUEUE_CUTOVER_URL")
+        u = urllib.parse.urlsplit(self.url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise Fail("bad URL")
+        return u
+
+    def req(self, method, path, body=None, headers=None, to_file=None, timeout=600):
+        u = self.need_url()
+        cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        c = cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=timeout)
+        h = {"Authorization": "Bearer " + self.token()}
+        h.update(headers or {})
+        try:
+            if hasattr(body, "read"):
+                c.putrequest(method, path)
+                for k, v in h.items():
+                    c.putheader(k, v)
+                c.endheaders()
+                while True:
+                    b = body.read(1024 * 1024)
+                    if not b:
+                        break
+                    c.send(b)
+            else:
+                data = json.dumps(body).encode() if body is not None else None
+                if data is not None:
+                    h["Content-Length"] = str(len(data))
+                c.request(method, path, body=data, headers=h)
+            r = c.getresponse()
+            if to_file is not None and r.status == 200:
+                with open(to_file, "wb") as fh:
+                    shutil.copyfileobj(r, fh, 1024 * 1024)
+                return r.status, dict(r.getheaders()), None
+            raw = r.read()
+        finally:
+            c.close()
+        try:
+            return r.status, dict(r.getheaders()), json.loads(raw)
+        except ValueError:
+            return r.status, dict(r.getheaders()), {"raw": raw[:200].decode("utf-8", "replace")}
+
+
+def wait_idle(cx, minutes):
+    deadline = time.time() + max(0.0, minutes) * 60
+    while True:
+        rc = queue_standby.running_counts(cx.state_dir, cx.disp)
+        if not rc["running"] and not rc["cpu_running"]:
+            return
+        if time.time() >= deadline:
+            raise Fail("jobs are running (%d queue, %d CPU lane); wait for them or use --wait MIN" %
+                       (rc["running"], rc["cpu_running"]))
+        cx.say("waiting: %d running, %d CPU-lane running" % (rc["running"], rc["cpu_running"]))
+        time.sleep(min(10.0, max(0.05, deadline - time.time())))
+
+
+def cmd_export(cx, a):
+    cx.need_url()
+    cx.say("step 1: check nothing is running")
+    wait_idle(cx, a.wait)
+    cx.say("step 2: stop the %d launchd jobs (plists stay)" % len(JOBS))
+    try:
+        cx.stop_jobs()
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        tar = cx.work / ("export-%s.tar" % stamp)
+        cx.say("step 3: pack the live state (sqlite backup, allowlist only) -> %s" % tar)
+        if cx.dry:
+            cx.say("step 4: would upload to %s/api/standby/import and check the returned sha256" % cx.url)
+            return
+        cx.work.mkdir(parents=True, exist_ok=True)
+        res = queue_standby.build_export(cx.state_dir, cx.disp, tar)
+        cx.say("packed %d files, %d bytes, sha256 %s" % (res["files"], res["bytes"], res["tar_sha256"]))
+        replace = a.replace or bool(cx.load().get("imported"))
+        path = "/api/standby/import" + ("?replace=1" if replace else "")
+        cx.say("step 4: upload (replace=%s)" % ("1" if replace else "0"))
+        with open(tar, "rb") as fh:
+            st, _, doc = cx.req("POST", path, body=fh, headers={
+                "X-Content-SHA256": res["tar_sha256"], "Content-Length": str(res["bytes"]),
+                "Content-Type": "application/x-tar"})
+        if st != 200 or not isinstance(doc, dict) or not doc.get("ok"):
+            raise Fail("upload refused: HTTP %s %s" % (st, json.dumps(doc)[:200]))
+        if doc.get("tar_sha256") != res["tar_sha256"]:
+            raise Fail("the container hashed a different file (sent %s, got %s)" % (res["tar_sha256"], doc.get("tar_sha256")))
+        if doc.get("manifest_ok") is not True:
+            raise Fail("the container could not verify the manifest")
+        cx.save(fallback_at=None, imported={"sha256": res["tar_sha256"], "files": doc.get("files"), "at": time.time()})
+        cx.say("upload ok: hash matches, manifest verified, %s files. The Mac jobs stay stopped." % doc.get("files"))
+    except Exception as e:
+        cx.say("FAILED (%s): starting the Mac jobs again" % e)
+        cx.start_jobs()
+        raise
+
+
+def set_api_url(text, url):
+    """Return text with queue.api_url set to url (inside [queue], created when missing)."""
+    line = 'api_url = "%s"' % url
+    lines = text.splitlines()
+    sec = None
+    for i, ln in enumerate(lines):
+        m = re.match(r"^\s*\[([^\]]+)\]\s*$", ln)
+        if m:
+            sec = m.group(1).strip()
+        elif sec == "queue" and re.match(r"^\s*api_url\s*=", ln):
+            lines[i] = line
+            return "\n".join(lines) + "\n"
+    if any(re.match(r"^\s*\[queue\]\s*$", ln) for ln in lines):
+        j = next(i for i, ln in enumerate(lines) if re.match(r"^\s*\[queue\]\s*$", ln))
+        lines.insert(j + 1, line)
+    else:
+        lines += ["", "[queue]", line]
+    return "\n".join(lines) + "\n"
+
+
+def api_url_in(text):
+    sec = None
+    for ln in text.splitlines():
+        m = re.match(r"^\s*\[([^\]]+)\]\s*$", ln)
+        if m:
+            sec = m.group(1).strip()
+        elif sec == "queue":
+            m = re.match(r'^\s*api_url\s*=\s*"([^"]*)"', ln)
+            if m:
+                return m.group(1)
+    return None
+
+
+def cmd_switch(cx, a):
+    cx.need_url()
+    old = cx.config.read_text() if cx.config.exists() else ""
+    if api_url_in(old) == cx.url:
+        cx.say("step 1: queue.api_url already %s (nothing to do)" % cx.url)
+    else:
+        bak = cx.work / ("config.toml.bak-%s" % time.strftime("%Y%m%dT%H%M%S"))
+        cx.say("step 1: back up %s -> %s, set queue.api_url = %s" % (cx.config, bak, cx.url))
+        if not cx.dry:
+            cx.work.mkdir(parents=True, exist_ok=True)
+            had = cx.config.exists()
+            if had:
+                shutil.copy2(cx.config, bak)
+            if "config_had_file" not in cx.load():          # keep the first (pre-cutover) backup across re-runs
+                cx.save(config_backup=str(bak) if had else None, config_had_file=had)
+            cx.config.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cx.config.with_suffix(".tmp")
+            tmp.write_text(set_api_url(old, cx.url))
+            os.replace(tmp, cx.config)
+    users = []
+    try:
+        for p in sorted(cx.agents.glob("*.plist")):
+            if re.search(rb"<key>QUEUE_API(_URL)?</key>", p.read_bytes()):
+                users.append(p.name)
+    except OSError:
+        pass
+    cx.say("step 2: files that set QUEUE_API (names only; change them by hand): %s" % (", ".join(users) or "none found"))
+
+
+def cmd_fallback(cx, a):
+    cx.need_url()
+    done = cx.load().get("fallback_at")
+    if done and not a.force:
+        cx.say("fallback already completed (%s); nothing to do. A new export starts a new cycle; --force repeats it." %
+               time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(done)))
+        return
+    cx.say("step 1: drain the container (stop new work)")
+    if not cx.dry:
+        st, _, doc = cx.req("POST", "/api/admin/drain", {"on": True})
+        if st != 200:
+            raise Fail("drain refused: HTTP %s %s" % (st, json.dumps(doc)[:200]))
+    cx.say("step 2: wait (up to %s min) until nothing runs there" % a.wait)
+    if not cx.dry:
+        deadline = time.time() + a.wait * 60
+        while True:
+            st, _, doc = cx.req("GET", "/api/admin/drain")
+            if st == 200 and not doc.get("running") and not doc.get("cpu_running"):
+                break
+            if time.time() >= deadline:
+                raise Fail("jobs still running in the container (%s); drain stays on, run fallback again" %
+                           json.dumps({k: doc.get(k) for k in ("running", "cpu_running")}))
+            cx.say("container: %s running, %s CPU-lane running" % (doc.get("running"), doc.get("cpu_running")))
+            time.sleep(min(10.0, max(0.05, deadline - time.time())))
+    tar = cx.work / ("fallback-%s.tar" % time.strftime("%Y%m%dT%H%M%S"))
+    cx.say("step 3: pull the container's export -> %s" % tar)
+    if not cx.dry:
+        cx.work.mkdir(parents=True, exist_ok=True)
+        st, hd, doc = cx.req("GET", "/api/admin/export", to_file=tar)
+        if st != 200:
+            raise Fail("export refused: HTTP %s %s" % (st, json.dumps(doc)[:200]))
+        want = hd.get("X-Content-SHA256")
+        got = queue_standby.sha256_file(tar)
+        if not want or want != got:
+            raise Fail("export hash mismatch (header %s, file %s)" % (want, got))
+        cx.say("export ok: sha256 %s" % got)
+    cx.say("step 4: make sure the Mac jobs are stopped")
+    cx.stop_jobs()
+    cx.say("step 5: restore the state here (the old state is kept as .standby-backup-*)")
+    if not cx.dry:
+        res = queue_standby.import_state(tar, cx.state_dir, cx.disp, sha256=got, replace=True)
+        cx.say("restored %s files, manifest_ok=%s, backup %s" % (res["files"], res["manifest_ok"], res.get("backup")))
+        if res.get("manifest_ok") is not True:
+            raise Fail("manifest not verified after restore")
+    cx.say("step 6: put the old client config back")
+    d = cx.load()
+    bak = d.get("config_backup")
+    if bak and Path(bak).exists():
+        if cx.config.exists() and cx.config.read_bytes() == Path(bak).read_bytes():
+            cx.say("config already restored")
+        elif not cx.dry:
+            shutil.copy2(bak, cx.config)
+            cx.say("restored %s from %s" % (cx.config, bak))
+        else:
+            cx.say("would restore %s from %s" % (cx.config, bak))
+    elif d.get("config_had_file") is False:
+        cx.say("no config existed before switch-clients; remove queue.api_url from %s by hand" % cx.config)
+    else:
+        cx.say("no config backup recorded: set queue.api_url back by hand")
+    cx.say("step 7: bootstrap the launchd jobs again")
+    cx.start_jobs()
+    if not cx.dry:
+        cx.save(imported=None, fallback_at=time.time())
+    cx.say("fallback done. The container stays drained; stop it when you are ready.")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="queue-cutover", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--url")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("export")
+    e.add_argument("--wait", type=float, default=0.0)
+    e.add_argument("--replace", action="store_true")
+    sub.add_parser("switch-clients")
+    f = sub.add_parser("fallback")
+    f.add_argument("--wait", type=float, default=30.0)
+    f.add_argument("--force", action="store_true", help="repeat a fallback that already completed")
+    a = ap.parse_args(argv)
+    cx = Ctx(a)
+    try:
+        {"export": cmd_export, "switch-clients": cmd_switch, "fallback": cmd_fallback}[a.cmd](cx, a)
+    except Fail as e:
+        cx.say("STOPPED: %s" % e)
+        return 1
+    except Exception as e:  # noqa: BLE001
+        cx.say("STOPPED: %s: %s" % (type(e).__name__, str(e)[:300]))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

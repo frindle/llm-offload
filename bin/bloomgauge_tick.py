@@ -345,7 +345,11 @@ def tick(work, now=None, cfg=None, client=None, policy=None, ctl=None):
         note_failure(dec, bud, result, policy, ctl, cfg, eff, now)
 
     # Step 8: Save lease (or remove if new is None)
-    ctl.lease_save(path, None if new is None else dict(new, heartbeat=now, daemon_pid=os.getpid(), mode=eff))
+    # cfg owner_pid (2026-11-12): the Mac status service runs this step for a queue that runs elsewhere and passes
+    # None, so the lease names no live process and the stale-lease guard goes by the heartbeat alone (that
+    # service outlives the queue; its pid would keep the guard from ever handing back).
+    owner = cfg.get("owner_pid", os.getpid())
+    ctl.lease_save(path, None if new is None else dict(new, heartbeat=now, daemon_pid=owner, mode=eff))
 
     return dec
 

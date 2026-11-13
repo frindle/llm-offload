@@ -31,7 +31,7 @@ from docsum_ui_multipart import parse_multipart  # noqa: E402
 from docsum_ui_page import page_html  # noqa: E402
 
 DEFAULT_PORT = 7690
-PRIVATE_ROOT = os.path.expanduser("~/Documents/doc-summaries/private")
+PRIVATE_ROOT = os.path.expanduser(os.environ.get("DOCSUM_PRIVATE_ROOT") or "~/Documents/doc-summaries/private")
 STATE = os.path.expanduser("~/bin/ollama-queue-state.json")
 QUEUE = os.path.expanduser("~/bin/ollama-queue.py")
 MAX_PDF = 100 * 1024 * 1024
@@ -42,6 +42,16 @@ ID_RE = re.compile(r"[0-9a-f]{8}")
 FAILED = ("failed", "error", "needs_opus", "cancelled")
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; "
        "form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+
+
+def _queue_standby():
+    import queue_config
+    return queue_config.standby()
+
+
+def _queue_frozen():
+    import queue_config
+    return queue_config.standby() or queue_config.draining()
 
 
 def valid_id(s):
@@ -56,10 +66,9 @@ def safe_name(name):
 
 def queue_rows():
     """docsum rows from the queue state file: {id, label, status}. No other job data is read."""
-    try:
-        with open(STATE) as f:
-            jobs = json.load(f).get("jobs") or []
-    except Exception:
+    import queue_config
+    jobs = (queue_config.load_queue_state(STATE) or {}).get("jobs") or []
+    if not isinstance(jobs, list):
         return []
     return [{"id": j.get("id"), "label": j.get("label"), "status": j.get("status")}
             for j in jobs if isinstance(j, dict) and is_private_label(j.get("label"))]
@@ -91,14 +100,17 @@ def enqueue_job(job, model):
 
 
 ACTIVE = ("running", "pending", "queued", "paused")
-CLEAR_URL = "http://127.0.0.1:7684/api/runs/%s/clear"
+CLEAR_URL = None   # set below from queue_config.queue_api()
 
 
 def clear_row(qid):
     """Dashboard clear for a finished/resolved row; best effort."""
     import urllib.request
     try:
-        urllib.request.urlopen(urllib.request.Request(CLEAR_URL % qid, data=b"", method="POST"), timeout=5).read()
+        import queue_config
+        url = CLEAR_URL or (queue_config.queue_api()[0] + "/api/runs/%s/clear")
+        urllib.request.urlopen(urllib.request.Request(url % qid, data=b"", method="POST",
+                                                      headers=queue_config.queue_api_headers()), timeout=5).read()
     except Exception:
         pass
 
@@ -235,6 +247,9 @@ def make_handler(cfg):
             if not self._guarded("POST"):
                 return
             path = self.path.split("?", 1)[0]
+            if path in ("/api/upload",) or path.startswith("/api/delete/"):
+                if _queue_frozen():   # standby copy of the Mac queue, or draining for the fallback: touch no queue row
+                    return self._err(503, "E_STANDBY" if _queue_standby() else "E_DRAINING", "frozen")
             if path == "/api/upload":
                 return self._upload()
             m = re.fullmatch(r"/api/delete/([^/]+)", path)

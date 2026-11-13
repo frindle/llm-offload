@@ -163,7 +163,7 @@ def revert_check():
         d = Path(tempfile.mkdtemp(prefix="reapmut-"))
         dst = d / "verify-orphan-reap.py"
         dst.write_text(src.replace(old, new))
-        (d / "notify-owner.py").write_text((HERE / "notify-owner.py").read_text())
+        (d / "notify-operator.py").write_text((HERE / "notify-operator.py").read_text())
         r = subprocess.run([sys.executable, __file__], env={**os.environ, "REAP_SRC": str(dst),
                                                      **({"REAP_PURE_ONLY": "1"} if pure_only else {})},
                            capture_output=True, text=True, timeout=180)

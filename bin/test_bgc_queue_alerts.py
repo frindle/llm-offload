@@ -35,7 +35,7 @@ def test_control_alert_writes_one_janitor_parseable_row_per_open_condition(tmp_p
     m = J.ROW_RE.match(lines[0])
     assert m and (m["plan"], m["who"], m["src"], m["ts"]) == (
         "bloomgauge-control-pick", "BLOOMGAUGE CONTROL", "Q", "1970-01-01T00:16:40Z")
-    assert lines[0].endswith(" - needs the owner: failed 3 picks in a row")
+    assert lines[0].endswith(f" - needs {oq.queue_config.operator_name()}: failed 3 picks in a row")
     idx.write_text(idx.read_text().replace("- [ ] `bloomgauge-control-pick`", "- [x] `bloomgauge-control-pick`"))
     assert oq._control_alert("bloomgauge-control-pick", "failed 3 picks in a row", now=3000.0, idx=idx) is True
 
@@ -75,7 +75,7 @@ def test_the_darkbloom_hint_names_no_command():
     on = oq.darkbloom_fix_hint({"qwen3.6-35b-a3b-vl-mtp-mxfp8"}, mode="on")
     off = oq.darkbloom_fix_hint({"qwen3.6-35b-a3b-vl-mtp-mxfp8"}, mode="off")
     assert on.startswith("nothing to run: the queue's BloomGauge control pins qwen3.6-35b-a3b-vl-mtp-mxfp8")
-    assert off.startswith("needs the owner: pick qwen3.6-35b-a3b-vl-mtp-mxfp8 in BloomGauge")
+    assert off.startswith(f"needs {oq.queue_config.operator_name()}: pick qwen3.6-35b-a3b-vl-mtp-mxfp8 in BloomGauge")
     for h in (on, off, oq.darkbloom_fix_hint(set(), mode="shadow")):
         assert "darkbloom start" not in h and "never run darkbloom" in h.lower()
 
@@ -98,7 +98,7 @@ def test_control_mode_is_cached_and_off_on_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "bloomgauge_control", types.SimpleNamespace(config=lambda: 1 / 0))
     assert oq._bloomgauge_control_mode(1000.0 + oq.BG_MODE_CACHE_S - 1) == "on"          # cached
     assert oq._bloomgauge_control_mode(1000.0 + oq.BG_MODE_CACHE_S) == "off"             # re-read, broke
-    assert oq.darkbloom_fix_hint({"m"}).startswith("needs the owner: pick m in BloomGauge")   # mode read: off
+    assert oq.darkbloom_fix_hint({"m"}).startswith(f"needs {oq.queue_config.operator_name()}: pick m in BloomGauge")   # mode read: off
 
 
 # ---------------------------------------------------------------- drift grace
@@ -108,7 +108,7 @@ def test_with_control_on_a_drift_alerts_only_after_the_grace(monkeypatch):
     assert oq.darkbloom_drift_alert(["m"], st, 1000.0, mode="on") is None and st["since"] == 1000.0
     assert oq.darkbloom_drift_alert(["m"], st, 1000.0 + oq.DRIFT_GRACE_S - 1, mode="on") is None
     msg = oq.darkbloom_drift_alert(["m"], st, 1000.0 + oq.DRIFT_GRACE_S, mode="on")
-    assert msg.startswith("Darkbloom does not serve m but queued jobs need it, for over 75 min")
+    assert msg.startswith("Darkbloom does not serve m but the next queued run needs it, for over 75 min")
     assert msg == oq.darkbloom_drift_alert(["m"], st, 99999.0, mode="on")       # stable text: deduped
     assert "darkbloom start" not in msg and "Never run darkbloom" in msg
 
@@ -116,11 +116,11 @@ def test_with_control_on_a_drift_alerts_only_after_the_grace(monkeypatch):
 def test_with_control_off_a_missing_model_alerts_at_once_and_a_down_endpoint_after_15_min(monkeypatch):
     monkeypatch.setattr(oq, "_darkbloom_url", lambda: "http://127.0.0.1:8000")
     msg = oq.darkbloom_drift_alert(["m"], {}, 1000.0, mode="off")
-    assert msg.startswith("Darkbloom does not serve m but queued jobs need it: pick it in BloomGauge")
+    assert msg.startswith("Darkbloom does not serve m but the next queued run needs it: pick it in BloomGauge")
     st = {}
     assert oq.darkbloom_drift_alert(["m"], st, 1000.0, mode="off", down=True) is None
     msg = oq.darkbloom_drift_alert(["m"], st, 1000.0 + oq.DRIFT_DOWN_GRACE_S, mode="off", down=True)
-    assert msg.startswith("Darkbloom has not answered at http://127.0.0.1:8000 while queued jobs need m: start it")
+    assert msg.startswith("Darkbloom has not answered at http://127.0.0.1:8000 while the next queued run needs m: start it")
 
 
 def test_the_daemon_routes_drift_to_the_control_alert_and_marks_state():

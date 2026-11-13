@@ -341,7 +341,10 @@ def c3(ctx):
     m = re.search(r"^- runner: .*? sha=([0-9a-f]{12})\s*$", vf.read_text() if vf.is_file() else "", re.M)
     cur = (MR.sha_file(runner_path()) or "")[:12]
     if not m or m.group(1) != cur:  # belt and braces: an older mini-validate does not compare the runner
-        raise Fail("C3", f"VALIDATION.md was written by runner sha {m.group(1) if m else 'unknown'}, current is {cur}", fix)
+        hint = fix
+        if m and _remote_queue() and "- validated on the queue: job " in vf.read_text():
+            hint = "the queue image's runner differs from this machine's mini-swe-runner.py: bring ~/bin and the image to the same commit"
+        raise Fail("C3", f"VALIDATION.md was written by runner sha {m.group(1) if m else 'unknown'}, current is {cur}", hint)
     return "VALIDATION fresh for this spec and runner"
 
 
@@ -435,7 +438,22 @@ def wipe_workdir(ctx):
             shutil.rmtree(c, ignore_errors=True) if c.is_dir() else c.unlink(missing_ok=True)
 
 
+def c5_remote(ctx):
+    """Remote queue: C5 and C6 (and V1-V8) run as ONE validate job on the queue, never on this machine (spec tests execute project
+    code). A VALIDATION.md the queue already produced (marked by mini_validate_remote) covers them; C3 has just proved it fresh."""
+    import mini_validate_remote as MVR
+    jid = MVR.marked_job(ctx.spec_dir / "VALIDATION.md")
+    if jid:
+        return f"runner --check-only ran in the queue's validate job {jid}"
+    ok, jid, out = MVR.remote_validate(ctx.spec_path, ctx.model, ctx.label)
+    if not ok:
+        raise Fail("C5", f"the queue's validate job did not pass: {out.strip()[-600:]}", "fix the spec (the job's log is on the queue)")
+    return f"the queue's validate job {jid} passed (V1-V8, C5, C6)"
+
+
 def c5(ctx):
+    if _remote_queue():
+        return c5_remote(ctx)
     cmd, rc, out = run_runner(ctx, [])
     wipe_workdir(ctx)
     if rc != 0:
@@ -446,6 +464,8 @@ def c5(ctx):
 def c6(ctx):
     if not ctx.spec.get("steps"):
         return "plain spec: skipped"
+    if _remote_queue():
+        return "covered by the queue's validate job (C5)"
     refd = ref_dir(ctx)
     cmd, rc, out = run_runner(ctx, ["--try-fix-chain", str(refd)])
     wipe_workdir(ctx)
@@ -537,6 +557,48 @@ def graph_warning(steps):
         return ""
 
 
+def _remote_queue():
+    """True when the queue API is on another machine (queue_config.queue_is_remote()): the job is then uploaded."""
+    try:
+        import queue_config
+        return bool(queue_config.queue_is_remote())
+    except ImportError:
+        return False
+
+
+def submit_remote(a, ctx, rest):
+    """Queue on another machine: the C0-C6 checks above ran here against the local files; now pack the spec and what it
+    points at (queue_remote.py) and POST it. The queue unpacks it under its own mini-work and runs the runner of the same
+    NAME from its own bin. No local receipt is written: the queue cannot verify one, it relies on the API token."""
+    import queue_config
+    import queue_remote as QR
+    try:
+        fields = QR.parse_enqueue_flags(rest)
+        # the same defaults the local enqueue adds (host auto, task kind coding) unless the caller passed them
+        job = dict({"host": "auto", "task_kind": "coding"}, **fields)
+        job.update(model=a.model, label=a.label)
+        spec = json.loads(ctx.spec_path.read_text())
+        QR.check_paths(spec, ctx.spec_path.parent)   # RemoteError: a command names a local path no shipped tree holds
+        for k in QR.unhandled_path_keys(spec):
+            print(f"mini-submit: WARN spec key {k!r} holds a local path; it is NOT sent and will not resolve on the queue")
+        if a.dry_run:
+            print(f"mini-submit: DRY-RUN ok; would upload {ctx.spec_path} to {queue_config.queue_api()[0]} "
+                  f"(runner {runner_path().name}, fields {sorted(job)})")
+            return 0
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="mini-upload-") as td:
+            pkg = Path(td) / "package.tar"
+            QR.build_package(ctx.spec_path, job, runner_path().name, pkg)
+            print(f"mini-submit: uploading {pkg.stat().st_size} bytes to {queue_config.queue_api()[0]}")
+            res = QR.upload(*queue_config.queue_api()[:1], queue_config.queue_api_headers(), pkg)
+    except QR.RemoteError as e:
+        print(f"mini-submit: remote submit failed: {e}")
+        return 1
+    print(f"run_dir: {res.get('run_dir', '')}   (on the queue)")
+    print("job_id: " + str(res.get("id", "")))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     ap.add_argument("spec", nargs="?")
@@ -617,6 +679,8 @@ def main(argv=None):
             if flag not in rest and not any(x.startswith(flag + "=") for x in rest):
                 enq += [flag] + ([val] if val else [])
         enq += rest
+        if _remote_queue():
+            return submit_remote(a, ctx, rest)
         if a.dry_run:
             print("mini-submit: DRY-RUN ok; would run: " + " ".join(shlex.quote(c) for c in enq))
             return 0

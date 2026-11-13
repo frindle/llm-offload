@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage_report.py -- automatic weekly Claude-usage report (offload plan step 6; the owner 2026-10-15).
+"""usage_report.py -- automatic weekly Claude-usage report (offload plan step 6; operator 2026-10-15).
 
 Measures the same way as plan sections 2b/2c (session logs, messages deduped by id, price-weighted
 tokens: input 1, cache write 1.25, cache read 0.1, output 5; pipeline-upkeep tag from the paths each

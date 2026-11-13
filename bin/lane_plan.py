@@ -26,6 +26,11 @@ Kill switches: LANE_PLAN=0 (env) or the file ~/.ollama-dispatch/lane-plan.disabl
 Secrets: the key lives only in a KeyBox (repr/str/pickle/json safe). Logs and plan files carry
 sha256 fingerprints ("sha256:1a2b3c4d") only.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import copy
 import dataclasses
 import hashlib
@@ -41,7 +46,7 @@ SCHEMA = 1
 DARKBLOOM_LANE = "studio-db"          # alias kept: gate env GATE_REGATE_HOST uses it
 BONSAI_LANE = "bonsai"
 DEFAULT_MODEL = os.environ.get("DARKBLOOM_DEFAULT_MODEL", "qwen3.6-35b-a3b-vl-mtp-mxfp8")
-DEFAULT_BASE = (os.environ.get("DARKBLOOM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_BASE = queue_config.get_str("darkbloom.base_url", "http://127.0.0.1:8000", env="DARKBLOOM_BASE_URL").rstrip("/")
 DISABLE_FILE = Path(os.path.expanduser("~/.ollama-dispatch/lane-plan.disabled"))
 _SECRET_FIELD_RE = re.compile(r"(^|_)(api_?key|secret|token|password|bearer)(_|$)", re.I)
 
@@ -384,6 +389,10 @@ def take_snapshot(prev=None, now=None, sources=None, sticky_s=None, pid_alive=No
 
     # --- local.json ---------------------------------------------------------------------
     st, rec = _json_obj(src.local_json)
+    if st == "ok":
+        rec = queue_config.darkbloom_apply_env(rec)          # env DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY laid over (no-op unset)
+    elif st == "missing" and (os.environ.get("DARKBLOOM_API_KEY") or os.environ.get("DARKBLOOM_BASE_URL")):
+        st, rec = "ok", queue_config.darkbloom_apply_env({})   # container: no vendor file, the environment names the endpoint
 
     def last_good(why):
         if win > 0 and pdb is not None and pdb.state == "up" and pdb.good_at is not None \

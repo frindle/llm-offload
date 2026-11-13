@@ -30,6 +30,11 @@ Contract (Phase 6, 2026-10-08):
 
 Seams are test-patchable: `_submit`, `_runner_online`, `_marker`, `snapshot`.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import ast
 import base64
 import gzip
@@ -303,8 +308,8 @@ def owner_label(wt, stage=None, explicit=None):
 
 
 # ----------------------------------------------------------------------------- bundle key
-QUEUE_STATE = HERE / "ollama-queue-state.json"
-QUEUE_LOGS = HERE / "ollama-queue-logs"
+QUEUE_STATE = queue_config.state_dir() / "ollama-queue-state.json"
+QUEUE_LOGS = queue_config.state_dir() / "ollama-queue-logs"
 
 
 def _queue_row_bundle(job_id=None, label=None):
@@ -938,7 +943,7 @@ SATURATION_WAIT_S_DEFAULT = 1200     # how long a stage queues for a busy-but-al
 
 
 def saturation_wait_s():
-    """Bounded wait (s) for a free runner slot. The owner 2026-10-10: the Mac runs CPU-lane stages ONLY when Unraid
+    """Bounded wait (s) for a free runner slot. operator 2026-10-10: the Mac runs CPU-lane stages ONLY when Unraid
     is saturated (every slot busy for this long) or down/ineligible -- never merely because the runner is busy."""
     try:
         return max(0.0, float(os.environ.get("CPU_LANE_SATURATION_WAIT_S", SATURATION_WAIT_S_DEFAULT)))

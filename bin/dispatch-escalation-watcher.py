@@ -11,7 +11,7 @@ parks such a slice in ESCALATED after 2 identical failures -- but ESCALATED is
 just a word in a JSON file. Nobody reads it at 3am.
 
 This watcher is the delivery half. It runs from launchd
-(com.example.dispatch-escalation-watcher, StartInterval 300) so there is nothing to
+(com.the operator.dispatch-escalation-watcher, StartInterval 300) so there is nothing to
 re-arm, and it works with ZERO open Claude sessions:
 
   1. DETECT   -- three independent sources, so a loop that dodges one is caught
@@ -75,6 +75,11 @@ a dispatch. Exceptions are contained per-source.
 """
 from __future__ import annotations
 
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import json
 import os
@@ -97,8 +102,8 @@ INDEX_MD = ESC_DIR / "ESCALATIONS.md"
 # the desktop ping is unchanged. qctl/the hook read only INDEX_MD.
 READY_MD = ESC_DIR / "READY-TO-LAND.md"
 QUEUE_PY = Path.home() / "bin" / "ollama-queue.py"
-QUEUE_LOGS = Path.home() / "bin" / "ollama-queue-logs"
-RUNS_API = "http://127.0.0.1:7684/api/runs"
+QUEUE_LOGS = queue_config.state_dir() / "ollama-queue-logs"
+RUNS_API = queue_config.queue_api()[0] + "/api/runs"
 AUTO_RUNS = DISPATCH_DIR / "auto-runs"
 WORKTREES = DISPATCH_DIR / "worktrees"
 # The model review of an escalation is a BOUNDED job: a "<400 words" answer needs ~1K output
@@ -122,7 +127,7 @@ ATTEMPTS_ESCALATE = 4
 # far longer producing nothing. 90 min never fires on a healthy job and still
 # catches a wedge inside the first two hours of an overnight window.
 STUCK_JOB_MINUTES = 90
-# POLL: matches the com.example.dispatch-ack-reconcile precedent.
+# POLL: matches the com.the operator.dispatch-ack-reconcile precedent.
 POLL_SECONDS = 300
 REVIEW_TIMEOUT = 1800
 REVIEW_MODEL = "local"  # retired: reviews are queue jobs (REVIEW_QUEUE_MODEL)
@@ -140,8 +145,8 @@ UNSATISFIED_LOOPABLE = ("pending", "failed", "enqueued", "blocked")
 REVIEW_TOOLS = [
     "Read", "Grep", "Glob",
     "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git status:*)",
-    "Bash(python3 /Users/user/bin/ollama-queue.py results:*)",
-    "Bash(python3 /Users/user/bin/ollama-queue.py status:*)",
+    f"Bash(python3 {Path.home()}/bin/ollama-queue.py results:*)",
+    f"Bash(python3 {Path.home()}/bin/ollama-queue.py status:*)",
 ]
 
 
@@ -404,7 +409,7 @@ def _job_started_epoch(job_id):
     """Best-effort launch time: the queue state row, else the log file's mtime."""
     st = _load_json(DISPATCH_DIR.parent / ".ollama-queue" / "state.json")
     for base in (Path.home() / ".ollama-queue" / "state.json",
-                 Path.home() / "bin" / "ollama-queue-state.json"):
+                 queue_config.state_dir() / "ollama-queue-state.json"):
         st = st or _load_json(base)
     if isinstance(st, dict):
         for j in st.get("jobs") or []:
@@ -483,12 +488,12 @@ def detect_stuck_jobs(now=None, status_text=None):
 def detect_needs_info_jobs(jobs=None):
     """Source G: a mini-swe job PARKED on a NEEDS.md question (status paused,
     pause_reason needs_info). Notice only (no_review): nothing to diagnose, no Opus
-    session, and no auto-answer/auto-resume -- only the owner answers, with `mini-answer`.
+    session, and no auto-answer/auto-resume -- only the operator answers, with `mini-answer`.
     One finding per job and ask number (the ask number is spelled as a letter in the
     signature so _norm_sig's digit masking keeps a second ask distinct)."""
     if jobs is None:
         try:
-            jobs = (_load_json(Path.home() / "bin" / "ollama-queue-state.json") or {}).get("jobs") or []
+            jobs = (_load_json(queue_config.state_dir() / "ollama-queue-state.json") or {}).get("jobs") or []
         except Exception:
             return []
     out = []
@@ -557,7 +562,7 @@ def new_escalations(found, ledger):
 
 
 # --------------------------------------------------------------------------
-# NUMBERED RERUNS WITH A VISIBLE CAUSE (the owner, 2026-10-01)
+# NUMBERED RERUNS WITH A VISIBLE CAUSE (the operator, 2026-10-01)
 # --------------------------------------------------------------------------
 # _norm_sig masks every digit and hex id, which is what stops one parked slice from
 # being announced six times -- but it ALSO swallowed a genuinely worse
@@ -891,7 +896,7 @@ def resolve_job_evidence(e, state_path=None, auto_runs=None, worktrees=None, dis
     {} when nothing did. Pure reads, never raises."""
     out = {}
     try:
-        state_path = Path(state_path) if state_path else Path.home() / "bin" / "ollama-queue-state.json"
+        state_path = Path(state_path) if state_path else queue_config.state_dir() / "ollama-queue-state.json"
         ar = Path(auto_runs) if auto_runs else AUTO_RUNS
         wts = Path(worktrees) if worktrees else WORKTREES
         dd = Path(dispatch_dir) if dispatch_dir else DISPATCH_DIR
@@ -1152,7 +1157,7 @@ def build_context(e, state=None, evidence=None):
     L = []
     L.append("# DISPATCH ESCALATION -- needs eyes")
     L.append("")
-    # NUMBERED RERUN, AT THE TOP (the owner 2026-10-01: "the ability to somehow see what
+    # NUMBERED RERUN, AT THE TOP (operator 2026-10-01: "the ability to somehow see what
     # caused the rerun? maybe have it put at the top of the log window"). First thing
     # under the title, before any other context, so the reviewer reads the CAUSE
     # first: escalation #N, what changed old -> new, and the triggering job.
@@ -2001,9 +2006,9 @@ def write_proposal(patch, repo, out_path):
     """Write a VALIDATED proposal + its one-line apply command. Returns the
     apply command, or None when there is nothing trustworthy to offer.
 
-    Propose, never apply (the owner 2026-09-19). The evidence for that split is in
+    Propose, never apply (operator 2026-09-19). The evidence for that split is in
     this pipeline's own history: of the first three live verdicts two were
-    'harness defect' and the owner wanted to review one himself, so the triage class
+    'harness defect' and the operator wanted to review one himself, so the triage class
     is not a safe auto-trigger; and bg-brokers is the counterexample that
     settles it -- a change that was CORRECT PER SPEC silently dropped real
     behaviour (dedupe), which only a human reading the chain tip caught. An
@@ -2111,7 +2116,7 @@ def ensure_verdict(e, ctx, stem, review, rerun=None, ev=None):
         fc = e.get("failure_class")
         if not fc and e.get("job_id"):
             try:
-                st = json.loads((Path.home() / "bin" / "ollama-queue-state.json").read_text())
+                st = json.loads((queue_config.state_dir() / "ollama-queue-state.json").read_text())
                 fc = next((j.get("failure_class") for j in st.get("jobs") or []
                            if j.get("id") == e["job_id"]), None)
             except Exception:
@@ -2236,7 +2241,7 @@ def _queue_live_paths(state=None):
     """Every task_file / capture_final_as a LIVE queue row still points at. Never raises."""
     out = set()
     try:
-        st = json.loads(Path(state or (Path.home() / "bin" / "ollama-queue-state.json")).read_text())
+        st = json.loads(Path(state or (queue_config.state_dir() / "ollama-queue-state.json")).read_text())
         for j in st.get("jobs") or []:
             if j.get("status") in _ACTIVE_STATES:
                 for k in ("task_file", "capture_final_as"):
@@ -2482,7 +2487,7 @@ def handle_no_evidence(e, body, ctx, stem, render_failed=False, esc_dir=None, in
     if not fc and e.get("job_id"):
         try:
             fc = next((j.get("failure_class") for j in json.loads(
-                (Path.home() / "bin" / "ollama-queue-state.json").read_text()).get("jobs") or []
+                (queue_config.state_dir() / "ollama-queue-state.json").read_text()).get("jobs") or []
                 if j.get("id") == e["job_id"]), None)
         except Exception:
             fc = None
@@ -2696,7 +2701,7 @@ def run_once(dry_run=False):
             print("  NOTICE %s -> %s" % (esc_key(e), ctx))
             continue
 
-        # PRE-SPAWN EVIDENCE GATE (2026-10-09, the owner: "how was it missing the required
+        # PRE-SPAWN EVIDENCE GATE (2026-10-09, the operator: "how was it missing the required
         # checks and still queued?"). The review task tells the reviewer to read plan state /
         # worktree / log evidence; a context without ANY of it (a bare job row whose evidence
         # could not be resolved from its label) used to be reviewed anyway -- the model
@@ -2860,14 +2865,14 @@ SELF_HEAL = Path(__file__).resolve().parent / "dispatch-self-heal.py"
 
 
 def review_bundle(e):
-    """PURE. The bundle an escalation review job joins (the owner 2026-10-02: every job
+    """PURE. The bundle an escalation review job joins (operator 2026-10-02: every job
     belongs to a bundle; an esc-review is a child of what it reviews): the job's own
     bundle, else the slice plan, else None (the queue derives one)."""
     if e.get("bundle") or e.get("plan"):
         return e.get("bundle") or e.get("plan")
     if e.get("job_id"):
         try:
-            st = json.loads((Path.home() / "bin" / "ollama-queue-state.json").read_text())
+            st = json.loads((queue_config.state_dir() / "ollama-queue-state.json").read_text())
             for j in st.get("jobs") or []:
                 if j.get("id") == e["job_id"]:
                     if j.get("bundle"):
@@ -3549,7 +3554,7 @@ def self_test():
     check("the freshness re-check only ever runs READ-ONLY git subcommands",
           _subs and set(_subs) <= _GIT_READONLY)
 
-    # --- NUMBERED RERUNS WITH A VISIBLE CAUSE (the owner 2026-10-01) --------------
+    # --- NUMBERED RERUNS WITH A VISIBLE CAUSE (operator 2026-10-01) --------------
     # Grounded in the real chain off ~/bin/ollama-queue-state.json:
     # dbcf30f84454 -> d96a71500b9b -> f059db0bce62 (bundle sidecar-bfmr-login-nudge).
     # THE BUG: these two reasons share a masked esc_key, so the second was silently

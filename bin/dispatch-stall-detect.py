@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dispatch-stall-detect.py -- nothing hangs silently (the owner 2026-10-02, mandate item 3).
+"""dispatch-stall-detect.py -- nothing hangs silently (operator 2026-10-02, mandate item 3).
 
 "Any bundle/slice with no state change for >30 min while the lane is idle gets
 auto-diagnosed and acted on; if it truly needs a human, ONE notification naming what
@@ -24,10 +24,15 @@ ONE action per stale state (the run-state mtime identifies it), then ONE alert:
   * a plan idle for more than STALE_HORIZON_S (a day) is NOT relaunched -- someone
     may have abandoned it -- it is reported instead;
   * nothing applicable, or the action left the state unchanged for another
-    STALL_S -> ONE notify-owner alert with the exact qctl commands.
+    STALL_S -> ONE notify-operator alert with the exact qctl commands.
 Every decision goes to ~/.ollama-dispatch/decisions.jsonl (shown by `qctl status`).
 State: ~/.ollama-dispatch/stall-detect.json. Dry run: --dry-run. Tests: --self-test.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import importlib.util
 import json
@@ -44,7 +49,7 @@ SLICE_RUNS = DISPATCH / "slice-runs"
 ESC_DIR = DISPATCH / "escalations"
 LEDGER = DISPATCH / "stall-detect.json"
 DECISIONS = DISPATCH / "decisions.jsonl"
-QSTATE = Path(os.environ.get("STALL_QUEUE_STATE") or BIN / "ollama-queue-state.json")
+QSTATE = Path(os.environ.get("STALL_QUEUE_STATE") or queue_config.state_dir() / "ollama-queue-state.json")
 SELF_HEAL = BIN / "dispatch-self-heal.py"
 
 STALL_S = 30 * 60
@@ -219,7 +224,7 @@ def run_pass(now=None, dry=False, notifier=None, launcher=None, healer=None, can
         except Exception:
             cancelled = lambda lbl: False
     if notifier is None:
-        notifier = _mod("notify_owner", BIN / "notify-owner.py").notify
+        notifier = _mod("notify_operator", BIN / "notify-operator.py").notify
     results = []
     for p in sorted(SLICE_RUNS.glob("*.json")):
         st = _load(p, None)

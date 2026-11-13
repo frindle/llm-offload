@@ -32,6 +32,11 @@ Clearing = `handoff-emit.py --acted <ids> --reason ...` (the existing separate t
 Kill switch: file ~/.ollama-dispatch/handoff-autoclear/OFF or HANDOFF_AUTOCLEAR=off
 (nothing acts). `--dry-run` prints the plan. `--auto` is what the watcher pass runs.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import hashlib
 import json
@@ -45,8 +50,8 @@ from pathlib import Path
 BIN = Path.home() / "bin"
 EMIT = BIN / "handoff-emit.py"
 QUEUE = BIN / "ollama-queue.py"
-STATE = BIN / "ollama-queue-state.json"
-LOGS = BIN / "ollama-queue-logs"
+STATE = queue_config.state_dir() / "ollama-queue-state.json"
+LOGS = queue_config.state_dir() / "ollama-queue-logs"
 HEAL_LEDGER = Path.home() / ".ollama-dispatch" / "escalations" / "self-heal.json"
 WORK = Path.home() / ".ollama-dispatch" / "handoff-autoclear"
 KILL = WORK / "OFF"

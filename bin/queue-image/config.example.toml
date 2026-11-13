@@ -1,0 +1,44 @@
+# Example queue config. Copy to ~/.config/ollama-queue/config.toml (or point $QUEUE_CONFIG at it).
+# Every key can also be set from the environment as QUEUE_<KEY> (dots become underscores); some keys have older names too.
+# The state directory is not a key: set $QUEUE_STATE_DIR (default: ~/bin).
+
+[operator]
+name = "the operator"                       # display name in "needs <name>" alerts and cancel reasons
+handle = "operator"                         # short lowercase handle: default signoff reviewer, keychain account
+
+[ollama]
+unraid_url = "http://192.0.2.10:11434"      # the small-GPU Ollama host (lane "unraid"); empty disables the lane
+studio_url = "http://192.0.2.11:11434"      # the main Ollama host (lane "studio"); in the container a loopback URL = no studio host
+
+[search]
+searxng_url = "http://192.0.2.12:8080"      # SearXNG base URL for the worker's web search; empty disables it
+
+[vault]
+url = "http://192.0.2.13:27123"             # notes-vault REST endpoint; empty disables vault lookups
+
+[bonsai]
+url = "http://192.0.2.14:8092"              # bonsai (small local model) server; empty falls back to the bonsai-host file
+
+[darkbloom]
+base_url = "http://127.0.0.1:8000"          # OpenAI-style endpoint of the main local model server
+upstream_hosts = ["192.0.2.20"]             # exact IPs besides loopback that may receive the model-server key
+
+[diagnostics]
+unraid_graphql_url = "https://unraid.example.com/graphql"   # Unraid GraphQL API used by dispatch-diagnostics
+
+[bakeoff]
+driver = "/home/user/bakeoff/bakeoff-driver.sh"             # shell driver that bakeoff-runner executes
+
+[upload]
+max_mb = 512                                # largest job upload (POST /api/jobs/upload) the API accepts; 413 above it
+max_unpacked_mb = 2048                      # largest total size the upload may unpack to; 413 above it
+run_max_mb = 128                            # largest run-dir fetch (mini-finish's mirror); files over it are listed in _queue/skipped.txt
+
+[paths]
+handoff_dir = "~/.ollama-dispatch/handoff"                   # handoff panel pages + acted.json; $HANDOFF_DIR wins; default ~/Desktop/GitHub Projects/ollama/ollama-handoff
+
+[docsum]
+upstream = "192.0.2.15:7690"                # host:port the docsum UI proxy forwards to (default 127.0.0.1:7690; set when docsum runs on another host)
+
+[toolchain]
+repos = ["owner/repo-a", "owner/repo-b"]       # repos repo-toolchain-check clones and checks (token from $GITHUB_TOKEN)

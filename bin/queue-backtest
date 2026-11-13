@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""queue-backtest: replay the queue's recorded history through this code and compare. Scratch only.
+
+  queue-backtest run --out DIR [--parts B1,B2,...] [--limit N] [--old-bin DIR] [--cases DIR] [--api-url URL]
+  queue-backtest _worker --bin DIR        (internal: evaluates decisions with the code found in DIR; JSON on stdin/stdout)
+
+Writes only under --out (status.json, results.json, a scratch/ folder). Never pushes, never notifies, never calls the Mac
+status service (the hold check feeds recorded history through the status service's own code in-process), and only does
+GETs against --api-url. The state it reads is the standby container's copy; it is never modified.
+
+Parts (pass marks: Queue Move Cutover Plan, "Back-test before going live"):
+  B1 decisions   per recorded job: the derived fields (bundle from label, context ceiling for host+model) recomputed with
+                 the new code and, when --old-bin is given, the old code. Fields the record does not hold, or that depend
+                 on live state, are counted as "not comparable" with the reason.
+  B2 holds       recorded sandbox holds (infra-incidents.jsonl) turned into provider-log history and read back through
+                 the old path (direct log parse), the new path (status-service view, then the container's reading of it)
+                 and the CPU lane's own hold check, at the edges of each hold, tolerance 10 s.
+  B3 checks      <cases>/b3.jsonl: apply each recorded diff to its recorded base tree and run its recorded check.
+  B4 live runs   <cases>/b4.jsonl: re-run chosen past jobs in a scratch environment (push and notify neutralised).
+  B5 graph jobs  <cases>/b5.jsonl: same runner; compares the graph output (node and edge counts, file set).
+  B6 read routes <cases>/b6/routes.json: GET each route on --api-url and compare with the Mac's recorded output.
+  B7 events      the session-event mirror run into a scratch folder, compared with the Mac's own event file.
+Case files are made from the real history by the operator step and stay out of git; the test uses made-up ones.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+TOL_S = 10.0
+ALL_PARTS = ["B1", "B2", "B3", "B4", "B5", "B6", "B7"]
+
+
+# ---------------------------------------------------------------------------------------------- worker (decisions)
+def _load(bin_dir, fname, name):
+    import importlib.util
+    sys.path.insert(0, bin_dir)
+    spec = importlib.util.spec_from_file_location(name, os.path.join(bin_dir, fname))
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def worker(bin_dir):
+    req = json.load(sys.stdin)
+    op = req["op"]
+    scratch = req.get("scratch") or tempfile.mkdtemp(prefix="bt-worker-")
+    os.environ["DARKBLOOM_PROVIDER_LOG"] = os.path.join(scratch, "provider.log")
+    os.environ["DARKBLOOM_SLOTS_LOG"] = os.path.join(scratch, "sandbox-slots.log")
+    os.environ.pop("QUEUE_AGENT_URL", None)
+    out = []
+    if op == "b1":
+        q = _load(bin_dir, "ollama-queue.py", "bt_queue")
+        for r in req["records"]:
+            d = {}
+            for field, fn in (("bundle", lambda: q.default_bundle_from_label(r.get("label"))),
+                              ("ctx_ceiling", lambda: q.resolve_ctx_ceiling(r.get("host_pref"), r.get("model")))):
+                try:
+                    d[field] = fn()
+                except Exception as e:  # noqa: BLE001
+                    d[field] = "ERROR:%s" % type(e).__name__
+            out.append(d)
+    elif op == "hold_old":
+        q = _load(bin_dir, "ollama-queue.py", "bt_queue")
+        for s in req["samples"]:
+            _write_log(os.environ["DARKBLOOM_PROVIDER_LOG"], s)
+            v = q.darkbloom_view(s["now"], log_path=os.environ["DARKBLOOM_PROVIDER_LOG"],
+                                 slots_path=os.path.join(scratch, "none"))
+            out.append({"hold": bool(v.get("hold"))})
+    elif op == "hold_new":
+        agent = _load(bin_dir, "queue-agent.py", "bt_agent")
+        q = agent.queue_mod()
+        cl = agent.cpu_lane_mod()
+        import queue_config
+        for s in req["samples"]:
+            _write_log(os.environ["DARKBLOOM_PROVIDER_LOG"], s)
+            payload = agent.hold_payload(now=s["now"])     # what the Mac status service would answer
+            saved = queue_config.agent_get
+            queue_config.agent_get = lambda path, timeout=3.0, text=False, _p=payload: _p
+            try:
+                v = q._agent_darkbloom_view(s["now"])      # the container's reading of that answer
+            finally:
+                queue_config.agent_get = saved
+            cl.HOLD_VIEW = lambda _v=v: _v
+            held, _cause = cl.model_hold(fresh=True)
+            out.append({"hold": bool(v.get("hold")), "cpu_hold": bool(held)})
+    else:
+        raise SystemExit("unknown op")
+    json.dump(out, sys.stdout)
+    return 0
+
+
+def _write_log(path, s):
+    with open(path, "w") as f:
+        f.write("\n".join(s["lines"]) + ("\n" if s["lines"] else ""))
+    os.utime(path, (s["mtime"], s["mtime"]))
+
+
+def call_worker(bin_dir, req, scratch):
+    req = dict(req, scratch=tempfile.mkdtemp(dir=scratch, prefix="w-"))
+    env = {k: v for k, v in os.environ.items() if k not in ("QUEUE_AGENT_URL",)}
+    p = subprocess.run([sys.executable, os.path.join(HERE, "queue-backtest"), "_worker", "--bin", bin_dir],
+                       input=json.dumps(req), capture_output=True, text=True, env=env, timeout=600)
+    if p.returncode != 0:
+        raise RuntimeError("worker failed for %s: %s" % (os.path.basename(bin_dir.rstrip("/")) or bin_dir, p.stderr[-300:]))
+    return json.loads(p.stdout)
+
+
+# ---------------------------------------------------------------------------------------------- part results
+def new_part(name, title):
+    return {"part": name, "title": title, "cases": 0, "matched": 0, "differences": [], "not_comparable": {}, "note": ""}
+
+
+def nc(part, reason, n=1):
+    part["not_comparable"][reason] = part["not_comparable"].get(reason, 0) + n
+
+
+def diff(part, case, field, expected, got, reason):
+    part["differences"].append({"case": str(case), "field": field, "expected": _short(expected), "got": _short(got),
+                                "reason": reason})
+
+
+def _short(v):
+    s = json.dumps(v, default=str) if not isinstance(v, str) else v
+    return s if len(s) <= 160 else s[:157] + "..."
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        with open(path) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    try:
+                        rows.append(json.loads(ln))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return rows
+
+
+# ---------------------------------------------------------------------------------------------- B1
+def load_records(state_dir, limit):
+    recs = []
+    logs = os.path.join(state_dir, "ollama-queue-logs")
+    try:
+        names = [n for n in os.listdir(logs) if n.endswith(".done.json")]
+    except OSError:
+        names = []
+    for n in names:
+        try:
+            with open(os.path.join(logs, n)) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("label"):
+            recs.append(d)
+    try:
+        with open(os.path.join(state_dir, "ollama-queue-state.json")) as f:
+            for j in (json.load(f).get("jobs") or []):
+                if isinstance(j, dict) and j.get("label") and j.get("id") not in {r.get("id") for r in recs}:
+                    recs.append(j)
+    except (OSError, ValueError):
+        pass
+    recs.sort(key=lambda r: str(r.get("persisted_at") or ""), reverse=True)
+    return recs[:limit]
+
+
+def part_b1(ctx):
+    p = new_part("B1", "decisions")
+    recs = load_records(ctx["state_dir"], ctx["limit"])
+    if not recs:
+        p["note"] = "no recorded jobs found"
+        return p
+    new = call_worker(ctx["new_bin"], {"op": "b1", "records": recs}, ctx["scratch"])
+    old = call_worker(ctx["old_bin"], {"op": "b1", "records": recs}, ctx["scratch"]) if ctx.get("old_bin") else None
+    p["cases"] = len(recs)
+    for i, r in enumerate(recs):
+        jid = r.get("id") or i
+        bad = False
+        n = new[i]
+        # bundle: pure function of the label; the record may also hold an explicit or chain bundle
+        if old is not None and old[i]["bundle"] != n["bundle"]:
+            diff(p, jid, "bundle", old[i]["bundle"], n["bundle"], "new code differs from old code")
+            bad = True
+        if r.get("bundle") is None:
+            nc(p, "bundle not recorded")
+        elif r["bundle"] != n["bundle"]:
+            nc(p, "bundle differs from the label rule: set explicitly or from a chain record")
+        # context ceiling: the recorded window must not exceed what the new code allows for that host and model
+        ceil = n["ctx_ceiling"]
+        if old is not None and old[i]["ctx_ceiling"] != ceil:
+            diff(p, jid, "ctx_ceiling", old[i]["ctx_ceiling"], ceil, "new code differs from old code")
+            bad = True
+        if isinstance(r.get("num_ctx"), int) and isinstance(ceil, int) and r["num_ctx"] > ceil:
+            diff(p, jid, "num_ctx<=ceiling", r["num_ctx"], ceil, "recorded window above the new ceiling")
+            bad = True
+        elif not isinstance(r.get("num_ctx"), int):
+            nc(p, "num_ctx not recorded")
+        if isinstance(ceil, str) and ceil.startswith("ERROR"):
+            diff(p, jid, "ctx_ceiling", "a number", ceil, "new code raised")
+            bad = True
+        p["matched"] += 0 if bad else 1
+    nc(p, "lane: chosen at launch from live load, not recorded", len(recs))
+    nc(p, "model and retry ladder: depend on enqueue arguments and failures not in the sidecar", len(recs))
+    nc(p, "priority: not in the done sidecar", len(recs))
+    if old is None:
+        p["note"] = "no --old-bin: compared against the records only"
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- B2
+def hold_intervals(dispatch_dir):
+    rows = sorted((r for r in read_jsonl(os.path.join(dispatch_dir, "infra-incidents.jsonl"))
+                   if r.get("kind") in ("sandbox-hold", "sandbox-release") and isinstance(r.get("ts"), (int, float))),
+                  key=lambda r: r["ts"])
+    out, start = [], None
+    for r in rows:
+        if r["kind"] == "sandbox-hold":
+            if start is None:
+                start = r
+        elif start is not None:
+            out.append((start["ts"], r["ts"], int(start.get("lease_s") or 60)))
+            start = None
+    return out
+
+
+def hold_sample(s, e, lease, t):
+    lines, last = [], None
+    ts = s
+    seq = [("begin", s)]
+    k = 1
+    while s + k * lease < e:
+        seq.append(("renewed", s + k * lease))
+        k += 1
+    seq.append(("released", e))
+    for tr, at in seq:
+        if at <= t:
+            lines.append(json.dumps({"operation": "addon_hold", "transition": tr, "lease_seconds": lease}))
+            last = at
+    return {"lines": lines, "now": t, "mtime": last if last is not None else t - 1000.0}
+
+
+def part_b2(ctx):
+    p = new_part("B2", "holds")
+    ivs = hold_intervals(ctx["dispatch_dir"])[:ctx["limit"]]
+    if not ivs:
+        p["note"] = "no recorded holds found"
+        return p
+    cases, samples = [], []
+    for i, (s, e, lease) in enumerate(ivs):
+        if e - s < 2 * TOL_S + 1:
+            nc(p, "hold shorter than the 10 s tolerance window")
+            continue
+        for label, t, want in (("before start", s - TOL_S, False), ("after start", s + TOL_S, True),
+                               ("before release", e - TOL_S, True), ("after release", e + TOL_S, False)):
+            cases.append((i, label, want))
+            samples.append(hold_sample(s, e, lease, t))
+    new = call_worker(ctx["new_bin"], {"op": "hold_new", "samples": samples}, ctx["scratch"])
+    old_bin = ctx.get("old_bin") or ctx["new_bin"]
+    old = call_worker(old_bin, {"op": "hold_old", "samples": samples}, ctx["scratch"])
+    seen = {}
+    for (i, label, want), o, n in zip(cases, old, new):
+        seen.setdefault(i, True)
+        bad = False
+        for name, got in (("old path (log parse)", o["hold"]), ("new path (status view)", n["hold"]),
+                          ("cpu lane hold", n["cpu_hold"])):
+            if got != want:
+                diff(p, "hold#%d" % i, label, want, got, "%s disagrees with the recorded hold" % name)
+                bad = True
+        if o["hold"] != n["hold"]:
+            diff(p, "hold#%d" % i, label, o["hold"], n["hold"], "old and new paths disagree")
+            bad = True
+        seen[i] = seen[i] and not bad
+    p["cases"] = len(seen)
+    p["matched"] = sum(1 for v in seen.values() if v)
+    if not ctx.get("old_bin"):
+        p["note"] = "no --old-bin: the old path ran with the new code's log parser"
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- B3
+def sandbox_env(scratch):
+    keep = {k: v for k, v in os.environ.items()
+            if k in ("PATH", "LANG", "LC_ALL", "TZ") }
+    keep.update(HOME=scratch, QUEUE_BACKTEST="1", QUEUE_NO_NOTIFY="1", GIT_TERMINAL_PROMPT="0")
+    shim = os.path.join(scratch, "shim")
+    os.makedirs(shim, exist_ok=True)
+    real_git = shutil.which("git") or "/usr/bin/git"
+    with open(os.path.join(shim, "git"), "w") as f:
+        f.write('#!/bin/sh\nfor a in "$@"; do case "$a" in push) echo "backtest: push blocked" >&2; exit 0;; esac; done\n'
+                'exec %s "$@"\n' % real_git)
+    with open(os.path.join(shim, "gh"), "w") as f:
+        f.write('#!/bin/sh\necho "backtest: gh blocked" >&2\nexit 1\n')
+    for n in ("git", "gh"):
+        os.chmod(os.path.join(shim, n), 0o755)
+    keep["PATH"] = shim + os.pathsep + keep.get("PATH", "/usr/bin:/bin")
+    return keep
+
+
+def _within(base, path):
+    base, path = os.path.realpath(base), os.path.realpath(os.path.join(base, path))
+    return path if path == base or path.startswith(base + os.sep) else None
+
+
+def run_cmd(argv_or_str, cwd, env, timeout, shell=False):
+    try:
+        r = subprocess.run(argv_or_str, cwd=cwd, env=env, shell=shell, capture_output=True, text=True, timeout=timeout)
+        return r.returncode
+    except subprocess.TimeoutExpired:
+        return "timeout"
+
+
+def part_b3(ctx):
+    p = new_part("B3", "checks")
+    cases = read_jsonl(os.path.join(ctx["cases"], "b3.jsonl"))[:ctx["limit"]]
+    if not cases:
+        p["note"] = "no cases file (cases/b3.jsonl)"
+        return p
+    for c in cases:
+        p["cases"] += 1
+        cid = c.get("id")
+        base, dfile = _within(ctx["cases"], c.get("base", "")), _within(ctx["cases"], c.get("diff", ""))
+        if not base or not dfile or not os.path.isdir(base) or not os.path.isfile(dfile) or not c.get("check"):
+            diff(p, cid, "case", "usable case", "bad paths or no check", "case file is incomplete")
+            continue
+        work = os.path.join(ctx["scratch"], "b3-%s" % re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid)))
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.copytree(base, work, symlinks=True)
+        env = sandbox_env(os.path.join(ctx["scratch"], "home"))
+        rc = run_cmd(["git", "apply", "--whitespace=nowarn", dfile], work, env, 120)
+        if rc != 0:
+            got = "apply-failed"
+        else:
+            rc = run_cmd(c["check"], work, env, int(c.get("timeout") or 300), shell=True)
+            got = "pass" if rc == 0 else ("timeout" if rc == "timeout" else "fail")
+        if got == c.get("recorded"):
+            p["matched"] += 1
+        else:
+            diff(p, cid, "verdict", c.get("recorded"), got, "check verdict differs from the Mac's record")
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- B4 / B5
+def part_run(ctx, name, title, graph):
+    p = new_part(name, title)
+    cases = read_jsonl(os.path.join(ctx["cases"], name.lower() + ".jsonl"))[:ctx["limit"]]
+    if not cases:
+        p["note"] = "no cases file (cases/%s.jsonl)" % name.lower()
+        return p
+    for c in cases:
+        p["cases"] += 1
+        cid = c.get("id")
+        cwd = _within(ctx["cases"], c.get("cwd", "."))
+        argv = c.get("argv")
+        if not cwd or not isinstance(argv, list) or not argv:
+            diff(p, cid, "case", "usable case", "bad cwd or argv", "case file is incomplete")
+            continue
+        work = os.path.join(ctx["scratch"], "%s-%s" % (name.lower(), re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid))))
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.copytree(cwd, work, symlinks=True)
+        env = sandbox_env(os.path.join(ctx["scratch"], "home"))
+        rc = run_cmd(argv, work, env, int(c.get("timeout") or 900))
+        exp = c.get("expect") or {}
+        ok = True
+        if "exit" in exp and rc != exp["exit"]:
+            diff(p, cid, "exit", exp["exit"], rc, "exit status differs from the Mac's record")
+            ok = False
+        rf = _within(work, c.get("result_file", "")) if c.get("result_file") else None
+        res = None
+        if rf:
+            try:
+                with open(rf) as f:
+                    res = json.load(f)
+            except (OSError, ValueError):
+                diff(p, cid, "result_file", "readable JSON", "missing or invalid", "the re-run wrote no result")
+                ok = False
+        if res is not None:
+            if "verdict" in exp and res.get("verdict") != exp["verdict"]:
+                diff(p, cid, "verdict", exp["verdict"], res.get("verdict"), "check verdict differs from the Mac's record")
+                ok = False
+            for k, v in (exp.get("result") or {}).items():
+                if res.get(k) != v:
+                    diff(p, cid, k, v, res.get(k), "result field differs from the Mac's record")
+                    ok = False
+            if graph:
+                for k in ("nodes", "edges"):
+                    if k in exp:
+                        got = len(res.get(k) or []) if isinstance(res.get(k), list) else res.get(k)
+                        if got != exp[k]:
+                            diff(p, cid, k, exp[k], got, "graph %s count differs from the Mac's record" % k)
+                            ok = False
+                if "files" in exp and sorted(res.get("files") or []) != sorted(exp["files"]):
+                    diff(p, cid, "files", sorted(exp["files"]), sorted(res.get("files") or []),
+                         "graph file set differs from the Mac's record")
+                    ok = False
+        p["matched"] += 1 if ok else 0
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- B6
+VOLATILE = re.compile(r"(^|_)(at|ts|time|now|uptime|age|elapsed|generated|updated|since|mtime)(_|$)|_at$|_s$", re.I)
+
+
+def scrub(v):
+    if isinstance(v, dict):
+        return {k: scrub(x) for k, x in v.items() if not VOLATILE.search(k)}
+    if isinstance(v, list):
+        return [scrub(x) for x in v]
+    return v
+
+
+def first_diff(a, b, path=""):
+    if type(a) != type(b):
+        return path or "/"
+    if isinstance(a, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a or k not in b:
+                return "%s/%s" % (path, k)
+            d = first_diff(a[k], b[k], "%s/%s" % (path, k))
+            if d:
+                return d
+        return None
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return "%s[len]" % path
+        for i, (x, y) in enumerate(zip(a, b)):
+            d = first_diff(x, y, "%s[%d]" % (path, i))
+            if d:
+                return d
+        return None
+    return None if a == b else (path or "/")
+
+
+def http_get(url, token):
+    req = urllib.request.Request(url, method="GET")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+def part_b6(ctx):
+    p = new_part("B6", "read routes")
+    rpath = os.path.join(ctx["cases"], "b6", "routes.json")
+    try:
+        with open(rpath) as f:
+            routes = json.load(f)
+    except (OSError, ValueError):
+        p["note"] = "no routes file (cases/b6/routes.json)"
+        return p
+    if not ctx.get("api_url"):
+        p["note"] = "no --api-url"
+        return p
+    token = os.environ.get("QUEUE_API_TOKEN", "")
+    for rt in routes[:ctx["limit"]]:
+        p["cases"] += 1
+        path = rt.get("path", "")
+        mac = _within(os.path.join(ctx["cases"], "b6"), rt.get("mac_file", ""))
+        if not path.startswith("/") or not mac:
+            diff(p, path, "case", "usable case", "bad path or file", "case file is incomplete")
+            continue
+        try:
+            got = json.loads(http_get(ctx["api_url"].rstrip("/") + path, token))
+            with open(mac) as f:
+                want = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            diff(p, path, "fetch", "JSON", type(e).__name__, "route or recorded output unreadable")
+            continue
+        d = first_diff(scrub(want), scrub(got))
+        if d:
+            diff(p, path, d, "Mac output", "container output", "differs apart from timestamps")
+        else:
+            p["matched"] += 1
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- B7
+def part_b7(ctx):
+    p = new_part("B7", "session events")
+    mac_dir = os.path.join(ctx["cases"], "b7", "mac")
+    src_dir = os.path.join(ctx["cases"], "b7", "source")
+    if not os.path.isdir(mac_dir):
+        p["note"] = "no recorded files (cases/b7/mac)"
+        return p
+    agent = _load(ctx["new_bin"], "queue-agent.py", "bt_agent7")
+    out = os.path.join(ctx["scratch"], "b7-mirror")
+    shutil.rmtree(out, ignore_errors=True)
+    api = ctx.get("api_url")
+    token = os.environ.get("QUEUE_API_TOKEN", "")
+    if api:
+        fetch = lambda url, tok, timeout=10: json.loads(http_get(url, token))
+    else:
+        events = read_jsonl(os.path.join(src_dir, "queue-events.jsonl"))
+        esc = {}
+        for n in agent.ESCALATION_FILES:
+            try:
+                esc[n] = open(os.path.join(src_dir, n)).read()
+            except OSError:
+                pass
+
+        def fetch(url, tok, timeout=10):
+            if "/api/mirror/events" in url:
+                after = int(re.search(r"after=(\d+)", url).group(1))
+                lim = int(re.search(r"limit=(\d+)", url).group(1))
+                ev = [e for e in events if int(e.get("seq") or 0) > after][:lim]
+                return {"events": ev, "failed": None}
+            return {"files": esc}
+    m = agent.Mirror("http://backtest.invalid", None, fetch=fetch, edir=out, esc_dir=os.path.join(out, "escalations"))
+    try:
+        m.once()
+    except Exception as e:  # noqa: BLE001
+        diff(p, "mirror", "pull", "ok", type(e).__name__, "mirror pull failed")
+        p["cases"] = 1
+        return p
+    pairs = [("queue-events.jsonl", os.path.join(mac_dir, "queue-events.jsonl"), os.path.join(out, "queue-events.jsonl"))]
+    for n in agent.ESCALATION_FILES:
+        if os.path.exists(os.path.join(mac_dir, n)):
+            pairs.append((n, os.path.join(mac_dir, n), os.path.join(out, "escalations", n)))
+    for name, want, got in pairs:
+        p["cases"] += 1
+        if name.endswith(".jsonl"):
+            a, b = read_jsonl(want), read_jsonl(got)
+            if a == b:
+                p["matched"] += 1
+            else:
+                ia = {e.get("seq"): e for e in a}
+                ib = {e.get("seq"): e for e in b}
+                for s in sorted(set(ia) | set(ib), key=lambda x: (x is None, x)):
+                    if ia.get(s) != ib.get(s):
+                        diff(p, "seq %s" % s, name, "Mac line" if s in ia else "absent",
+                             "mirror line" if s in ib else "absent", "event differs between the Mac file and the mirror")
+                        break
+        else:
+            try:
+                same = open(want).read() == open(got).read()
+            except OSError:
+                same = False
+            if same:
+                p["matched"] += 1
+            else:
+                diff(p, name, "text", "Mac text", "mirror text", "file text differs")
+    return p
+
+
+# ---------------------------------------------------------------------------------------------- run
+def table(res):
+    rows = [("part", "cases", "matched", "differences", "not comparable")]
+    for p in res["parts"]:
+        rows.append((p["part"] + " " + p["title"], str(p["cases"]), str(p["matched"]), str(len(p["differences"])),
+                     str(sum(p["not_comparable"].values()))))
+    w = [max(len(r[i]) for r in rows) for i in range(5)]
+    return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
+
+
+def queue_standby_root():
+    import queue_standby
+    return queue_standby.backtest_root()
+
+
+def run(argv):
+    a = {"parts": ALL_PARTS, "limit": 500}
+    it = iter(argv)
+    for x in it:
+        if x == "--out":
+            a["out"] = next(it)
+        elif x == "--parts":
+            a["parts"] = [s.strip().upper() for s in next(it).split(",") if s.strip()]
+        elif x == "--limit":
+            a["limit"] = int(next(it))
+        elif x == "--old-bin":
+            a["old_bin"] = next(it)
+        elif x == "--cases":
+            a["cases"] = next(it)
+        elif x == "--api-url":
+            a["api_url"] = next(it)
+        else:
+            print(__doc__)
+            return 2
+    if not a.get("out"):
+        print("queue-backtest: --out is required", file=sys.stderr)
+        return 2
+    out = os.path.realpath(a["out"])
+    os.makedirs(out, exist_ok=True)
+    scratch = os.path.join(out, "scratch")
+    shutil.rmtree(scratch, ignore_errors=True)
+    os.makedirs(os.path.join(scratch, "home"))
+    import queue_config
+    ctx = {"state_dir": str(queue_config.state_dir()), "dispatch_dir": str(queue_config.dispatch_dir()),
+           "new_bin": HERE, "old_bin": a.get("old_bin"), "scratch": scratch, "limit": a["limit"],
+           "cases": os.path.realpath(a.get("cases") or os.path.join(str(queue_standby_root()), "cases")), "api_url": a.get("api_url")}
+    import queue_standby
+    broot = os.path.realpath(str(queue_standby.backtest_root()))
+    for k in ("state_dir", "dispatch_dir"):     # read-only inputs: the scratch dir must not be inside them (bar .backtest)
+        base = os.path.realpath(ctx[k])
+        inside = out == base or out.startswith(base + os.sep)
+        if inside and not (out == broot or out.startswith(broot + os.sep)):
+            print("queue-backtest: --out must not be inside the state or dispatch dir (use %s)" % broot, file=sys.stderr)
+            return 2
+
+    def status(state, **kw):
+        d = dict({"state": state, "started": started}, **kw)
+        tmp = os.path.join(out, "status.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, os.path.join(out, "status.json"))
+
+    started = time.time()
+    status("running")
+    fns = {"B1": part_b1, "B2": part_b2, "B3": part_b3, "B4": lambda c: part_run(c, "B4", "live runs", False),
+           "B5": lambda c: part_run(c, "B5", "graph jobs", True), "B6": part_b6, "B7": part_b7}
+    parts = []
+    try:
+        for name in a["parts"]:
+            if name in fns:
+                parts.append(fns[name](ctx))
+    except Exception as e:  # noqa: BLE001
+        status("failed", error="%s: %s" % (type(e).__name__, str(e)[:300]), finished=time.time())
+        print("queue-backtest failed: %s" % e, file=sys.stderr)
+        return 1
+    res = {"parts": parts, "summary": {"cases": sum(p["cases"] for p in parts), "matched": sum(p["matched"] for p in parts),
+                                       "differences": sum(len(p["differences"]) for p in parts)},
+           "started": started, "finished": time.time()}
+    res["table"] = table(res)
+    with open(os.path.join(out, "results.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    status("done", finished=res["finished"], differences=res["summary"]["differences"])
+    shutil.rmtree(scratch, ignore_errors=True)
+    print(res["table"])
+    return 0 if res["summary"]["differences"] == 0 else 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "_worker":
+        sys.exit(worker(sys.argv[sys.argv.index("--bin") + 1]))
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        sys.exit(run(sys.argv[2:]))
+    print(__doc__)
+    sys.exit(2)

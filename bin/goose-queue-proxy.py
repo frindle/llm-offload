@@ -3,12 +3,12 @@
 hard-bound, no silent fallback.
 
     goose -> this proxy (127.0.0.1:8011) -> ONE of:
-      A) "darkbloom"  http://127.0.0.1:8000/v1/chat/completions   Qwen3.5-9B   (default)
-      B) "unraid"     http://198.51.100.145:11434/api/chat            qwen3:14b @ num_ctx 6144
+      A) "darkbloom"  <local.json base_url>/chat/completions   Qwen3.5-9B   (default; this machine only)
+      B) "unraid"     <ollama.unraid_url>/api/chat            qwen3:14b @ num_ctx 6144
 
     goose -> ~/bin/goose-queue-mcp.py (stdio MCP) -> ollama-queue.py enqueue -> studio-db
 
-WHY A PROXY AT ALL, AND WHY CHAT IS NOT QUEUED (the owner 2026-10-01)
+WHY A PROXY AT ALL, AND WHY CHAT IS NOT QUEUED (operator 2026-10-01)
   Standing rule is that all GPU work goes through ~/bin/ollama-queue.py so the one
   studio-db lane is accounted for and visible. CHAT is the one deliberate exception:
   an earlier build (goose-queue-proxy.py.bak-unraidchat) made every chat turn a queue
@@ -30,7 +30,7 @@ BACKEND SELECTION IS EXPLICIT AND FAILS CLOSED
 
 THE GUARDS (revert-tested in test-goose-queue-proxy.py)
   1. TOOL ALLOWLIST (both backends). Goose re-sends every enabled tool's JSON schema on
-     EVERY request. Measured on the owner's box: the default profile sent 29 tool definitions
+     EVERY request. Measured on the operator's box: the default profile sent 29 tool definitions
      = 19,235 chars (~5.5k tokens) on top of a 10,306-char system prompt. The goose
      profile is trimmed to just the queue tools, but a profile is a config file that
      drifts, so the proxy enforces the budget independently: any tool whose name is not
@@ -64,16 +64,24 @@ Started/stopped automatically by ~/bin/goose-darkbloom.sh.
 import argparse
 import errno
 import importlib.util
+import ipaddress
 import json
 import os
 import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 HOME = Path(os.environ.get("GOOSE_QUEUE_HOME") or Path.home())
 BIN = HOME / "bin"
 WORKER_SRC = BIN / "ollama-worker.py"
@@ -218,6 +226,28 @@ def resolve_unraid_ctx(url, model, requested):
 
 
 # ============================================================ backend A: Darkbloom
+def on_this_host(url):
+    """True when `url` is a plain http(s) URL whose host is an IP address of this machine: a loopback address,
+    or one a socket here can bind (so a LAN address another machine holds, a name, or 0.0.0.0 is refused)."""
+    try:
+        u = urllib.parse.urlsplit(str(url or "").strip())
+        if u.scheme not in ("http", "https") or u.username is not None or u.password is not None:
+            return False
+        ip = ipaddress.ip_address(u.hostname or "")
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if ip.is_unspecified or ip.is_multicast:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((str(ip), 0))
+        return True
+    except OSError:
+        return False
+
+
 class DarkbloomBackend:
     """Qwen3.5-9B on the local Darkbloom provider. OpenAI in, OpenAI out.
 
@@ -233,8 +263,10 @@ class DarkbloomBackend:
 
     name = "darkbloom"
     # Hard-bound: the local provider, nothing else. Taken from Darkbloom's own record so
-    # a port change there is picked up, but pinned to loopback below.
-    PINNED_HOST = "127.0.0.1"
+    # a port or bind change there is picked up, but pinned to THIS machine below: a loopback
+    # address, or an address this machine owns (the provider's [local] bind may name the
+    # Mac's own LAN address; local.json's base_url then carries it).
+    PINNED_HOST = "this machine"
     model = os.environ.get("GOOSE_CHAT_DARKBLOOM_MODEL", "Qwen3.5-9B")
     # MEASURED, 2026-10-01, via queued ctxprobe-9b-* jobs (needle-in-filler, needle at
     # the start / middle / end, scored on exact recall):
@@ -274,7 +306,7 @@ class DarkbloomBackend:
         b = self._dbk.base_url()
         if not b:
             raise Refused("darkbloom endpoint not configured (~/.darkbloom/local.json)")
-        if self.PINNED_HOST not in b:
+        if not on_this_host(b):
             raise Refused(f"darkbloom base_url {b!r} is not on {self.PINNED_HOST}; "
                           f"refusing to send chat off-host")
         return b
@@ -329,7 +361,7 @@ class UnraidBackend:
     # Hard-bound, deliberately NOT env-overridable: this backend exists to put chat on
     # Unraid at a VETTED window, and an env var is how that becomes "whatever host was
     # exported last", with the clamp table then matching the wrong GPU.
-    URL = "http://198.51.100.145:11434"
+    URL = str(queue_config.file_get("ollama.unraid_url", "")).rstrip("/")   # config FILE only (no env): ollama.unraid_url
     model = os.environ.get("GOOSE_UNRAID_MODEL", "qwen3:14b")
     # The ASK; resolve_unraid_ctx decides. Set to the pregate's value so the common case
     # is a no-op clamp.

@@ -513,7 +513,7 @@ def bundle_outcome(view, superseded=None, cancelled=None):
     """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
     "incomplete" | "superseded" (+ the number of failed slices).
 
-    ROOT CAUSE this closes (the owner 2026-10-06, "considered finished but have failed
+    ROOT CAUSE this closes (operator 2026-10-06, "considered finished but have failed
     flags"): the finished list was "every bundle with no queue row left", i.e.
     FINISHED meant NOTHING LIVE, so a bundle whose slice FAILED (or ended / needs_opus)
     and was never retried sat in Finished, "2/3", flagged failed. FINISHED now means
@@ -748,7 +748,7 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None, passed_
             phase = "done"
         elif heal_wait:
             # NOT terminal: the heal/escalation ladder still has a pending/held review that can
-            # advance this job (the owner 2026-10-09, needs-opus-auto-rt-bg-getcommitments-status
+            # advance this job (operator 2026-10-09, needs-opus-auto-rt-bg-getcommitments-status
             # read red `failed` beside its own pending `escalation / heal` row). `failed` is
             # reserved for a job nothing can still advance (see outstanding_heal).
             phase = "escalation-review"
@@ -770,7 +770,7 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None, passed_
                      "_base": base, "_t": max([_t(x) or 0 for x in mine] or [0]),
                      "_sup": [x.get("superseded_by") for x in mine
                               if x.get("status") in ("failed", "needs_opus") and x.get("superseded_by")]})
-    # SUPERSEDED FAILURES (the owner 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"
+    # SUPERSEDED FAILURES (operator 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"
     # beside chains that later exited 0): a failed pseudo-slice is OUTSTANDING only when
     # nothing later in its lineage passed or is still running. Three provable proofs, none
     # weaker; the row stays in the expanded history either way:

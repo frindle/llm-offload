@@ -5,6 +5,11 @@ Deletes ONLY files in an explicit ALLOWLIST (root dir + filename regex), only wh
 newest mtime is older than the retention for that log, never a symlink, never anything a
 live consumer still references. Pure planning (plan()) is separate from deletion (run()).
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import fcntl
 import json
 import os
@@ -42,15 +47,18 @@ ALLOWLIST = [
 
 def make_paths(home=None):
     h = Path(home) if home else HOME
+    sd = h / "bin" if (home or os.environ.get("LOG_ROTATE_HOME")) else queue_config.state_dir()   # state dir; an explicit home (tests) keeps the old layout
     ho = os.environ.get("HANDOFF_DIR")
+    if not ho and not home and not os.environ.get("LOG_ROTATE_HOME"):
+        ho = str(queue_config.handoff_dir())        # env, then paths.handoff_dir, then the Mac default
     return {
         "home": h,
-        "queue_logs": h / "bin" / "ollama-queue-logs",
-        "livelogs": h / "bin" / "ollama-queue-livelogs",
-        "worker_logs": h / "bin" / "ollama-worker-logs",
+        "queue_logs": sd / "ollama-queue-logs",
+        "livelogs": sd / "ollama-queue-livelogs",
+        "worker_logs": sd / "ollama-worker-logs",
         "dispatch": h / ".ollama-dispatch",
-        "state": h / "bin" / "ollama-queue-state.json",
-        "signoff": h / "bin" / "signoff.json",
+        "state": sd / "ollama-queue-state.json",
+        "signoff": sd / "signoff.json",
         "handoff": Path(ho) if ho else h / "Desktop" / "GitHub Projects" / "ollama" / "ollama-handoff",
         "escalations": h / ".ollama-dispatch" / "escalations" / "ESCALATIONS.md",
         "lock": h / ".ollama-dispatch" / "log-rotate.lock",

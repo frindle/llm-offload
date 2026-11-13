@@ -22,6 +22,7 @@ import json
 import os
 import re
 import resource
+import shutil
 import signal
 import socketserver
 import subprocess
@@ -40,8 +41,11 @@ _BIN_DIR = os.path.expanduser("~/bin")
 if _BIN_DIR not in sys.path:
     sys.path.append(_BIN_DIR)
 
+import queue_config  # noqa: E402  (~/bin is on sys.path from here)
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))   # queue_upload.py sits next to this file
+import queue_upload  # noqa: E402
 QUEUE_PATH = Path.home() / "bin" / "ollama-queue.py"
-TASKS_DIR = Path.home() / "bin" / "ollama-queue-logs" / "web-tasks"
+TASKS_DIR = queue_config.state_dir() / "ollama-queue-logs" / "web-tasks"
 PORT = 7684
 
 # Tailed out of each job's log file for the dashboard -- ollama-worker.py logs
@@ -801,7 +805,7 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
     return out
 
 
-# NEEDS-ATTENTION PRESENTATION (the owner 2026-10-11: "can we clean up the needs attention
+# NEEDS-ATTENTION PRESENTATION (operator 2026-10-11: "can we clean up the needs attention
 # area of the dashboard for the queue"). DISPLAY ONLY: needs_attention keeps its meaning
 # for every other consumer (handoff, escalation); this only stamps HOW the panel should
 # present each flagged row so 59 rows stop reading as 59 to-dos. Nothing is dropped --
@@ -1298,7 +1302,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     return rows
 
 
-# BUNDLE ROLLUP PRECEDENCE (the owner 2026-10-09, rt-costco-receipt-attach read `pending` while its
+# BUNDLE ROLLUP PRECEDENCE (operator 2026-10-09, rt-costco-receipt-attach read `pending` while its
 # slice 1 said `authoring 2:45`, beside a yellow "1 failed" for a round that was being
 # retried). _annotate_plan_rollup sees QUEUE ROWS only, so "2 pending, none running"
 # rolled up to `pending` even though a slicer/chain driver was authoring a slice
@@ -1520,7 +1524,7 @@ def _wait_reason_for(r, active, by_id, running, db_status=None):
 
 
 def _busy_job_phrase(r, b):
-    """'waiting for job <id> (<label>) to finish' + WHOSE job it is (the owner 2026-10-09: an
+    """'waiting for job <id> (<label>) to finish' + WHOSE job it is (operator 2026-10-09: an
     escalation row read 'held on running job 48c096d8d690 (rt-bg-sync-zero-guard)' as if the
     failed job itself were running; that job belonged to a different bundle)."""
     key = r.get("group_key") or r.get("bundle") or None
@@ -2298,7 +2302,7 @@ function foldRounds(entries) {
   const max = rounds.reduce((m, h) => Math.max(m, rnd(h)), 0);
   // A LIVE (running/pending/...) row is never folded away: a chain relaunch restarts the
   // round counter, so a running r1 can sit below an older done r2 and would otherwise be
-  // swallowed into the collapsed "refine r1-r1" group (the owner 2026-10-09).
+  // swallowed into the collapsed "refine r1-r1" group (operator 2026-10-09).
   const early = rounds.filter(h => rnd(h) < max && !isLiveRow(h));
   if (early.length < 2) return entries.map(h => ({h}));
   const out = []; let placed = false;
@@ -2773,7 +2777,7 @@ function idleWaitText(w, jobs, activeKey, views) {
   const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
   if (!pend.length) {
     // A bundle driver (slicer/chain) can be authoring a slice with NO queue row yet: the queue is
-    // not "empty" then, work is in flight (the owner 2026-10-10, rt-amazon-cardlink read "Queue empty").
+    // not "empty" then, work is in flight (operator 2026-10-10, rt-amazon-cardlink read "Queue empty").
     // a bundle-less auto run (ollama-dispatch-auto) works OUTSIDE the queue between its jobs
     const au = ((views && views.activity) || []).filter(a => a.kind === 'auto' && !a.bundle);
     if (au.length) return 'Auto run ' + au[0].label + ': ' + (au[0].step || au[0].phase) + ' (driver working outside the queue, no queue job right now)'
@@ -2799,7 +2803,7 @@ function idleWaitText(w, jobs, activeKey, views) {
 }
 
 
-// PER-LANE "RUNNING NOW" (the owner 2026-10-09): one equal row per lane -- studio-db, unraid, CPU
+// PER-LANE "RUNNING NOW" (operator 2026-10-09): one equal row per lane -- studio-db, unraid, CPU
 // lane -- each with label, model, host, elapsed, bundle and a short live status line; an
 // idle lane says so explicitly ("unraid: idle"). A gpu-exclusive job shows its PHASE.
 const NOW_LANES = [['studio-db', 'studio-db'], ['unraid', 'unraid'], ['cpu', 'CPU lane']];
@@ -2892,7 +2896,7 @@ function laneNowHtml(rows) {
   }).join('') + ((rows.auto || []).map(autoRunHtml).join('')) + '</div>';
 }
 
-// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (the owner 2026-10-10: "CPU stages should be in the queue ...
+// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (operator 2026-10-10: "CPU stages should be in the queue ...
 // running like others"). DISPLAY ONLY, from the same /api/cpu-lane payload the CPU lane panel uses:
 // d.running (Unraid runner), d.pending (waiting for a runner), d.local_running (stage running LOCALLY
 // on the Mac with its fallback reason, e.g. audit-determinism / audit-trivial). A GPU-idle but
@@ -2974,7 +2978,7 @@ function cpuQueueCounts(d) {
 }
 // Draw the rows and refresh everything that says whether the queue is "empty": the Queue panel count
 // and empty line. Called by the CPU-lane poll and by renderSummary (whichever runs last wins, both agree).
-// Where each CPU row goes (the owner 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
+// Where each CPU row goes (operator 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
 // jobs). hasHeader(key) says whether the queue table already has a bundle header for `key`. A row with a
 // bundle key that is not a bare job id nests (under the existing header, or under a CPU-only header made for
 // it); a row with no bundle, or whose "bundle" is only a standalone job id, falls back to the #cpuQueue table.
@@ -4218,7 +4222,7 @@ async function refresh() {
   // the same per-slice lines + full history the live bundles get. Read-only.
   function renderStalledBundles(renderSlices) {
     // STALLED / FAILED bundles: nothing live, but NOT finished (a slice failed/ended or
-    // slices are still owed). Their own panel + count, never aged out (the owner 2026-10-06).
+    // slices are still owed). Their own panel + count, never aged out (operator 2026-10-06).
     const allStalled = (finishedBundles || {}).stalled || [];
     const views = allStalled.slice(0, stalledShown);
     const panel = document.getElementById('stalledPanel');
@@ -5727,7 +5731,7 @@ def _completed_jobs(limit=50):
 # Archived rows STAY archived (recoverable by hand from LOG_DIR/archive/); they do
 # not come back into the list.
 
-# --- SHARED HANDLED LEDGER (2026-10-14, the owner: "clearing a job in one doesn't clear it in
+# --- SHARED HANDLED LEDGER (2026-10-14, the operator: "clearing a job in one doesn't clear it in
 # the other, I have to clear things twice"). Verified from the code before this change:
 #   * handoff `--acted` wrote ONLY acted.json; this list never read it, so an acted
 #     deliverable stayed in needs_eyes/good_to_go (54 of the 100 live rows were acted).
@@ -5780,7 +5784,7 @@ def _acted_fold_reason(meta):
 
 def _signoff_path():
     """The signoff.json handoff-emit's signoff_blocks_acting reads (next to it)."""
-    return Path(ho.__file__).parent / "signoff.json"
+    return queue_config.state_dir() / "signoff.json"
 
 
 def _signoff_rows_beyond_cap(rows, acted):
@@ -5866,7 +5870,7 @@ def _run_status_jobs(limit=100):
     return rows
 
 
-# --- BUNDLE VERDICTS (2026-10-14, the owner: "gate verdicts should stay with their bundle").
+# --- BUNDLE VERDICTS (2026-10-14, the operator: "gate verdicts should stay with their bundle").
 # The verdict / needs_eyes|good_to_go|handled group / reason that Run Status shows is
 # ALSO surfaced inline on each job row under its bundle and as a roll-up on the bundle
 # header. Single source: the /api/runs rows (_run_status_jobs -> _annotate_run_groups);
@@ -6350,7 +6354,7 @@ _QUEUE_LIVE_STATUSES = frozenset({"pending", "queued", "scheduled", "planned",
                                   "running", "paused", "held"})
 
 
-# --- LIVE AUTO RUNS (2026-10-11, the owner: run-status showed "BLOCKED -- authoring stage
+# --- LIVE AUTO RUNS (2026-10-11, the operator: run-status showed "BLOCKED -- authoring stage
 # only, the coding slice never ran" + a clear button for auto-author-* rows whose
 # ollama-dispatch-auto run was STILL ALIVE and advancing, and a bundle-less run (outside
 # the queue between its jobs) was invisible on the dashboard). The driver's own state
@@ -7206,7 +7210,7 @@ def _web_search_usage():
     #   * dispatch-metrics.jsonl  -- ollama-worker.py dispatch runs
     #   * research-metrics.jsonl  -- studio-research.py deep-research runs
     # The dashboard sums web-search usage across both.
-    _LOGDIR = Path.home() / "bin" / "ollama-worker-logs"
+    _LOGDIR = queue_config.state_dir() / "ollama-worker-logs"
     METRICS_PATHS = [_LOGDIR / "dispatch-metrics.jsonl",
                      _LOGDIR / "research-metrics.jsonl"]
     
@@ -7736,7 +7740,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         starts = [h.get("launched_at") for h in recs if h.get("launched_at")]
         outcome, nbad = bv.bundle_outcome(v, sup, _plan_cancel_rec(k))
         # FINISHED = every slice done/landed/skipped. A bundle with nothing live that
-        # failed (or still owes slices) is STALLED, not finished (the owner 2026-10-06).
+        # failed (or still owes slices) is STALLED, not finished (operator 2026-10-06).
         v.update(finished=(outcome == "finished"), outcome=outcome, failed_slices=nbad,
                  last_activity=last[k],
                  first_activity=min(starts) if starts else None, runs=len(recs))
@@ -8164,6 +8168,189 @@ def _lr_handle(method, path, headers, body):
     return 404, {"ok": False, "error": "not found"}
 
 
+# ---- write-route auth + mirror routes (queue-to-container move) ------------------------------------------------
+# A token is configured by env QUEUE_API_TOKEN, else the first line of ~/.config/ollama-queue/queue-api-token, else none.
+# No token: nothing here changes behavior (the dashboard trusts its caller, as always).
+# Token: every state-changing request needs "Authorization: Bearer <token>", except a request whose TCP peer is loopback
+# AND carries no proxy / Cloudflare header (a local job posting to 127.0.0.1; a tunnel running beside the server also
+# connects from loopback, so its Cf-* / X-Forwarded-* headers cancel the exemption). /api/cpu/* keeps its own runner
+# token (cpu_lane.handle) and is never touched here.
+# Routes that need the token (Handler method: routes):
+#   do_POST   every POST except /api/cpu/*: /api/jobs (enqueue), /api/jobs/move, /api/jobs/move-group,
+#             /api/jobs/<id>/kill|promote|promote-group|run-now|hold|resume, /api/runs/retention/apply,
+#             /api/runs/<id>/clear|accept, /api/handoff/acted, /api/settings/hosts, /api/log-retention*,
+#             /api/chat/*, /api/bypass/*, /docsum*
+#   do_DELETE every DELETE except /api/cpu/*: /api/jobs/<id> (cancel, force=1), /api/log-retention*
+#   do_PUT    every PUT except /api/cpu/* (none exist besides the cpu lane)
+#   do_GET    no GET changes state today; the GETs that need the token are the two mirror routes
+#             (/api/mirror/events, /api/mirror/escalations) and /api/gpu-hold. Re-check this list when a GET route
+#             is added.
+# The token and the Authorization header are never logged or echoed.
+import hmac as _hmac
+
+QUEUE_API_TOKEN_FILE = Path.home() / ".config" / "ollama-queue" / "queue-api-token"
+_AUTH_PROXY_HEADERS = ("cf-ray", "cf-connecting-ip", "cf-visitor", "cf-ipcountry", "cf-access-jwt-assertion",
+                       "cf-access-authenticated-user-email", "x-forwarded-for", "x-forwarded-host", "x-real-ip",
+                       "forwarded")
+
+
+def _queue_api_token():
+    """The configured write token, or "" when none (then every route stays open)."""
+    t = (os.environ.get("QUEUE_API_TOKEN") or "").strip()
+    if t:
+        return t
+    try:
+        return QUEUE_API_TOKEN_FILE.read_text().split("\n", 1)[0].strip()
+    except OSError:
+        return ""
+
+
+def _is_loopback_peer(addr):
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def _write_auth_ok(peer_ip, headers, token=None):
+    """True when the request may proceed: no token configured, or a loopback peer with no proxy header, or the
+    correct Bearer token. `headers` is any mapping with a case-insensitive .get (an http.client message)."""
+    token = _queue_api_token() if token is None else token
+    if not token:
+        return True
+    if _is_loopback_peer(peer_ip) and not any(headers.get(h) for h in _AUTH_PROXY_HEADERS):
+        return True
+    got = headers.get("Authorization") or ""
+    if got[:7].lower() != "bearer ":
+        return False
+    return _hmac.compare_digest(got[7:].strip().encode("utf-8"), token.encode("utf-8"))
+
+
+# Mirror (the Mac pulls these files from the container; see queue-agent.md). Same files the hooks read today.
+MIRROR_MAX_EVENTS = 200
+MIRROR_MAX_FILE_BYTES = 8 * 1024 * 1024      # the writer rotates at 1 MB; this only bounds a damaged file
+MIRROR_MAX_TEXT_BYTES = 1024 * 1024
+MIRROR_ESC_NAMES = ("ESCALATIONS.md", "READY-TO-LAND.md")
+
+
+def _mirror_dir():
+    return Path(os.environ.get("QEL_DIR") or os.path.expanduser("~/.ollama-dispatch"))
+
+
+def _mirror_read(path, cap):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - cap))
+            data = f.read()
+        if size > cap:                      # started mid-file: drop the cut first line
+            data = data.split(b"\n", 1)[-1]
+        return data
+    except OSError:
+        return None
+
+
+def _mirror_events(after=0, limit=MIRROR_MAX_EVENTS, base=None):
+    """Events with seq > after, oldest first, at most `limit` (never above MIRROR_MAX_EVENTS)."""
+    base = Path(base) if base is not None else _mirror_dir()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = MIRROR_MAX_EVENTS
+    limit = max(1, min(limit, MIRROR_MAX_EVENTS))
+    try:
+        after = int(after)
+    except (TypeError, ValueError):
+        after = 0
+    rows, last = [], 0
+    for fn in ("queue-events.jsonl.1", "queue-events.jsonl"):
+        data = _mirror_read(base / fn, MIRROR_MAX_FILE_BYTES)
+        for ln in (data or b"").splitlines():
+            try:
+                e = json.loads(ln)
+                seq = int(e.get("seq") or 0)
+            except (ValueError, TypeError, AttributeError):
+                continue                     # a half line from a killed append
+            last = max(last, seq)
+            if seq > after:
+                rows.append((seq, e))
+    rows.sort(key=lambda r: r[0])
+    seen, out = set(), []
+    for seq, e in rows:
+        if seq in seen:
+            continue
+        seen.add(seq)
+        out.append(e)
+        if len(out) >= limit:
+            break
+    failed = None
+    data = _mirror_read(base / "queue-events.failed.json", MIRROR_MAX_TEXT_BYTES)
+    if data:
+        try:
+            failed = json.loads(data)
+        except ValueError:
+            failed = None
+    return {"generated_at": time.time(), "events": out, "last_seq": last, "failed": failed}
+
+
+def _mirror_escalations(base=None):
+    base = Path(base) if base is not None else _mirror_dir()
+    files = {}
+    for name in MIRROR_ESC_NAMES:
+        data = _mirror_read(base / "escalations" / name, MIRROR_MAX_TEXT_BYTES)
+        files[name] = None if data is None else data.decode("utf-8", "replace")
+    return {"generated_at": time.time(), "files": files}
+
+
+# GPU hold (2026-11-13; read by plex-automation's llm_advisor.hold_active through LLM_UNRAID_HOLD_URL/_TOKEN). While an
+# `enqueue-gpu` job RUNS on a lane, that lane's GPU is its own: gpu-exclusive-runner.py unloaded every Ollama model
+# before the command started, so an outside model call there would load a model under it. GET /api/gpu-hold[?lane=X]
+# (default lane unraid) answers {"hold": true, "cause": "gpu-exclusive", "lane": X, "job": <id>} then, else
+# {"hold": false, "lane": X}. Only a RUNNING row holds: a pending one has no GPU yet and the runner frees the card
+# when it ends. Read-only and lock-free (the daemon replaces the state file by atomic rename). Unreadable state or
+# standby (a copied state says nothing about this host's GPU): 503, which the caller treats as no hold (fails open).
+GPU_HOLD_DEFAULT_LANE = "unraid"
+
+
+def _is_gpu_exclusive_row(j):
+    """A row `enqueue-gpu` made. The runner is matched by file name, not the full path q._is_gpu_exclusive_job wants:
+    a row whose runner path names another host's home (a state imported across the queue move) still holds."""
+    return (isinstance(j, dict) and j.get("job_kind") == q.GPU_JOB_KIND
+            and Path(str(j.get("runner") or "")).name == Path(q.GPU_JOB_RUNNER).name)
+
+
+def _gpu_hold(jobs, lane=GPU_HOLD_DEFAULT_LANE):
+    """PURE given q's lane naming. The hold answer for `lane` from the queue's job rows."""
+    for j in jobs or []:
+        if not _is_gpu_exclusive_row(j) or j.get("status") != "running":
+            continue
+        try:
+            jl = q._pinned_lane_of(j) or (q._lane_name(j["lane"]) if j.get("lane") else None)
+        except Exception:
+            jl = j.get("host_pref") or j.get("lane")
+        if jl == lane:
+            return {"hold": True, "cause": "gpu-exclusive", "lane": lane, "job": j.get("id")}
+    return {"hold": False, "lane": lane}
+
+
+def _gpu_hold_now(lane=GPU_HOLD_DEFAULT_LANE):
+    """(status, body) for GET /api/gpu-hold, from the live state file."""
+    if queue_config.standby():
+        return 503, {"error": "standby"}
+    try:
+        jobs = json.loads(Path(q.STATE_PATH).read_text()).get("jobs") if Path(q.STATE_PATH).exists() else []
+    except (OSError, ValueError, AttributeError):
+        return 503, {"error": "queue state unreadable"}
+    if not isinstance(jobs, list):
+        return 503, {"error": "queue state unreadable"}
+    return 200, _gpu_hold(jobs, lane)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     _slot = None
 
@@ -8324,7 +8511,420 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.path.startswith("/api/cpu/"):
             _invalidate_response_cache()
 
+    def _require_write_auth(self):
+        """False after a 401 has been sent. See the block above the class for what needs the token."""
+        token = _queue_api_token()
+        if not token:
+            return True                 # no token configured: exactly as before (touches nothing on the request)
+        if _write_auth_ok(self.client_address[0], self.headers, token=token):
+            return True
+        out = json.dumps({"ok": False, "error": "unauthorized"}).encode()
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")     # the request body was not read
+        self.end_headers()
+        self.wfile.write(out)
+        self.close_connection = True
+        return False
+
+    def _require_private_read_auth(self, what):
+        """Gate for read routes that serve raw files (the mirror routes, /api/state). With NO token configured they
+        answer only a loopback peer without proxy headers (nothing remote needs them then): 403. With a token, the
+        write-route check applies: 401 without the right bearer. False once a refusal has been sent."""
+        if not _queue_api_token() and not (_is_loopback_peer(self.client_address[0])
+                                           and not any(self.headers.get(h) for h in _AUTH_PROXY_HEADERS)):
+            out = json.dumps({"ok": False, "error": what + " needs QUEUE_API_TOKEN set on the server"}).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(out)
+            return False
+        return self._require_write_auth()
+
+    # POST /api/cli: run an allowlisted ollama-queue.py / qctl command on this host for a client whose queue is remote.
+    _CLI_TOOLS = {"ollama-queue.py": "ollama-queue.py", "qctl": "qctl"}
+    _CLI_VERBS = {
+        "ollama-queue.py": frozenset((
+            "plan-add", "plan-clear", "focus", "accept-bundle", "unpin-group", "bundle", "nsample", "ttc", "escalate",
+            "retag-bundles", "hold", "resume", "promote", "cancel", "stop", "resolve", "promote-group", "run-now",
+            "move-group", "status")),     # never: run, enqueue, enqueue-gpu, clear-card, results, needs-opus
+        "qctl": frozenset(("status", "clear", "slots", "why", "bundle", "supersede", "retire", "close", "auto-retire",
+                           "failures", "timeline", "runs-clear")),
+    }
+    _CLI_MAX_ARGS, _CLI_MAX_ARG_LEN, _CLI_MAX_TOTAL, _CLI_MAX_OUT, _CLI_TIMEOUT = 64, 4096, 65536, 256 * 1024, 180
+
+    def _cli(self):
+        # The refusals send before the body is read, so they close the connection.
+        def refuse(msg, status):
+            self.close_connection = True
+            self._text(msg, status)
+        if not self._require_private_read_auth("/api/cli"):
+            return
+        if any(self.headers.get(h) for h in _AUTH_PROXY_HEADERS):
+            return refuse("/api/cli is not served through a proxy", 403)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > 4 * self._CLI_MAX_TOTAL:
+            return refuse("bad request body size", 400)
+        try:
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._text("body must be JSON", 400)
+        tool, argv = (req.get("tool"), req.get("argv")) if isinstance(req, dict) else (None, None)
+        if not isinstance(tool, str) or tool not in self._CLI_TOOLS:
+            return self._text("tool must be one of: " + ", ".join(sorted(self._CLI_TOOLS)), 400)
+        if (not isinstance(argv, list) or not 1 <= len(argv) <= self._CLI_MAX_ARGS
+                or not all(isinstance(a, str) and len(a) <= self._CLI_MAX_ARG_LEN and "\0" not in a for a in argv)
+                or sum(len(a.encode("utf-8", "replace")) for a in argv) > self._CLI_MAX_TOTAL):
+            return self._text("argv must be 1-%d strings (<=%d chars each, no NUL, <=%d bytes in all)"
+                              % (self._CLI_MAX_ARGS, self._CLI_MAX_ARG_LEN, self._CLI_MAX_TOTAL), 400)
+        if argv[0] not in self._CLI_VERBS[tool] and argv[0] not in ("--help", "-h"):
+            return self._text("%s %s is not available through /api/cli" % (tool, argv[0][:40]), 400)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self._CLI_TOOLS[tool])
+        env = dict(os.environ, OLLAMA_QUEUE_FORCE_LOCAL="1", QCTL_FORCE_LOCAL="1")
+        try:
+            r = subprocess.run([sys.executable, path] + argv, stdin=subprocess.DEVNULL, capture_output=True,
+                               timeout=self._CLI_TIMEOUT, cwd=str(queue_config.state_dir()), env=env)
+        except subprocess.TimeoutExpired:
+            self._invalidate_for_write()
+            return self._json({"ok": False, "error": "command timed out after %ds" % self._CLI_TIMEOUT}, 504)
+        except OSError as e:
+            return self._json({"ok": False, "error": "cannot run: %s" % type(e).__name__}, 500)
+        self._invalidate_for_write()
+        cap, trunc = self._CLI_MAX_OUT, False
+        out = []
+        for b in (r.stdout, r.stderr):
+            if len(b) > cap:
+                b, trunc = b[-cap:], True
+            out.append(b.decode("utf-8", "replace"))
+        self._json({"rc": r.returncode, "stdout": out[0], "stderr": out[1], "truncated": trunc})
+
+    def _state(self):
+        # The raw queue state JSON, exactly as the daemon wrote it, for the Mac-side scripts that read the state file
+        # (queue_config.load_queue_state) once the queue runs elsewhere. Job specs carry commands and paths, so this
+        # is a private read: token, or loopback without proxy headers.
+        if not self._require_private_read_auth("/api/state"):
+            return
+        with q._Locked() as lock:
+            state = lock.load()
+        self._json(state)
+
+    def _results(self):
+        # The durable job results (q._iter_job_results: done/gate sidecars in the queue's log dir) for `ollama-queue.py
+        # results` on a machine without that log dir. Same filter as the CLI (q._filter_results). Records carry paths
+        # and run details, so this is a private read like /api/state.
+        if not self._require_private_read_auth("/api/results"):
+            return
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        try:
+            limit = int((qs.get("limit") or ["0"])[0])
+        except ValueError:
+            return self._text("limit must be a number", 400)
+        rows = q._filter_results(q._iter_job_results(), (qs.get("verdict") or [None])[0],
+                                 (qs.get("label") or [None])[0], limit)
+        self._json({"results": rows})
+
+    def _gpu_hold_route(self):
+        # Token-gated like the mirror routes (see the gate's docstring); answers only whether a lane's GPU is held.
+        if not self._require_private_read_auth("/api/gpu-hold"):
+            return
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        lane = ((qs.get("lane") or [GPU_HOLD_DEFAULT_LANE])[0] or GPU_HOLD_DEFAULT_LANE)[:64]
+        status, body = _gpu_hold_now(lane)
+        return self._json(body, status)
+
+    def _mirror(self):
+        # These two routes are new and serve whole escalation files: a private read (see the gate's docstring).
+        if not self._require_private_read_auth("mirror routes"):
+            return
+        u = urllib.parse.urlsplit(self.path)
+        if u.path == "/api/mirror/escalations":
+            return self._json(_mirror_escalations())
+        qs = urllib.parse.parse_qs(u.query)
+        return self._json(_mirror_events((qs.get("after") or ["0"])[0], (qs.get("limit") or [MIRROR_MAX_EVENTS])[0]))
+
+    # ---- standby (QUEUE_STANDBY=1): the container holds a COPY of the Mac queue's state and must not act on it ----
+    # Every route that changes queue state, enqueues, leases a CPU job, notifies or posts to the Mac status service
+    # answers 503 {"error":"standby"}: all POST / PUT / DELETE (the /api/cpu/* writes included) except /api/standby/*.
+    # GETs read the copied state as usual. /api/standby/* exists only in standby (404 otherwise) and needs the write
+    # token itself (never the loopback exemption). Not standby: none of this runs and every path is as before.
+    def _standby_refuse(self):
+        out = json.dumps({"error": "standby"}).encode()
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Retry-After", "60")
+        self.send_header("Connection", "close")     # the request body was not read
+        self.end_headers()
+        self.wfile.write(out)
+        self.close_connection = True
+
+    def _standby_gate(self):
+        """True when the request was refused because the queue is in standby."""
+        if not queue_config.standby() or self.path.split("?", 1)[0].startswith("/api/standby/"):
+            return False
+        self._standby_refuse()
+        return True
+
+    def _standby_auth(self):
+        """Standby admin routes: 404 outside standby; the configured bearer token is required (no token configured:
+        403; no loopback exemption). False once an answer has been sent."""
+        if not queue_config.standby():
+            self.close_connection = True
+            self._text("not found", 404)
+            return False
+        token = _queue_api_token()
+        got = self.headers.get("Authorization") or ""
+        if not token:
+            self._refuse_unread("standby routes need QUEUE_API_TOKEN set on the server", 403)
+            return False
+        if got[:7].lower() != "bearer " or not _hmac.compare_digest(got[7:].strip().encode("utf-8"), token.encode("utf-8")):
+            self._refuse_unread("unauthorized", 401)
+            return False
+        return True
+
+    def _standby_post(self):
+        path, _, qs = self.path.partition("?")
+        path = path.rstrip("/")
+        if not self._standby_auth():
+            return
+        if path == "/api/standby/import":
+            return self._standby_import(urllib.parse.parse_qs(qs))
+        if path == "/api/standby/backtest":
+            return self._standby_backtest_start()
+        self._refuse_unread("not found", 404)
+
+    def _standby_import(self, qs):
+        """POST /api/standby/import[?replace=1]: body = one state tarball, header X-Content-SHA256 = its sha256 (hex).
+        See queue_standby.py for what it may hold and how it is extracted. 200 {ok, tar_sha256, files, bytes, ...}."""
+        import queue_standby
+        sha = (self.headers.get("X-Content-SHA256") or "").strip().lower()
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            return self._refuse_unread("X-Content-SHA256 (64 hex) required", 400)
+        try:
+            length = int(self.headers.get("Content-Length") or -1)
+        except ValueError:
+            length = -1
+        if length < 0:
+            return self._refuse_unread("Content-Length required", 411)
+        if length > queue_standby.upload_max_bytes():
+            return self._refuse_unread("upload larger than the %d MB cap" % (queue_standby.upload_max_bytes() // (1024 * 1024)), 413)
+        root = queue_standby.backtest_root()
+        if any((queue_standby.read_run(root, d.name) or {}).get("state") == "running"
+               for d in (root.iterdir() if root.is_dir() else ())):
+            return self._refuse_unread("a back-test is running; wait for it", 409)
+        state_dir, disp = queue_config.state_dir(), queue_config.dispatch_dir()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        up = state_dir / (".standby-upload-%s.tar" % uuid.uuid4().hex[:8])
+        replace = (qs.get("replace") or [""])[0] in ("1", "true", "yes")
+        try:
+            queue_upload.stream_to_file(self.rfile, length, up, queue_standby.upload_max_bytes())
+            res = queue_standby.import_state(up, state_dir, disp, sha256=sha, replace=replace,
+                                             around_swap=lambda: q._Locked())
+            _invalidate_response_cache()
+            self._json(res)
+        except queue_standby.StandbyError as e:
+            self.close_connection = True
+            self._json({"ok": False, "error": e.msg}, e.status)
+        except queue_upload.UploadError as e:
+            self.close_connection = True
+            self._text(e.msg, e.status)
+        except Exception as e:  # noqa: BLE001
+            self.close_connection = True
+            sys.stderr.write("[queue-api] standby import failed: %s: %s\n" % (type(e).__name__, str(e)[:300]))
+            self._json({"ok": False, "error": "import failed: %s" % type(e).__name__}, 500)
+        finally:
+            try:
+                up.unlink()
+            except OSError:
+                pass
+
+    def _standby_backtest_start(self):
+        """POST /api/standby/backtest: start queue-backtest on scratch state. Body (optional JSON): {"parts": ["B1", ...],
+        "limit": N, "mode": "dry"}. -> {"id": <12 hex>}; 409 while another run is going."""
+        import queue_standby
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}") if 0 < length <= 65536 else {}
+        except ValueError:
+            return self._text("body must be JSON", 400)
+        if not isinstance(body, dict):
+            return self._text("body must be a JSON object", 400)
+        parts = body.get("parts") or []
+        if (not isinstance(parts, list) or len(parts) > 12
+                or not all(isinstance(x, str) and re.fullmatch(r"B[1-7]", x) for x in parts)):
+            return self._text("parts must be a list of B1..B7", 400)
+        argv = []
+        if parts:
+            argv += ["--parts", ",".join(parts)]
+        if body.get("limit") is not None:
+            try:
+                lim = int(body["limit"])
+            except (TypeError, ValueError):
+                return self._text("limit must be a number", 400)
+            if not 1 <= lim <= 100000:
+                return self._text("limit must be 1..100000", 400)
+            argv += ["--limit", str(lim)]
+        root = queue_standby.backtest_root()
+        root.mkdir(parents=True, exist_ok=True)
+        for d in root.iterdir():
+            if (queue_standby.read_run(root, d.name) or {}).get("state") == "running":
+                return self._text("a back-test is already running: " + d.name, 409)
+        rid = queue_standby.new_run_id()
+        out = root / rid
+        out.mkdir()
+        (out / "status.json").write_text(json.dumps({"state": "running", "started": time.time()}))
+        env = dict(os.environ, QUEUE_STANDBY="1", OLLAMA_QUEUE_NO_NOTIFY="1")
+        try:
+            logf = open(out / "run.log", "wb")
+            subprocess.Popen([sys.executable, os.path.join(_BIN_DIR, "queue-backtest"), "run", "--out", str(out)] + argv,
+                             stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                             start_new_session=True, cwd=str(out))
+            logf.close()
+        except OSError as e:
+            (out / "status.json").write_text(json.dumps({"state": "failed", "error": "cannot start: %s" % type(e).__name__}))
+            return self._json({"ok": False, "error": "cannot start the back-test"}, 500)
+        self._json({"id": rid})
+
+    def _standby_get(self):
+        """GET /api/standby/backtest/<id>: the run's status and, once finished, its results JSON."""
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if not self._standby_auth():
+            return
+        import queue_standby
+        m = re.match(r"^/api/standby/backtest/([^/]+)$", path)
+        if not m:
+            return self._text("not found", 404)
+        run = queue_standby.read_run(queue_standby.backtest_root(), m.group(1))
+        if run is None:
+            return self._text("unknown back-test id", 404)
+        self._json(run)
+
+    # Fallback routes (live container only): /api/admin/drain stops new work, /api/admin/export hands the small live
+    # state back once nothing runs. Bearer token required, no loopback exemption; 404 while in standby (the standby
+    # admin routes are /api/standby/*). The marker file is queue_config.drain_marker(): the daemon launches nothing while
+    # it exists and the API refuses enqueue and CPU-lane claim / create (503 {"error":"draining"}); running work finishes.
+    def _admin_auth(self):
+        token = _queue_api_token()
+        got = self.headers.get("Authorization") or ""
+        if not token:
+            self._refuse_unread("admin routes need QUEUE_API_TOKEN set on the server", 403)
+            return False
+        if got[:7].lower() != "bearer " or not _hmac.compare_digest(got[7:].strip().encode("utf-8"), token.encode("utf-8")):
+            self._refuse_unread("unauthorized", 401)
+            return False
+        return True
+
+    def _drain_status(self):
+        import queue_standby
+        out = queue_standby.running_counts(queue_config.state_dir(), queue_config.dispatch_dir())
+        out["draining"] = queue_config.draining()
+        return out
+
+    def _drain_refuse(self):
+        out = json.dumps({"error": "draining"}).encode()
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Retry-After", "60")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(out)
+        self.close_connection = True
+
+    def _drain_gate(self):
+        """True when a new-work route was refused because the queue is draining. Cheap: one stat when not draining."""
+        if not queue_config.draining():
+            return False
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path in ("/api/jobs", "/api/jobs/upload", "/api/cpu/claim", "/api/cpu/jobs"):
+            self._drain_refuse()
+            return True
+        return False
+
+    def _admin_post(self):
+        """POST /api/admin/drain {"on": true|false} -> {draining, running, cpu_running, pending}."""
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path != "/api/admin/drain":
+            return self._refuse_unread("not found", 404)
+        if not self._admin_auth():
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(min(n, 4096)) or b"{}")
+        except (ValueError, OSError):
+            return self._json({"ok": False, "error": "bad JSON"}, 400)
+        on = bool(body.get("on", True)) if isinstance(body, dict) else True
+        marker = queue_config.drain_marker()
+        try:
+            if on:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                if not marker.exists():
+                    marker.write_text(json.dumps({"since": time.time()}))
+            else:
+                marker.unlink(missing_ok=True)
+        except OSError as e:
+            return self._json({"ok": False, "error": "cannot change the drain marker: %s" % type(e).__name__}, 500)
+        self._json(dict(self._drain_status(), ok=True))
+
+    def _admin_get(self):
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if not self._admin_auth():
+            return
+        if path == "/api/admin/drain":
+            return self._json(self._drain_status())
+        if path != "/api/admin/export":
+            return self._text("not found", 404)
+        import queue_standby
+        st = self._drain_status()
+        if not st["draining"]:
+            return self._json({"ok": False, "error": "drain first (POST /api/admin/drain)"}, 409)
+        if st["running"] or st["cpu_running"]:
+            return self._json(dict(st, ok=False, error="jobs are still running"), 409)
+        state_dir = queue_config.state_dir()
+        out = state_dir / (".export-%s.tar" % uuid.uuid4().hex[:8])
+        try:
+            with q._Locked():
+                res = queue_standby.build_export(state_dir, queue_config.dispatch_dir(), out)
+            size = out.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-tar")
+            self.send_header("Content-Length", str(size))
+            self.send_header("X-Content-SHA256", res["tar_sha256"])
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(out, "rb") as fh:
+                while True:
+                    b = fh.read(1024 * 1024)
+                    if not b:
+                        break
+                    self.wfile.write(b)
+        except Exception as e:  # noqa: BLE001
+            self.close_connection = True
+            sys.stderr.write("[queue-api] export failed: %s: %s\n" % (type(e).__name__, str(e)[:300]))
+            try:
+                self._json({"ok": False, "error": "export failed: %s" % type(e).__name__}, 500)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            try:
+                out.unlink()
+            except OSError:
+                pass
+
     def do_PUT(self):
+        if self._standby_gate():
+            return
+        if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
+            return
         self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("PUT")
@@ -8353,6 +8953,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return _annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state))
 
     def do_GET(self):
+        if self.path.startswith("/api/standby/"):
+            return self._standby_get()
+        if self.path.split("?", 1)[0].startswith("/api/admin/") and not queue_config.standby():
+            return self._admin_get()
+        if self.path.split("?", 1)[0] in ("/api/mirror/events", "/api/mirror/escalations"):
+            return self._mirror()
+        if self.path.split("?", 1)[0] == "/api/gpu-hold":
+            return self._gpu_hold_route()
+        if self.path.split("?", 1)[0] == "/api/state":
+            return self._state()
+        if self.path.split("?", 1)[0] == "/api/results":
+            return self._results()
         if _is_docsum_path(self.path):
             return self._docsum()
         if self.path.startswith("/api/cpu/"):
@@ -8463,6 +9075,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.match(r"^/api/jobs/([^/]+)/gate$", self.path)
             if m:
                 return self._gate_detail(m.group(1))
+            m = re.match(r"^/api/jobs/([0-9a-f]{6,64})/result(\?scope=run)?$", self.path)
+            if m:
+                return self._job_result(m.group(1), run_scope=bool(m.group(2)))
             self._text("not found", 404)
 
     _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -8513,10 +9128,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
+        if self._standby_gate():
+            return
+        if self.path.split("?", 1)[0].startswith("/api/standby/"):
+            return self._standby_post()
+        if self.path.split("?", 1)[0].startswith("/api/admin/"):
+            return self._admin_post()
+        if self._drain_gate():
+            return
+        if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
+            return
         if _is_docsum_path(self.path):
             return self._docsum()
         if self.path.startswith("/api/bypass/"):
             return self._plex_bypass()
+        if self.path.split("?")[0].rstrip("/") == "/api/cli":
+            return self._cli()
         # Any state change must be visible on the very next poll.
         self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
@@ -8525,6 +9152,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._chat("POST")
         if self.path == "/api/jobs":
             self._enqueue()
+        elif self.path == "/api/jobs/upload":
+            return self._upload_job()
         elif self.path.split("?")[0].rstrip("/").startswith("/api/log-retention"):
             return self._log_retention("POST")
         elif self.path == "/api/settings/hosts":
@@ -8551,6 +9180,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.match(r"^/api/jobs/([^/]+)/resume$", self.path)
             if m:
                 return self._resume(m.group(1))
+            m = re.match(r"^/api/jobs/([^/]+)/resolve$", self.path)
+            if m:
+                return self._resolve(m.group(1))
             if self.path == "/api/runs/retention/apply":
                 return self._retention_apply()
             m = re.match(r"^/api/runs/([^/]+)/clear$", self.path)
@@ -8564,6 +9196,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def do_DELETE(self):
+        if self._standby_gate():
+            return
+        if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
+            return
         self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("DELETE")
@@ -8590,17 +9226,116 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             return self._text(f"could not save hosts: {e}", 500)
 
+    def _refuse_unread(self, msg, status):
+        """Answer without reading the request body, and close so the unread bytes cannot be parsed as a request."""
+        out = json.dumps({"ok": False, "error": msg}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(out)
+        self.close_connection = True
+
+    def _upload_job(self):
+        """POST /api/jobs/upload: body is one tar package (see queue_upload.py). Needs the bearer token (a tokenless
+        queue answers loopback only). Nothing from the package is executed here; the job runs later under the daemon."""
+        if not self._require_private_read_auth("job upload"):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or -1)
+        except ValueError:
+            length = -1
+        root = queue_upload.work_root()
+        run_dir = None
+        try:
+            if length < 0:
+                return self._refuse_unread("Content-Length required", 411)
+            if length > queue_upload.max_bytes(queue_config):
+                return self._refuse_unread("upload larger than the %d MB cap"
+                                           % (queue_upload.max_bytes(queue_config) // (1024 * 1024)), 413)
+            root.mkdir(parents=True, exist_ok=True)
+            run_dir = queue_upload.new_run_dir(root, "upload")
+            pkg = run_dir / "package.tar"
+            queue_upload.stream_to_file(self.rfile, length, pkg, queue_upload.max_bytes(queue_config))
+            info = queue_upload.unpack_package(pkg, run_dir, _BIN_DIR,
+                                               max_unpacked=queue_upload.max_unpacked_bytes(queue_config))
+            pkg.unlink()
+            data = dict(info["fields"], cwd=info["cwd"], task=info["task"], runner=info["runner"])
+            job_id, err = self._enqueue_data(data, runner_args=info.get("runner_args") or None)
+            if err:
+                shutil.rmtree(run_dir, ignore_errors=True)
+                return self._text(err[0], err[1])
+            self._json({"id": job_id, "run_dir": info["run_dir"]})
+        except queue_upload.UploadError as e:
+            if run_dir:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            self.close_connection = True
+            self._text(e.msg, e.status)
+        except Exception as e:
+            if run_dir:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            self.close_connection = True
+            sys.stderr.write("[queue-api] upload failed: %s: %s\n" % (type(e).__name__, str(e)[:300]))
+            self._text("upload failed: %s" % type(e).__name__, 500)
+
+    def _job_result(self, job_id, run_scope=False):
+        """GET /api/jobs/<id>/result: tar.gz of job.json, done.json, a log tail and the work dir. With ?scope=run: the
+        whole run dir instead (mini-finish's mirror); 404 when the job's run dir is not under the mini-work root."""
+        if not self._require_private_read_auth("job result"):
+            return
+        with q._Locked() as lock:
+            state = lock.load()
+        job = next((j for j in state["jobs"] if str(j.get("id")) == job_id), None)
+        if job is None:
+            return self._text("job not found", 404)
+        tmp = None
+        try:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(suffix=".tgz")
+            os.close(fd)
+            if run_scope:
+                if queue_upload.build_run_tar(job, tmp, queue_upload.work_root(), queue_config.state_dir(),
+                                               cap=queue_upload.run_max_bytes(queue_config)) is None:
+                    return self._text("no run dir for this job", 404)
+            else:
+                queue_upload.build_result(job, tmp, queue_config.state_dir(), queue_upload.work_root())
+            size = os.path.getsize(tmp)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(tmp, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
     def _enqueue(self):
         try:
             data = self._read_json_body()
+            job_id, err = self._enqueue_data(data)
+            if err:
+                return self._text(err[0], err[1])
+            self._json({"id": job_id})
+        except Exception as e:
+            self._text(f"error: {e}", 500)
+
+    def _enqueue_data(self, data, runner_args=None):
+        """Shared by POST /api/jobs and POST /api/jobs/upload. Returns (job_id, None) or (None, (message, status))."""
+        if True:
             model = data.get("model", "").strip()
             cwd = data.get("cwd", "").strip()
             task = data.get("task", "").strip()
             if not model or not cwd or not task:
-                return self._text("model, cwd, and task are required", 400)
+                return None, ("model, cwd, and task are required", 400)
             cwd_path = Path(cwd).expanduser()
             if not cwd_path.is_dir():
-                return self._text(f"cwd does not exist: {cwd_path}", 400)
+                return None, (f"cwd does not exist: {cwd_path}", 400)
             TASKS_DIR.mkdir(parents=True, exist_ok=True)
             task_id = uuid.uuid4().hex[:12]
             task_file = TASKS_DIR / f"{task_id}.txt"
@@ -8616,7 +9351,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               if str(j.get("label")) == str(_label)
                               and j.get("status") in q._LIVE_LABEL_STATES), None)
                 if _dupe and not data.get("allow_duplicate_label"):
-                    return self._text(
+                    return None, (
                         f"duplicate label: {_label!r} already has a LIVE job "
                         f"{_dupe['id']} ({_dupe.get('status')}). Adopt that job, or "
                         f"pass allow_duplicate_label to enqueue anyway.", 409)
@@ -8633,6 +9368,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "api": data.get("api") or "ollama",
                     "verify": data.get("verify") or None,
                     "runner": (str(Path(data["runner"]).expanduser().resolve()) if data.get("runner") else None),
+                    "runner_args": [str(x) for x in runner_args][:64] if runner_args else None,  # only from an upload (queue_upload allowlist)
                     "num_ctx": int(data.get("num_ctx") or 65536),
                     "max_iters": int(data.get("max_iters") or 20),
                     "temperature": float(data.get("temperature") or 0),
@@ -8643,9 +9379,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 }
                 state["jobs"].append(job)
                 lock.save(state)
-            self._json({"id": job_id})
-        except Exception as e:
-            self._text(f"error: {e}", 500)
+            return job_id, None
 
     def _move(self):
         try:
@@ -8783,7 +9517,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text(f"error: {e}", 500)
 
     def _run_now(self, job_id):
-        # Bundle "Run now" (the owner 2026-10-30): delegates to promote_group_for_job(run_now=True)
+        # Bundle "Run now" (operator 2026-10-30): delegates to promote_group_for_job(run_now=True)
         # -- the bundle goes to the front, the running bundle's job is gracefully paused
         # (even a committed one's) and both resume on their own once this bundle is done.
         try:
@@ -8812,6 +9546,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(q.resume_job(job_id))
         except q.QueueActionError as e:
             self._text(str(e), 400)
+        except Exception as e:
+            self._text(f"error: {e}", 500)
+
+    def _resolve(self, job_id):
+        # `ollama-queue.py resolve` for a client that cannot see the state file (the CLI forwards here when the
+        # queue is remote). Same resolve_job(): same lock, same finished/parked-only rule. 404 when the job is gone
+        # (qctl close treats that as already resolved).
+        try:
+            self._json(q.resolve_job(job_id))
+        except q.QueueActionError as e:
+            self._text(str(e), 404 if str(e).startswith("job not found") else 409)
         except Exception as e:
             self._text(f"error: {e}", 500)
 
@@ -9866,7 +10611,7 @@ console.log(JSON.stringify({
     elif not _node:
         print("  SKIP planAlertSummary behavioural checks: no `node` on PATH")
 
-    # --- Needs-attention cleanup (the owner 2026-10-11): presentation only, nothing hidden ---
+    # --- Needs-attention cleanup (operator 2026-10-11): presentation only, nothing hidden ---
     _na = lambda **k: dict({"status": "failed", "needs_attention": True,
                             "group_key": "p1"}, **k)
     _pv = lambda j, ld=None: "PASS"
@@ -11617,11 +12362,13 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(0 if _self_test() else 1)
     _lim = _raise_fd_limit()
-    threading.Thread(target=_retention_loop, name="runstatus-retention", daemon=True).start()
+    if not queue_config.standby():            # standby: the copied state is only read, never swept or reaped
+        threading.Thread(target=_retention_loop, name="runstatus-retention", daemon=True).start()
     try:
         cpu_lane = _cpu_lane_mod()
         cpu_lane.read_token(create=True)      # 0600 random token if absent (never printed)
-        cpu_lane.start_reaper()
+        if not queue_config.standby():
+            cpu_lane.start_reaper()
     except Exception as _e:  # noqa: BLE001
         print(f"[queue-api] cpu lane disabled: {_e!r}", flush=True)
     srv = ThreadingServer((BIND_ADDR, PORT), Handler)

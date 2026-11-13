@@ -25,6 +25,7 @@ import urllib.request
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import model_profile as _mp   # model cards -> request fields (model_profiles.yaml)
+import queue_config as _qc    # Darkbloom endpoint layers: env, local.json, config
 
 LOCAL_JSON = os.path.expanduser("~/.darkbloom/local.json")
 DEFAULT_MODEL = os.environ.get("DARKBLOOM_DEFAULT_MODEL", "qwen3.6-35b-a3b-vl-mtp-mxfp8")
@@ -68,14 +69,14 @@ def _raw_record():
     try:
         txt = open(LOCAL_JSON).read()
     except OSError:
-        return {}, False
+        return _qc.darkbloom_apply_env({}), False
     try:
         rec = json.loads(txt)
     except ValueError:
-        return {}, True
+        return _qc.darkbloom_apply_env({}), True
     if not isinstance(rec, dict):
-        return {}, True
-    return rec, False
+        return _qc.darkbloom_apply_env({}), True
+    return _qc.darkbloom_apply_env(rec), False
 
 
 def _record():
@@ -87,7 +88,7 @@ def _record():
     s = _sticky_s()
     if s > 0 and _GOOD[0] and _now() - _GOOD[1] < s:
         return dict(_GOOD[0])
-    return {}
+    return _qc.darkbloom_apply_env({})
 
 
 def record_transient():
@@ -101,7 +102,7 @@ def record_transient():
 # 759f2ebc2ea1, edf9e823be47) and the worker sent no Bearer key (the 401s). A
 # record that carries an api_key IS the local endpoint being on; its address is
 # the fixed local port (DARKBLOOM_BASE_URL overrides).
-DEFAULT_BASE = (os.environ.get("DARKBLOOM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_BASE = _qc.darkbloom_default_base()
 
 
 def base_from_record(rec, default=None):

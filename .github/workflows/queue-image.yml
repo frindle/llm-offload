@@ -1,0 +1,97 @@
+# Becomes .github/workflows/queue-image.yml in the public repo (frindle/llm-offload) at the queue cutover.
+# Builds on pushes to main (tags latest + short sha) and to queue-pre (tags standby + pre-<short sha>; `latest` is main only).
+# queue-pre is published by `offload-repo-sync --bin-ref REF --branch queue-pre`, which copies this file onto that branch.
+# Repo layout it builds from: bin/ (the ~/bin files; links into the dashboard repo are not copied) and dashboard/src/
+# (the dashboard's real files). The stage step overlays dashboard/src/*.py onto a copy of bin/, then runs
+# bin/queue-image/stage.sh, which copies the files in bin/queue-image/MANIFEST into bin/queue-image/build/bin/.
+# The build context is bin/queue-image/. Every shipped file must already be free of private info (the repo sync's
+# runtime check stops a sync that would publish one); the scan below re-checks the staged files.
+name: queue image
+on:
+  push:
+    branches: [main, queue-pre]
+    paths:
+      - "bin/**"
+      - "dashboard/src/**"
+      - ".github/workflows/queue-image.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: queue-image-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Stage the image's code (bin/ plus the dashboard's real files)
+        run: |
+          set -eu
+          src=$(mktemp -d)
+          cp -a bin/. "$src/"
+          cp -p dashboard/src/*.py "$src/"
+          bash bin/queue-image/stage.sh "$src"
+      - name: Private-info scan of the staged files (generic patterns; fails the build on a hit)
+        run: python3 bin/queue-image/scan-private-info.py --base bin/queue-image/build/bin --list bin/queue-image/MANIFEST
+      - name: Static checks (no Docker)
+        working-directory: bin/queue-image
+        run: |
+          set -eu
+          bash -n entrypoint.sh every.sh throttle.sh stage.sh
+          python3 -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('supervisord.conf'); p=[s for s in c.sections() if s.startswith('program:')]; assert len(p)==9, p; print(sorted(p))"
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Stage the image's code
+        run: |
+          set -eu
+          src=$(mktemp -d)
+          cp -a bin/. "$src/"
+          cp -p dashboard/src/*.py "$src/"
+          bash bin/queue-image/stage.sh "$src"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/frindle/llm-offload-queue
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=standby,enable=${{ github.ref == 'refs/heads/queue-pre' }}
+            type=sha,format=short,prefix=${{ github.ref == 'refs/heads/queue-pre' && 'pre-' || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/frindle/llm-offload
+            org.opencontainers.image.licenses=MIT
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: bin/queue-image
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke the pushed image (python, node, tools, supervisord config, shipped code)
+        run: |
+          img=ghcr.io/frindle/llm-offload-queue@${{ steps.build.outputs.digest }}
+          docker run --rm --entrypoint python3 "$img" -c "import sys,yaml,jinja2; assert sys.version_info[:2]==(3,14), sys.version; print('python', sys.version.split()[0])"
+          docker run --rm --entrypoint node "$img" -v
+          docker run --rm --entrypoint sh "$img" -c 'set -e; git --version; pnpm --version; tini --version; test "$(id -u)" != 0; test -L /home/queue/bin; /opt/mini-venv/bin/python -c "import litellm, minisweagent"'
+          docker run --rm --entrypoint python3 "$img" -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('/etc/queue/supervisord.conf'); assert len([s for s in c.sections() if s.startswith('program:')])==9"
+          docker run --rm --entrypoint sh "$img" -c 'set -e; cd /home/queue/bin; for f in ollama-queue.py ollama-queue-api.py queue_upload.py queue_config.py mini-swe-runner.py; do test -f "$f"; done'
+      - name: Parity checks inside the image (made-up data, fake tokens; one PASS/FAIL line each)
+        run: |
+          img=ghcr.io/frindle/llm-offload-queue@${{ steps.build.outputs.digest }}
+          docker run --rm --entrypoint bash -e QUEUE_CODE=/opt/queue/bin "$img" /opt/queue/ci/parity-ci.sh

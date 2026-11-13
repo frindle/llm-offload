@@ -4,7 +4,7 @@
 Does the real wire still match the profile? Every run does ONE of:
   1. VERIFY the previous probe (if one is pending and its job is terminal): its job["conformance"] verdict (the
      daemon's reap-time comparison of the worker's conformance records against the lane PLAN) must be ok with
-     >= 1 recorded call; anything else -> alert (notify-owner, deduped).
+     >= 1 recorded call; anything else -> alert (notify-operator, deduped).
   2. ENQUEUE a tiny synthetic probe job -- ONLY when nothing is queued/running/held and no bundle is committed
      (a probe must never take a lane from real work or break a bundle's commitment): `_bundle_commit` empty,
      no job in pending/running/paused/held/planned. Otherwise skip silently (the next tick tries again).
@@ -21,6 +21,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config  # noqa: E402  (the queue state wherever the queue runs: load_queue_state)
 
 HOME = Path.home()
 BIN = Path(os.environ.get("BIN") or Path(__file__).resolve().parent)
@@ -88,7 +93,7 @@ def verdict(job):
 
 
 def alert(title, msg, key, dry):
-    cmd = [sys.executable, str(BIN / "notify-owner.py"), title, msg, "--dedupe-key", key, "--dedupe-s", "21600"]
+    cmd = [sys.executable, str(BIN / "notify-operator.py"), title, msg, "--dedupe-key", key, "--dedupe-s", "21600"]
     if dry:
         print("ALERT:", cmd[2:])
         return
@@ -116,7 +121,7 @@ def run(args):
     if not enabled():
         print("live probe disabled")
         return 0
-    qs = json.loads(Path(args.queue_state).read_text()) if Path(args.queue_state).exists() else {}
+    qs = queue_config.load_queue_state(args.queue_state) or {}
     ps = json.loads(Path(args.state).read_text()) if Path(args.state).exists() else {}
     now = time.time()
     act, what = decide(qs, ps, now)

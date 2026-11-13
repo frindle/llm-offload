@@ -28,6 +28,11 @@ import re
 import sys
 import time
 from pathlib import Path
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config  # noqa: E402  (the queue state wherever the queue runs: load_queue_state)
 
 HOME = Path.home()
 QUEUE_STATE = Path(os.environ.get("OLLAMA_QUEUE_STATE", HOME / "bin" / "ollama-queue-state.json"))
@@ -50,7 +55,7 @@ def _read_json(p):
 
 
 def queue_jobs(path):
-    d = _read_json(path)
+    d = queue_config.load_queue_state(path)
     if not isinstance(d, dict):
         return None
     jobs = d.get("jobs") or []

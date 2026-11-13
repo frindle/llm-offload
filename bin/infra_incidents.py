@@ -13,7 +13,7 @@ Writers call record(); it never raises and never touches a protected path (the l
 ~/.ollama-dispatch, and the lock state comes from ioreg). Records are JSON lines:
 
     {"ts": 1793684100.5, "iso": "2026-11-03T05:35:00Z", "kind": "path-blocked", "component": "queue",
-     "host": "studio", "pid": 25225, "screen_locked": true, "path": "/Users/user/Desktop/x/.git", ...}
+     "host": "studio", "pid": 25225, "screen_locked": true, "path": "/Users/example/Desktop/x/.git", ...}
 
 Kinds in use (open set; summary() counts anything):
     path-blocked / path-cleared     a path did not answer / answers again (blocked_for_s on the clear)

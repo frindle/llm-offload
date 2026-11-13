@@ -39,7 +39,8 @@ def main():
     (home / "bin").mkdir(parents=True)
     (tmp / "ho").mkdir()
     shutil.copy(SRC, tmp / "handoff-emit.py")
-    (tmp / "signoff.json").write_text(json.dumps({"fffff0000005": {"required": True, "reviewer": "owner",
+    shutil.copy(Path(SRC).parent / "queue_config.py", tmp / "queue_config.py")
+    (home / "bin" / "signoff.json").write_text(json.dumps({"fffff0000005": {"required": True, "reviewer": "owner",
                                                                     "verdict": None, "reason": "t"}}))
     rows = [
         {"id": "fffff0000001", "label": "live-one", "status": "needs_opus", "cwd": "/w/1"},

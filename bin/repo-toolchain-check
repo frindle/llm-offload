@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""repo-toolchain-check: clone each configured repo into a temp dir and run its standard check.
+
+Repo list: config key toolchain.repos (list) or $QUEUE_TOOLCHAIN_REPOS (comma separated).
+Each entry is OWNER/NAME (cloned from GitHub), or a full URL / local path (used as is).
+Token: $GITHUB_TOKEN (never printed; passed to git through a header, not the URL).
+The check is picked from the files in the repo:
+  node    package-lock.json: npm ci, prisma generate (if a schema exists), tsc --noEmit (if tsconfig),
+          npm test (if a test script), and the same for a sidecar/ dir with its own lock file
+  python  requirements.txt / ruff.toml / test_*.py: pip install -r requirements.txt in a venv, py_compile,
+          ruff check (if ruff.toml), pytest (if tests exist)
+  shell   a bash test script named in $QUEUE_TOOLCHAIN_SHELL_TESTS is not guessed; none are run by default
+Prints one PASS/FAIL/SKIP line per repo; exit 1 on any FAIL. Options: --only SUBSTR, --keep.
+"""
+import base64, glob, json, os, shutil, subprocess, sys, tempfile, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import queue_config
+except Exception:
+    queue_config = None
+
+TIMEOUT = int(os.environ.get("QUEUE_TOOLCHAIN_TIMEOUT", "900"))
+
+
+def repos():
+    raw = os.environ.get("QUEUE_TOOLCHAIN_REPOS", "")
+    if raw.strip():
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    if queue_config:
+        return list(queue_config.get_list("toolchain.repos", []) or [])
+    return []
+
+
+def run(cmd, cwd, env, log, shell=False):
+    log.write("$ %s\n" % (cmd if shell else " ".join(cmd)))
+    log.flush()
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, shell=shell, stdout=log, stderr=subprocess.STDOUT,
+                           timeout=TIMEOUT)
+        return p.returncode == 0
+    except subprocess.TimeoutExpired:
+        log.write("TIMEOUT\n")
+        return False
+
+
+def clone(spec, dest, log):
+    if "://" in spec or spec.startswith("/") or spec.startswith("."):
+        url = spec
+    else:
+        url = "https://github.com/%s.git" % spec
+    cmd = ["git"]
+    tok = os.environ.get("GITHUB_TOKEN", "")
+    if tok and url.startswith("https://github.com/"):
+        b = base64.b64encode(("x-access-token:" + tok).encode()).decode()
+        cmd += ["-c", "http.https://github.com/.extraheader=Authorization: Basic " + b]
+    cmd += ["clone", "-q", "--depth", "1", url, dest]
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+    if p.returncode != 0:
+        out = p.stdout.replace(tok, "***") if tok else p.stdout
+        log.write("clone failed: %s\n" % out[-500:])
+        return False
+    return True
+
+
+def node_steps(d, sub=""):
+    base = os.path.join(d, sub) if sub else d
+    steps = [("npm ci", "npm ci --no-audit --no-fund")]
+    try:
+        pkg = json.load(open(os.path.join(base, "package.json")))
+    except Exception:
+        pkg = {}
+    deps = dict(pkg.get("dependencies", {}), **pkg.get("devDependencies", {}))
+    if os.path.exists(os.path.join(base, "prisma", "schema.prisma")) or "prisma" in deps:
+        steps.append(("prisma generate", "DATABASE_URL=file:./ci.db npx prisma generate"))
+    if os.path.exists(os.path.join(base, "tsconfig.json")):
+        steps.append(("tsc", "npx tsc --noEmit"))
+    if "test" in (pkg.get("scripts") or {}):
+        steps.append(("npm test", "npm test"))
+    return [(("%s: " % sub if sub else "") + n, c, base) for n, c in steps]
+
+
+def python_steps(d, env):
+    steps = []
+    py = sys.executable
+    venv = os.path.join(d, ".check-venv")
+    steps.append(("venv", [py, "-m", "venv", "--system-site-packages", venv], d, False))
+    vpy = os.path.join(venv, "bin", "python")
+    if os.path.exists(os.path.join(d, "requirements.txt")):
+        steps.append(("pip install", [vpy, "-m", "pip", "install", "-q", "-r", "requirements.txt"], d, False))
+    steps.append(("tools", [vpy, "-m", "pip", "install", "-q", "pytest", "ruff"], d, False))
+    roots = sorted(glob.glob(os.path.join(d, "*.py")))
+    if roots:
+        steps.append(("py_compile", [vpy, "-I", "-m", "py_compile"] + roots, d, False))
+    if os.path.exists(os.path.join(d, "ruff.toml")):
+        steps.append(("ruff", [vpy, "-m", "ruff", "check", "."], d, False))
+    has_tests = glob.glob(os.path.join(d, "**", "test_*.py"), recursive=True) or \
+        glob.glob(os.path.join(d, "**", "*_test.py"), recursive=True)
+    if has_tests:
+        tdirs = sorted({os.path.relpath(os.path.dirname(p), d) or "." for p in has_tests})
+        steps.append(("pytest", [vpy, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + tdirs, d, False))
+    return steps
+
+
+def check(spec, keep):
+    tmp = tempfile.mkdtemp(prefix="toolchain-")
+    logp = os.path.join(tmp, "check.log")
+    log = open(logp, "w")
+    t0 = time.time()
+    dest = os.path.join(tmp, "repo")
+    verdict, why = "FAIL", ""
+    try:
+        if not clone(spec, dest, log):
+            why = "clone failed"
+        else:
+            env = dict(os.environ)
+            env.pop("GITHUB_TOKEN", None)
+            steps = []
+            if os.path.exists(os.path.join(dest, "package-lock.json")):
+                steps += [(n, c, b, True) for n, c, b in node_steps(dest)]
+                side = os.path.join(dest, "sidecar")
+                if os.path.exists(os.path.join(side, "package-lock.json")):
+                    steps += [(n, c, b, True) for n, c, b in node_steps(dest, "sidecar")]
+            if (os.path.exists(os.path.join(dest, "requirements.txt")) or os.path.exists(os.path.join(dest, "ruff.toml"))
+                    or glob.glob(os.path.join(dest, "**", "test_*.py"), recursive=True)):
+                steps += python_steps(dest, env)
+            if not steps:
+                verdict, why = "SKIP", "no known toolchain files"
+            else:
+                verdict = "PASS"
+                for name, cmd, cwd, shell in steps:
+                    if not run(cmd, cwd, env, log, shell=shell):
+                        verdict, why = "FAIL", "step failed: " + name
+                        break
+    finally:
+        log.close()
+    label = spec if "://" not in spec and not spec.startswith("/") else os.path.basename(spec.rstrip("/"))
+    print("%s %s%s (%ds)" % (verdict, label, (" - " + why) if why else "", time.time() - t0))
+    if verdict == "FAIL":
+        tail = open(logp, errors="replace").read()[-1200:]
+        if os.environ.get("GITHUB_TOKEN"):
+            tail = tail.replace(os.environ["GITHUB_TOKEN"], "***")
+        for ln in tail.splitlines()[-12:]:
+            print("    " + ln)
+    if not keep:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return verdict
+
+
+def main(argv):
+    only = None
+    keep = False
+    a = list(argv)
+    while a:
+        x = a.pop(0)
+        if x == "--only" and a:
+            only = a.pop(0)
+        elif x == "--keep":
+            keep = True
+        else:
+            print(__doc__)
+            return 2
+    rl = [r for r in repos() if not only or only in r]
+    if not rl:
+        print("FAIL no repos configured (toolchain.repos or QUEUE_TOOLCHAIN_REPOS)")
+        return 1
+    res = [check(r, keep) for r in rl]
+    return 1 if "FAIL" in res else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

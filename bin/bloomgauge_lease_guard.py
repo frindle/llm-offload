@@ -3,7 +3,8 @@
 
 If the queue daemon died while it held BloomGauge's Manager off (real lease file
 ~/.ollama-dispatch/bloomgauge-lease.json with a heartbeat older than QUEUE_BG_LEASE_TTL_S and a
-dead daemon_pid), hand the Manager back the way the daemon would (same waits, same budget, same
+dead daemon_pid, or none: the Mac status service runs the step for a queue elsewhere and saves no pid),
+hand the Manager back the way the daemon would (same waits, same budget, same
 yield to a manual change), log it to the ledger with cause=deadman and clear the lease. Never
 acts on the shadow lease; never runs darkbloom, launchctl or touches provider.toml. Meant for a
 com.example.* LaunchAgent every few minutes (com.example.bloomgauge-lease-guard, every 300 s). Run: python3 bloomgauge_lease_guard.py  -> prints the decision as JSON.

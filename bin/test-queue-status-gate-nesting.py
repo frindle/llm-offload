@@ -103,6 +103,7 @@ def parse(out):
 def mutated_copy(src_text, tmpdir):
     p = Path(tmpdir) / "ollama-queue-flat.py"
     p.write_text(src_text)
+    (Path(tmpdir) / "queue_config.py").write_text((QUEUE.parent / "queue_config.py").read_text())
     return p
 
 

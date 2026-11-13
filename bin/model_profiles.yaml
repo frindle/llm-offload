@@ -134,7 +134,7 @@ thinking_policy:
 #     0.4 / 1.2 values already used by ollama-worker.py's output-cap recovery turn (itself unvalidated);
 #     repetition_penalty 1.2 is OUTSIDE the card's 1.0. Temperature 0.8 sits between the card's coding
 #     (0.6) and general-thinking (1.0) presets.
-#   * step 2 presence_penalty 1.0 with thinking off (hybrid thinking arm only) -- WEAK: the owner's proposal;
+#   * step 2 presence_penalty 1.0 with thinking off (hybrid thinking arm only) -- WEAK: the operator's proposal;
 #     1.0 is inside the 0-2 range of the 14B card and below the card's non-thinking 1.5.
 # Roles it may touch are `roles:`; reviewers/gates already run the non-thinking preset.
 sampling_escalation:
@@ -146,7 +146,7 @@ sampling_escalation:
     2: {presence_penalty: 1.0, thinking: off, requires_thinking_arm: hybrid, fresh_seed: true}
 
 # Escalation (bigger-model) steps: ordered models per role. NOT hardcoded anywhere else (the queue's
-# N-sample escalation reads this via model_profile.escalation_models). The owner 2026-10-09: any model he
+# N-sample escalation reads this via model_profile.escalation_models). operator 2026-10-09: any model he
 # can host on Darkbloom is allowed. A model must have a `models:` entry (card + sha) to be listed.
 # The model that just failed is skipped. While bloom_control holds the queue's PAIR only
 # (Qwen3.5-9B + qwen3.6-35b-a3b), an escalation model outside the pair needs the pair widened first:

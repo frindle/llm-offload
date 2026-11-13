@@ -58,6 +58,11 @@ only waiting on a CPU stage does not hold the GPU lanes (see
 ollama-queue.py bundle_commit_status `cpu_wait`).  Local-fallback stages register
 a `local` marker row (begin_local/end_local) so they count the same way.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import base64
 import contextlib
 import hashlib
@@ -1122,7 +1127,7 @@ def lan_ip():
         pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("192.0.2.217", 1))
+        s.connect(("192.0.2.1", 1))   # no packet is sent; picks the default-route address
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -1237,8 +1242,27 @@ def _local_json_path():
                 or (Path.home() / ".darkbloom" / "local.json"))
 
 
+def _configured_upstream_hosts():
+    """Exact IP addresses the operator named in `darkbloom.upstream_hosts` (a list): the model server runs on
+    another machine (the container case), so its address is allowed besides loopback. Empty by default."""
+    out = set()
+    for h in queue_config.get_list("darkbloom.upstream_hosts", [], env="DARKBLOOM_UPSTREAM_HOSTS"):
+        try:
+            out.add(str(ipaddress.ip_address(str(h).strip())))
+        except ValueError:
+            pass                           # exact IPs only: no names, no ranges
+    try:                                   # the Darkbloom endpoint's own address (env / local.json / config)
+        eh = urllib.parse.urlsplit(queue_config.darkbloom_endpoint()[0]).hostname
+        if eh:
+            out.add(str(ipaddress.ip_address(eh)))
+    except ValueError:
+        pass
+    return out
+
+
 def _loopback_base(b):
-    """The endpoint root (no /v1) when `b` is a plain http(s) URL on this host (a loopback address or localhost),
+    """The endpoint root (no /v1) when `b` is a plain http(s) URL on this host (a loopback address or localhost)
+    or on a configured upstream IP (`darkbloom.upstream_hosts`),
     else None: the key is only ever sent to such a URL."""
     try:
         u = urllib.parse.urlsplit(str(b or "").strip())
@@ -1249,7 +1273,7 @@ def _loopback_base(b):
             or u.query or u.fragment or not u.hostname:
         return None
     host = u.hostname.lower()
-    if host != "localhost":
+    if host != "localhost" and host not in _configured_upstream_hosts():
         try:
             if not ipaddress.ip_address(host).is_loopback:
                 return None
@@ -1270,11 +1294,15 @@ def llm_upstream():
     try:
         txt = _local_json_path().read_text()
     except OSError:
-        return None, None
+        if not (os.environ.get("DARKBLOOM_API_KEY") or os.environ.get("DARKBLOOM_BASE_URL")):
+            return None, None
+        txt = "{}"               # no vendor file (the container): the environment names the endpoint
     try:
         rec = json.loads(txt)
     except ValueError:
         rec = None
+    if isinstance(rec, dict):
+        rec = queue_config.darkbloom_apply_env(rec)
     now = time.monotonic()
     with _llm_lock:
         if not isinstance(rec, dict):
@@ -1286,7 +1314,7 @@ def llm_upstream():
     key = rec.get("api_key") if isinstance(rec.get("api_key"), str) and rec.get("api_key") else None
     b = str(rec.get("base_url") or "").strip()
     if not b and key:
-        b = os.environ.get("DARKBLOOM_BASE_URL") or "http://127.0.0.1:8000"
+        b = queue_config.darkbloom_default_base()
     base = _loopback_base(b) if b else None
     return (base, key) if base else (None, None)
 

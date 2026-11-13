@@ -31,6 +31,9 @@
 !diagnose-verify
 !graphify-all
 !offload-repo-sync
+!queue-cutover
+!queue-backtest
+!repo-toolchain-check
 !logq
 # never
 *.bak*

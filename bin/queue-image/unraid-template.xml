@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<!-- Unraid template for the queue container. Real values (IP, MAC, appdata pool, tokens) are entered on the server only.
+     Values written CHANGE-ME are placeholders. -->
+<Container version="2">
+  <Name>ollama-queue</Name>
+  <Repository>ghcr.io/CHANGE-ME-owner/CHANGE-ME-repo:latest</Repository>
+  <Registry>https://github.com/CHANGE-ME-owner/CHANGE-ME-repo/pkgs/container/CHANGE-ME-repo</Registry>
+  <Network>br0</Network>
+  <MyIP>CHANGE-ME-QUEUE-IP</MyIP>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/CHANGE-ME-owner/CHANGE-ME-repo/issues</Support>
+  <Project>https://github.com/CHANGE-ME-owner/CHANGE-ME-repo</Project>
+  <Overview>The job queue: daemon, dashboard and API (port 7684), CPU job lane, event log and watchers, run by supervisord. Fixed LAN identity via br0 (IP in the Network field, MAC in Extra Parameters). State, locks and the sqlite lane store need a real local filesystem: use the cache pool, never /mnt/user. The daemon needs up to 60 s to stop cleanly, hence the stop timeout.</Overview>
+  <Category>Tools: Other:</Category>
+  <WebUI>http://[IP]:[PORT:7684]/</WebUI>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--restart=unless-stopped --mac-address=CHANGE-ME-QUEUE-MAC --stop-timeout=90 --log-opt max-size=20m --log-opt max-file=3 --health-cmd='curl -fsS -o /dev/null http://127.0.0.1:7684/' --health-interval=30s --health-timeout=10s --health-start-period=90s --health-retries=3</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <Config Name="Standby" Target="QUEUE_STANDBY" Default="1" Mode="" Description="1 = standby: only the API runs on a copy of the Mac state, write routes answer 503, nothing notifies. Set 0 and restart to go live." Type="Variable" Display="always" Required="true" Mask="false">1</Config>
+  <Config Name="Time zone" Target="TZ" Default="" Mode="" Description="Container time zone, for example Area/City. The log-rotate job runs at 04:17 in it." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Git author name" Target="GIT_AUTHOR_NAME" Default="" Mode="" Description="Name on commits the workers make." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Git author email" Target="GIT_AUTHOR_EMAIL" Default="" Mode="" Description="Email on commits the workers make." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="GitHub token" Target="GITHUB_TOKEN" Default="" Mode="" Description="Fine-grained token limited to the target repos (contents: write). Clone and push use it." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Darkbloom base URL" Target="DARKBLOOM_BASE_URL" Default="" Mode="" Description="Darkbloom local API on the Mac, http://MAC-LAN-IP:8000." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Darkbloom API key" Target="DARKBLOOM_API_KEY" Default="" Mode="" Description="Key for the Darkbloom local API." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Queue agent URL" Target="QUEUE_AGENT_URL" Default="" Mode="" Description="Mac status service, http://MAC-LAN-IP:7691." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Queue agent token" Target="QUEUE_AGENT_TOKEN" Default="" Mode="" Description="Bearer token for the Mac status service." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Queue API token" Target="QUEUE_API_TOKEN" Default="" Mode="" Description="Bearer token for the API's write routes. The Mac clients send the same token." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="CPU runner token" Target="CPU_RUNNER_TOKEN" Default="" Mode="" Description="Shared token the CPU runners use. Written to ~/.config/dispatch-cpu-runner/token at start." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Obsidian token" Target="OBSIDIAN_TOKEN" Default="" Mode="" Description="Obsidian Local REST API token for the vault dispatch log (optional)." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Tavily key" Target="TAVILY_API" Default="" Mode="" Description="Tavily search key (optional)." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Brave search key" Target="BRAVE_SEARCH_API" Default="" Mode="" Description="Brave search key (optional)." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Ollama web search key" Target="OLLAMA_WEB_SEARCH" Default="" Mode="" Description="Ollama hosted web-search bearer (optional)." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="API port" Target="7684" Default="7684" Mode="tcp" Description="Queue API and dashboard." Type="Port" Display="advanced" Required="true" Mask="false">7684</Config>
+  <Config Name="State" Target="/home/queue/state" Default="/mnt/cache/appdata/ollama-queue/state" Mode="rw" Description="State JSON, locks, queue logs. Cache pool only (flock)." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/ollama-queue/state</Config>
+  <Config Name="Dispatch data" Target="/home/queue/.ollama-dispatch" Default="/mnt/cache/appdata/ollama-queue/ollama-dispatch" Mode="rw" Description="Chain runs, escalations, CPU lane sqlite and blobs, hosts.json. Cache pool only (sqlite WAL)." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/ollama-queue/ollama-dispatch</Config>
+  <Config Name="Worktrees" Target="/home/queue/dispatch-worktrees" Default="/mnt/cache/appdata/ollama-queue/dispatch-worktrees" Mode="rw" Description="Job worktrees. Large; git needs a real filesystem." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/ollama-queue/dispatch-worktrees</Config>
+  <Config Name="Logs" Target="/home/queue/Library/Logs" Default="/mnt/cache/appdata/ollama-queue/logs" Mode="rw" Description="API and supervisord logs." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/ollama-queue/logs</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/cache/appdata/ollama-queue/config" Mode="ro" Description="Holds config.toml (hosts, addresses, names)." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/ollama-queue/config</Config>
+</Container>

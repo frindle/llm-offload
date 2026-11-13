@@ -1,0 +1,42 @@
+# Runs the PUBLISHED queue image on Unraid's br0 macvlan with a fixed LAN identity (runner style).
+# Deploy dir on Unraid: ${QUEUE_APPDATA} with this file and a .env beside it (see env.example).
+# QUEUE_IP, QUEUE_MAC, QUEUE_IMAGE and QUEUE_APPDATA have no defaults: compose refuses to start without them.
+# Normally installed from unraid-template.xml instead; this is the equivalent.
+services:
+  queue:
+    image: ${QUEUE_IMAGE:?set QUEUE_IMAGE in .env}
+    pull_policy: always
+    container_name: ollama-queue
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:?set TZ in .env}
+    volumes:
+      # All on the cache pool (local disk): flock and sqlite WAL need a real filesystem. entrypoint.sh refuses NFS/SMB/FUSE.
+      - ${QUEUE_APPDATA:?set QUEUE_APPDATA in .env}/state:/home/queue/state                         # QUEUE_STATE_DIR: state JSON, locks, queue logs
+      - ${QUEUE_APPDATA}/ollama-dispatch:/home/queue/.ollama-dispatch                               # chain runs, escalations, CPU lane sqlite, hosts.json
+      - ${QUEUE_APPDATA}/dispatch-worktrees:/home/queue/dispatch-worktrees                          # job worktrees (large)
+      - ${QUEUE_APPDATA}/logs:/home/queue/Library/Logs                                              # API and supervisord logs
+      - ${QUEUE_APPDATA}/config:/config:ro                                                          # config.toml
+    networks:
+      lan:
+        ipv4_address: ${QUEUE_IP:?set QUEUE_IP in .env}
+    mac_address: ${QUEUE_MAC:?set QUEUE_MAC in .env}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:7684/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    # The daemon gets 60 s to finish on SIGTERM (supervisord stopwaitsecs); never SIGKILL it early.
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    # Resource limits: not decided yet (README, open questions). Example:
+    # cpus: 8
+    # mem_limit: 16g
+networks:
+  lan:
+    external: true
+    name: br0

@@ -18,6 +18,11 @@ AUTO    the same code runs the same approve step itself when every mechanical ga
 Other commands: list | show | revert | go | scan | ingest | summary | stats | mode | breaker | tick
 Research basis: ~/.ollama-dispatch/merge-queue/2026-10-09-autoland-research.md
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import contextlib
 import fcntl
@@ -46,7 +51,7 @@ KILL_FILE = LANDING / "KILL"
 LEDGER = LANDING / "ledger.jsonl"
 READY_MD = ROOT / "escalations" / "READY-TO-LAND.md"
 ESC_MD = ROOT / "escalations" / "ESCALATIONS.md"
-QLOGS = Path(os.environ.get("LAND_QLOGS") or (Path.home() / "bin" / "ollama-queue-logs"))
+QLOGS = Path(os.environ.get("LAND_QLOGS") or (queue_config.state_dir() / "ollama-queue-logs"))
 SLICE_RUNS = ROOT / "slice-runs"
 STATES_PENDING = ("awaiting_final_review",)
 

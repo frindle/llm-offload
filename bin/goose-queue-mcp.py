@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MCP stdio server: the ONLY tool surface the Unraid-hosted Goose chat gets.
 
-The owner 2026-10-01: chat runs on Unraid (qwen3:14b, num_ctx pinned to the pregate's
+operator 2026-10-01: chat runs on Unraid (qwen3:14b, num_ctx pinned to the pregate's
 UNRAID_CONFIRMED_SAFE_CTX value so Ollama never reloads), and EVERY investigation /
 coding / research task is dispatched to the Studio queue instead of being done in the
 chat turn. So the chat model does not need a developer/shell/edit/write/vault/ollama
@@ -10,7 +10,7 @@ read verbs ("what is the queue doing", "what did job X say").
 
 WHY THE SCHEMAS ARE THIS SMALL
   Goose 1.50.0 sends every enabled tool's JSON schema on EVERY request. Measured on
-  The owner's box: the default profile's 29 tool definitions were 19,235 chars (~5.5k tokens)
+  the operator's box: the default profile's 29 tool definitions were 19,235 chars (~5.5k tokens)
   of a 28,784-char request -- which does not fit a 6144-token window at all, let alone
   leave room to talk. Every word of description here is paid for on every single turn,
   so the descriptions are terse ON PURPOSE. Do not "improve" them into prose.
@@ -26,6 +26,11 @@ The client's protocolVersion is echoed back, so this keeps working across MCP re
 Run (goose launches it; this is only for poking at it by hand):
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 ~/bin/goose-queue-mcp.py
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import json
 import os
 import re
@@ -37,10 +42,10 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("GOOSE_QUEUE_HOME") or Path.home())
 QUEUE = HOME / "bin" / "ollama-queue.py"
-STATE = HOME / "bin" / "ollama-queue-state.json"
+STATE = queue_config.state_dir() / "ollama-queue-state.json"
 SPOOL = Path(os.environ.get("GOOSE_QUEUE_SPOOL") or (HOME / ".cache" / "goose-dispatch"))
 
-# The Darkbloom lane. Hard-coded rather than guessed per call: the owner's standing rule is
+# The Darkbloom lane. Hard-coded rather than guessed per call: the operator's standing rule is
 # that all dispatched work goes to the one studio-db lane, so a chat turn cannot
 # accidentally aim a job at Unraid and evict the chat model it is talking to.
 LANE = "studio-db"
@@ -172,7 +177,7 @@ def queue_status(_args):
 
     Parsed from `status` rather than the state file so the human and the model see the
     SAME rows, and filtered to the live ones: `status` prints every retained done/failed
-    row too (hundreds, on the owner's box), which is a worklist for a human at a terminal and
+    row too (hundreds, on the operator's box), which is a worklist for a human at a terminal and
     pure window-burn for a 6144-token chat model."""
     rc, out, err = _run(["status"])
     if rc != 0 and not out:

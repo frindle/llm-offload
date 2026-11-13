@@ -65,14 +65,17 @@ def toml_enabled():
 
 
 def base_key():
+    sys.path.insert(0, E("DBAPPLY_CODE_DIR", str(H / "bin")))
+    import queue_config
     try:
-        j = json.loads(LOCAL.read_text())
-        base = str(j.get("base_url") or "http://127.0.0.1:8000").rstrip("/")
+        j = queue_config.darkbloom_apply_env(json.loads(LOCAL.read_text()))   # env DARKBLOOM_* laid over local.json
+        base = str(j.get("base_url") or queue_config.darkbloom_default_base()).rstrip("/")
         if base.endswith("/v1"):    # real local.json carries ".../v1"; every caller appends "/v1/..." itself
             base = base[:-3]
         return base, str(j.get("api_key") or j.get("key") or "")
     except (OSError, ValueError):
-        return "http://127.0.0.1:8000", ""
+        env = queue_config.darkbloom_apply_env({})
+        return str(env.get("base_url") or "http://127.0.0.1:8000").rstrip("/"), str(env.get("api_key") or "")
 
 
 def http(path, body=None, timeout=20):
@@ -108,8 +111,14 @@ def resident():
 def queue_jobs():
     """-> (running, pending) counts, or None if the queue state is unreadable (treated as busy)."""
     try:
-        jobs = json.loads(QSTATE.read_text()).get("jobs", [])
-    except (OSError, ValueError, AttributeError):
+        if str(H / "bin") not in sys.path:
+            sys.path.append(str(H / "bin"))
+        import queue_config  # the state file here, GET /api/state when the queue runs elsewhere
+        st = queue_config.load_queue_state(QSTATE)
+        jobs = st.get("jobs", []) if isinstance(st, dict) else None
+    except (ImportError, AttributeError):
+        return None
+    if jobs is None:
         return None
     if isinstance(jobs, dict):
         jobs = list(jobs.values())

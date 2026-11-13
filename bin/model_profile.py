@@ -636,7 +636,8 @@ def live_model_ids(rec, timeout=2.0):
         else:
             base = ""
         if not base and rec.get("api_key"):
-            base = "http://127.0.0.1:8000"
+            import queue_config
+            base = queue_config.darkbloom_default_base()
         if base.endswith("/v1"):
             base = base[:-len("/v1")]
         if not base.startswith("http"):

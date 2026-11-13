@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deliver queue events (<dir>/queue-events.jsonl, written by com.example.queue-event-log) to
+"""Deliver queue events (<dir>/queue-events.jsonl, written by com.the operator.queue-event-log) to
 the Claude session that should act on them.
 
   (default)   hook backend (PostToolUse/UserPromptSubmit via queue-events-inject.sh): read
@@ -26,14 +26,23 @@ delivers nothing and advances nothing: the events stay for the main session.
 Env: QEL_DIR, QEL_STATE_PATH, QEL_LOG_DIR, QEL_STATUS_CMD (fallback only), QEW_IDLE_EXIT_S,
 QEW_POLL_S, QEW_LOCK_WAIT_S.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import contextlib, fcntl, json, os, re, subprocess, sys, time
 
 DIR = os.environ.get("QEL_DIR") or os.path.expanduser("~/.ollama-dispatch")
-STATE_PATH = os.environ.get("QEL_STATE_PATH") or os.path.expanduser("~/bin/ollama-queue-state.json")
-LOG_DIR = os.environ.get("QEL_LOG_DIR") or os.path.expanduser("~/bin/ollama-queue-logs")
+STATE_PATH = os.environ.get("QEL_STATE_PATH") or str(queue_config.state_dir() / "ollama-queue-state.json")
+LOG_DIR = os.environ.get("QEL_LOG_DIR") or str(queue_config.state_dir() / "ollama-queue-logs")
 P = lambda n: os.path.join(DIR, n)
 NOT_IN_FLIGHT = {"done", "passed", "pass", "needs-review", "failed", "blocked", "needs_opus", "cancelled",
                  "done_unconverged", "error", "resolved"}
+# the queue API as the hook's reader reaches it: loopback needs no token; any other address (the container) needs one
+_QA_BASE, _QA_TOKEN = queue_config.queue_api()
+_CLEAR_CURL_PREFIX = (_QA_BASE + ' -H "Authorization: Bearer $(cat ~/.config/ollama-queue/queue-api-token)"'
+                      if _QA_TOKEN and queue_config.queue_is_remote() else _QA_BASE)
 HEADER = ("QUEUE EVENTS for this session (passed/done: review the result; passed with review=: this pass is in the 1-in-5 "
           "quality sample (the only check on false PASSes): before landing it, run the `review=` command shown and do the review it "
           "describes in THIS session or a Sonnet subagent of it (no API, no `claude -p`), then record the verdict with the "
@@ -47,7 +56,7 @@ HEADER = ("QUEUE EVENTS for this session (passed/done: review the result; passed
           "`~/bin/mini-finish <id>` shown, edit the files it lists in place, then `~/bin/mini-finish <id> --check` "
           "in the background; its PASS queues any remaining chain steps locally and resolves + clears the job; "
           "other failed/blocked/gate_nonpass: triage, then `python3 ~/bin/ollama-queue.py resolve <id>` and "
-          "`curl -s -X POST http://127.0.0.1:7684/api/runs/<id>/clear` in the same step; "
+          "`curl -s -X POST " + _CLEAR_CURL_PREFIX + "/api/runs/<id>/clear` in the same step; "
           "needs_info: answer the job's NEEDS.md):")
 
 
@@ -422,10 +431,11 @@ def inflight(me):
     jobs included). -1 when the queue state is unreadable."""
     if not me:
         return 0
-    try:
-        jobs = [j for j in json.load(open(STATE_PATH)).get("jobs", []) if isinstance(j, dict)]
-    except Exception:
+    d = queue_config.load_queue_state(STATE_PATH)      # the container's state via the API after the cutover
+    jobs = d.get("jobs") if isinstance(d, dict) else None
+    if not isinstance(jobs, list):
         return -1
+    jobs = [j for j in jobs if isinstance(j, dict)]
     by_id = {j.get("id"): j for j in jobs}
     n = 0
     for j in jobs:

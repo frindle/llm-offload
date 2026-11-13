@@ -76,6 +76,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import queue_config  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 
 # ---- bounds ----------------------------------------------------------------
@@ -333,7 +336,9 @@ def _unraid_graphql(query: str, variables: dict, src: dict, timeout: int) -> dic
     """Read-only GraphQL query against Unraid. Credentials come from the
     catalog's `key_from` (a JSON file + dotted path), never from the request."""
     import urllib.request
-    url = src.get("url") or "https://unraid.example.com/graphql"
+    url = src.get("url") or queue_config.get_str("diagnostics.unraid_graphql_url", "")
+    if not url:
+        raise Refused("no Unraid GraphQL url: set src.url in the catalog or diagnostics.unraid_graphql_url in the queue config")
     key_from = src.get("key_from") or {}
     creds = json.loads(Path(os.path.expanduser(key_from.get("file", "~/.claude.json"))).read_text())
     for part in (key_from.get("path") or "mcpServers.unraid.env.UNRAID_API_KEY").split("."):

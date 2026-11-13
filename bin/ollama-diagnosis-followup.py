@@ -46,6 +46,11 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config  # noqa: E402  (the queue state wherever the queue runs: load_queue_state)
 
 LOG_DIR = Path(os.path.expanduser("~/bin/ollama-queue-logs"))
 DISPATCH_AUTO = Path(os.path.expanduser("~/bin/ollama-dispatch-auto"))
@@ -108,12 +113,8 @@ def _record_from_queue_state(job_id, state_path=None):
     record at all. Keying anything on done.json alone silently misses them (found
     live -- --scan reported 0 of 55). The queue state is the next-best durable
     source for label/repo/cwd."""
-    p = Path(state_path or QUEUE_STATE)
-    if not p.is_file():
-        return None
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
+    data = queue_config.load_queue_state(state_path or QUEUE_STATE)
+    if data is None:
         return None
     jobs = data.get("jobs", data) if isinstance(data, dict) else data
     if isinstance(jobs, dict):
