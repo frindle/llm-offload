@@ -78,7 +78,10 @@ def run(j):
         tail = open(log, "rb").read().decode("utf-8", "replace").splitlines()[-%(tail)d:]
         if rc == 124: tail.append("[gate] timed out after %(timeout)d s")
     except Exception as e:
-        rc, tail = 125, ["[gate] runner error: %%r" %% (e,)]
+        import traceback
+        fr = traceback.extract_tb(e.__traceback__)[-1]
+        rc, tail = 125, ["[gate] runner error: %%r file=%%r (runner line %%d: %%s)"
+                         %% (e, getattr(e, "filename", None), fr.lineno, (fr.line or "").strip()[:80])]
     finally:
         shutil.rmtree(h, ignore_errors=True)
     return (name if sub == "bin" else sub + "/" + name), rc, tail

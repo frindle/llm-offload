@@ -190,6 +190,55 @@ def fingerprint_livelog(path):
     }
 
 
+# A job whose worker never ran an iteration (queue: class=harness, "worker produced no iterations")
+# usually died on something outside the model's code: Darkbloom held for sandbox work, a dropped
+# connection, a GPU out of memory, a model name the host doesn't have, a document that can't be read.
+# Its livelog's LAST error line says which. (cause, kind, regex) -- first match per line wins, and the
+# scan runs from the end of the log, so the fatal error counts, not an earlier one the worker survived.
+_FATAL = (
+    ("darkbloom-unreachable", "infra", re.compile(r"darkbloom unreachable")),
+    ("provider-capacity", "infra", re.compile(r"Provider capacity is temporarily unavailable")),
+    ("provider-error", "infra", re.compile(r"Internal inference failure")),
+    ("gpu-oom", "env", re.compile(r"\bout of memory\b")),
+    ("model-not-found", "env", re.compile(r"""model ['"][^'"]+['"] not found""")),
+    ("token-repeat-limit", "model", re.compile(r"token repeat limit")),
+    ("transport-error", "infra", re.compile(
+        r"^(?:\[[^\]]*\]\s*)*(?:(?:\w+\.)*(?:TimeoutError|RemoteDisconnected|ConnectionResetError"
+        r"|ConnectionRefusedError|URLError)|(?:\w+\.)+timeout):"
+        r"|<urlopen error .*(?:timed out|Connection refused|Connection reset)")),
+    ("docsum", None, re.compile(r"\[docsum\] job=\S+ FAIL code=(E_[A-Z_]+)")),
+)
+_DOCSUM_INPUT = {"E_SCANNED_NO_OCR", "E_NOT_PDF", "E_TOO_BIG", "E_TOO_MANY_PAGES", "E_NOT_FOUND",
+                 "E_BAD_UPLOAD", "E_SCENARIO_TOO_LONG"}
+_DOCSUM_INFRA = {"E_TIMEOUT", "E_EXTRACT_TIMEOUT"}
+# Transient infra causes: nothing in the job or its code to fix, so no triage packet (the queue's
+# Darkbloom wait / requeue is the remedy). env/model/input causes still get one.
+TRANSIENT = ("darkbloom-unreachable", "provider-capacity", "provider-error", "transport-error")
+
+
+def livelog_fatal(path, tail_n=60):
+    """{cause, kind, line} for the last fatal error in the livelog's tail, {} when none / unreadable.
+    PURE parse. kind: infra | env | model | input | harness."""
+    try:
+        text = _ANSI.sub("", Path(path).read_text(errors="replace"))
+    except Exception:
+        return {}
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][-tail_n:]
+    for ln in reversed(lines):
+        if ln.startswith(("raise ", 'File "')):
+            continue        # traceback source lines quote the message text without being the error
+        for cause, kind, rx in _FATAL:
+            m = rx.search(ln)
+            if not m:
+                continue
+            if cause == "docsum":
+                code = m.group(1)
+                cause = "docsum:" + code
+                kind = "input" if code in _DOCSUM_INPUT else ("infra" if code in _DOCSUM_INFRA else "harness")
+            return {"cause": cause, "kind": kind, "line": redact(ln)[:200]}
+    return {}
+
+
 # --------------------------------------------------------------------------- run-log scrape
 def scrape_runlog(path, tail_n=40):
     """FAILED CASE lines, last N lines of the worker's verify output, literal-cap/lint
@@ -263,6 +312,10 @@ def classify(rec, fp, scrape):
     rewrites = (fp or {}).get("rewrites") or {}
     if reason in ("force_stopped", "cancelled") or cls == "operator" or "force stopped" in detail:
         tags.append("operator-stop")
+    # The worker never ran an iteration and its livelog ends on a known outside cause.
+    fatal = (fp or {}).get("fatal") or {}
+    if fatal.get("cause") and not (fp or {}).get("iterations"):
+        tags.append(fatal["cause"])
     # Phase 3 worker_robust named exit reasons (ollama-worker.py TERMINAL REASON).
     if reason == "repeated_format_error":
         tags.append("format-error-loop")
@@ -444,8 +497,13 @@ def build_row(job_id, rec=None):
     live = rec.get("live_log_path") or next(iter(LIVELOGS.glob(f"{job_id}-*.livelog")), None)
     runlog = rec.get("log_path") or next(iter(QUEUE_LOGS.glob(f"{job_id}-*.log")), None)
     fp = fingerprint_livelog(live) if live else {}
+    if live and not fp.get("iterations"):
+        fatal = livelog_fatal(live)
+        if fatal:
+            fp["fatal"] = fatal
     sc = scrape_runlog(runlog) if runlog else {"failed_cases": [], "verify_tail": [], "lint": [], "transcript": None}
     sig, tags = classify(rec, fp, sc)
+    cause_kind = (fp.get("fatal") or {}).get("kind") if sig == (fp.get("fatal") or {}).get("cause") else None
     fpub = {k: v for k, v in fp.items() if k != "reads"}
     ts = rec.get("persisted_at")
     if not ts:
@@ -469,7 +527,7 @@ def build_row(job_id, rec=None):
         "lint": sc["lint"],
         "paths": {"livelog": str(live) if live else None, "runlog": str(runlog) if runlog else None,
                   "transcript": sc.get("transcript") or rec.get("resume_transcript")},
-        "signature": sig, "tags": tags,
+        "signature": sig, "tags": tags, "cause_kind": cause_kind,
     }
     return row
 

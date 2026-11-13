@@ -84,6 +84,43 @@ chk("counter: a human-retry window forgives, lifetime does not", c2["jobs_window
 h = fl.signature_hint("bun", "s4")
 chk("hint fires when the last two failures of the slice share a signature", "read-loop:auto-harness-check.py" in h and "READING" in h)
 chk("hint silent when they differ", fl.signature_hint("bun", "s5") == "")
+# fatal outside causes of workers that never ran an iteration (2026-11-13; real shapes from the ledger)
+def mkfatal(jid, label, text, iters=0):
+    (T/"q"/f"{jid}.done.json").write_text(json.dumps({"id": jid, "label": label, "status": "failed", "exit_code": 1,
+        "terminal_reason": "", "failure_class": "harness", "failure_detail": "worker produced no iterations (exit 1)",
+        "persisted_at": "2026-11-10T06:00:00Z", "model": "m"}))
+    pre = "".join(f"[10:00:{i:02d}] [{jid}] \x1b[2m── iteration {i}/24 ──\x1b[0m\n[10:00:{i:02d}] [{jid}] -> calling read_file(path='a.py')\n"
+                  for i in range(1, iters + 1))
+    (T/"l"/f"{jid}-{label}.livelog").write_text(pre + text)
+    (T/"q"/f"{jid}-{label}.log").write_text("")
+    return fl.build_row(jid)
+TB = ('Traceback (most recent call last):\n  File "/x/darkbloom_chat.py", line 463, in chat\n'
+      '    raise RuntimeError(f"darkbloom unreachable: {e}") from None\n')
+r = mkfatal("bbbb00000001", "docsum-6275d1cb", "[docsum] job=6275d1cb start model=x\n[docsum] job=6275d1cb FAIL code=E_SCANNED_NO_OCR\n")
+chk("fatal: docsum scanned PDF -> docsum:E_SCANNED_NO_OCR, kind input", r["signature"] == "docsum:E_SCANNED_NO_OCR" and r["cause_kind"] == "input")
+r = mkfatal("bbbb00000002", "bench-review-q36t-b1-blind-x", TB + "RuntimeError: darkbloom unreachable: <urlopen error [Errno 61] Connection refused>\n")
+chk("fatal: darkbloom traceback -> darkbloom-unreachable, kind infra", r["signature"] == "darkbloom-unreachable" and r["cause_kind"] == "infra"
+    and r["fingerprint"]["fatal"]["line"].startswith("RuntimeError: darkbloom unreachable"))
+r = mkfatal("bbbb00000003", "bench-review-g4t-b1-blind-y", "TimeoutError: timed out\nretrying\n"
+            'RuntimeError: ollama HTTP 500: {"error":"prediction aborted, token repeat limit reached"}\n')
+chk("fatal: the LAST error wins (token-repeat-limit, kind model)", r["signature"] == "token-repeat-limit" and r["cause_kind"] == "model")
+r = mkfatal("bbbb00000004", "bench-review-g3-b1-blind-z", 'RuntimeError: ollama HTTP 500: {"error":"CUDA error: out of memory"}\n')
+chk("fatal: CUDA out of memory -> gpu-oom, kind env", r["signature"] == "gpu-oom" and r["cause_kind"] == "env")
+r = mkfatal("bbbb00000005", "bench-review-g4t-b1-blind-w", "urllib.error.URLError: <urlopen error [Errno 60] Operation timed out>\n")
+chk("fatal: urlopen timeout -> transport-error", r["signature"] == "transport-error")
+r = mkfatal("bbbb00000006", "bench-review-q-v", TB + "KeyError: 'choices'\n")
+chk("fatal: a traceback SOURCE line quoting the message is not the error", r["signature"] == "model-nonconvergence-other"
+    and r["cause_kind"] is None and "fatal" not in r["fingerprint"])
+r = mkfatal("bbbb00000007", "auto-author-bun-s11", "timeout=30 set for verify\n")
+chk("fatal: a plain 'timeout=' log line is not a transport error", r["signature"] == "model-nonconvergence-other")
+r = mkfatal("bbbb00000008", "auto-author-bun-s12", "RuntimeError: darkbloom unreachable: Remote end closed\n", iters=3)
+chk("fatal: a worker that ran iterations is NOT re-signed by its last line", r["signature"] != "darkbloom-unreachable"
+    and "fatal" not in r["fingerprint"])
+_tps = importlib.util.spec_from_file_location("tp_t", os.environ.get("TP_SRC") or SRC.parent / "triage_packets.py")
+tp = importlib.util.module_from_spec(_tps); _tps.loader.exec_module(tp)
+g = tp._groups([{"job_id": "x1", "signature": "darkbloom-unreachable"}, {"job_id": "x2", "signature": "transport-error"},
+                {"job_id": "x3", "signature": "gpu-oom"}, {"job_id": "x4", "signature": "docsum:E_SCANNED_NO_OCR"}])
+chk("triage: transient infra causes get no packet; env/input causes do", sorted(g) == ["docsum:E_SCANNED_NO_OCR", "gpu-oom"])
 # fail-open
 os.environ["FAILURE_LEDGER"] = "/proc/definitely/not/writable/f.jsonl"
 fl.LEDGER = Path("/proc/definitely/not/writable/f.jsonl")

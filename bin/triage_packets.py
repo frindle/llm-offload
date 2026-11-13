@@ -35,7 +35,10 @@ INDEX = DIR / "index.json"
 PLANS = Path(os.environ.get("TRIAGE_PLANS") or HOME / ".ollama-dispatch" / "slice-plans")
 WORKTREES = Path(os.environ.get("TRIAGE_WORKTREES") or HOME / ".ollama-dispatch" / "worktrees")
 OUTCOMES = ("FIXED", "ESCALATED", "WONTFIX")
-SKIP = ("operator-stop", "cancelled")
+# operator stops, plus the failure ledger's transient infra causes (Darkbloom held / unreachable, provider
+# capacity, dropped connections): nothing in the job or its code to fix, the queue's wait/requeue is the remedy.
+SKIP = ("operator-stop", "cancelled",
+        "darkbloom-unreachable", "provider-capacity", "provider-error", "transport-error")
 
 FIX_STANDARD = """\
 REQUIRED FIX STANDARD (non-negotiable)

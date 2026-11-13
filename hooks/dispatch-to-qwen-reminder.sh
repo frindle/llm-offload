@@ -16,6 +16,8 @@
 # 2026-11-13: routing text changed by ~/bin/install-coding-route.py (issue-driven fixes -> Sonnet; local
 # model only with a check that exists before the job). Undo: python3 -I ~/bin/install-coding-route.py --uninstall
 input="$(cat)"
+# subagent guard: these reminders are for the main session only
+[ -n "$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null)" ] && exit 0
 path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_response.filePath // empty')"
 
 [ -n "$path" ] || exit 0

@@ -52,12 +52,15 @@ def suite(bindir):
     write([row("a1", "read-loop:x", "2026-10-06T10:00:00Z"), row("a2", "read-loop:x", "2026-10-06T11:00:00Z", same_as="a1"),
            row("b1", "literal-cap", "2026-10-06T12:00:00Z", slice_="s2"),
            row("c1", "operator-stop", "2026-10-06T12:30:00Z"), row("d1", "gone", "2026-10-06T09:00:00Z"),
+           row("e1", "darkbloom-unreachable", "2026-10-06T12:40:00Z"),
            {"event": "superseded", "job_id": "d1", "ts": "2026-10-06T09:30:00Z"}])
     o = json.loads(py(R + "print(json.dumps(t.refresh()))"))
     check("one packet per distinct signature (2), not per job", sorted(o["opened"]) == ["literal-cap", "read-loop-x"])
     d = tmp / "triage"
     check("operator-stop and fully-superseded signatures get no packet",
           not (d / "operator-stop.md").exists() and not (d / "gone.md").exists())
+    check("a transient infra signature (darkbloom-unreachable) gets no packet",
+          not (d / "darkbloom-unreachable.md").exists())
     pk = (d / "read-loop-x.md").read_text()
     check("packet has repeat chain, FAILED CASE, verify tail, commands and the fix standard",
           "a2 -> a1" in pk and "FAILED CASE: case A" in pk and "tail line" in pk
@@ -121,7 +124,8 @@ MUTANTS = {
     "reopen": ("if e[\"status\"] in (\"acted\", \"superseded\") and new_live:", "if False:", "triage_packets.py"),
     "history": ("if entry.get(\"history\"):", "if False:", "triage_packets.py"),
     "fixed-needs-ref": ("if outcome == \"FIXED\" and not (commit or job or ref):", "if False:", "triage_packets.py"),
-    "skip-operator-stop": ("SKIP = (\"operator-stop\", \"cancelled\")", "SKIP = ()", "triage_packets.py"),
+    "skip-operator-stop": ("SKIP = (\"operator-stop\", \"cancelled\",", "SKIP = (", "triage_packets.py"),
+    "skip-infra": ("\"darkbloom-unreachable\", \"provider-capacity\",", "", "triage_packets.py"),
     "sweep-wiring": ("triage_packets.refresh()", "pass", "failure_ledger.py"),
     "headless-skip": ("if [ -n \"${CLAUDE_HEADLESS_DIAGNOSIS:-}\" ]; then exit 0; fi", "", "triage-panel-hook.sh"),
     "mixed-plan-sort": ('key=lambda kv: (str(kv[0][0] or \"\"), str(kv[0][1] or \"\"))', "key=None", "triage_packets.py"),
