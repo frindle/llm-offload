@@ -1,0 +1,18 @@
+--- a/.darkbloom/sandbox-slots.sh
++++ b/.darkbloom/sandbox-slots.sh
+@@ -81,9 +81,13 @@
+ log "slots linux $cur -> $want, macos $curmac -> $MAC"
+ 
+ if [ -z "$pid" ]; then log "agent not running; launchd starts it with the new config"; exit 0; fi
++# Hold sandbox-watch alerts while we restart the agent (marker expires on its own; failure is harmless).
++/opt/homebrew/bin/python3 -I "$HOME/bin/sandbox-watch.py" --set-maintenance 600 "slots restart" --owner sandbox-slots >/dev/null 2>&1
+ pkill -TERM -f "^$B agent "
+-for i in {1..30}; do [ -z "$(agent_pid)" ] && break; sleep 1; done
+-if [ -n "$(agent_pid)" ]; then log "ERROR: agent pid $pid still running 30s after TERM"; exit 1; fi
++# Watch the OLD pid: KeepAlive relaunches the agent about a second after it exits, so "any agent running" stays true
++# and used to log a false "still running" error even though the restart had worked.
++for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
++if kill -0 "$pid" 2>/dev/null; then log "ERROR: agent pid $pid still running 30s after TERM"; exit 1; fi
+ launchctl kickstart "$JOB" >/dev/null 2>&1
+ new=
+ for i in {1..60}; do new=$(agent_pid); [ -n "$new" ] && [ "$new" != "$pid" ] && break; new=; sleep 1; done
