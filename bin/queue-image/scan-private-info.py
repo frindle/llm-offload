@@ -42,6 +42,8 @@ TOKENS = [
 OK_USERS = {"user", "username", "you", "me", "name", "example", "x", "<user>", "claude", "runner", "app", "home", "nobody", "root", "Shared", "$USER", "USER"}
 OK_EMAIL_DOMAINS = {"users.noreply.github.com", "example.com", "example.org", "noreply.github.com", "anthropic.com"}
 OK_EMAIL_LOCAL = {"noreply"}
+# RFC 2606 / RFC 6761 reserved names: they can never be anyone's real address (test fixtures use them)
+OK_EMAIL_TLDS = {"invalid", "test", "example", "localhost"}
 
 
 def ip_hit(m):
@@ -111,7 +113,8 @@ def scan_line(line, private):
             hits.append(("home path", m.group(0)))
     for m in EMAIL.finditer(line):
         loc, _, dom = m.group(0).partition("@")
-        if dom.lower() in OK_EMAIL_DOMAINS or loc in OK_EMAIL_LOCAL:
+        if (dom.lower() in OK_EMAIL_DOMAINS or dom.lower().rsplit(".", 1)[-1] in OK_EMAIL_TLDS
+                or loc in OK_EMAIL_LOCAL):
             continue
         hits.append(("email", m.group(0)))
     for name, rx in TOKENS:

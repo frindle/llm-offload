@@ -26,12 +26,16 @@ from pathlib import Path
 os.environ["DISPATCH_VERIFY_SANDBOX"] = "1"
 os.environ["OLLAMA_QUEUE_NO_NOTIFY"] = "1"
 RESULTS = []
+FAILED = []   # repeated in the last lines: the publish gate keeps only a test's output tail
 
 
 def check(name, got, want):
     ok = got == want
     RESULTS.append(ok)
-    print(("PASS " if ok else "FAIL ") + name + ("" if ok else f"\n     got={got!r}\n    want={want!r}"))
+    line = ("PASS " if ok else "FAIL ") + name + ("" if ok else f"\n     got={got!r}\n    want={want!r}")
+    if not ok:
+        FAILED.append(line)
+    print(line)
 
 
 def load_api(path):
@@ -236,6 +240,8 @@ def main():
     check("live: agent_post reaches the peer", (queue_config.agent_post("/hold", {"x": 1}), len(hits)), ({"ok": True}, 1))
     check("tests ran %d checks" % len(RESULTS), len(RESULTS) > 40, True)
     bad_n = RESULTS.count(False)
+    for line in FAILED:
+        print("again: " + line)
     print("\n%d checks, %d failed" % (len(RESULTS), bad_n))
     sys.exit(1 if bad_n else 0)
 
