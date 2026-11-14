@@ -10,7 +10,7 @@
 ## Left out, and why
 - Mentioned only in docs or comments, never loaded by code: `bloom_power_lib`, `bloom_ledger`, `mini-bench`, `doc-summary`, `mini-answer`, `qwen-dispatch.sh`, `start-llama-server-bonsai.sh`.
 - `graphify-lane`: it is not a queue job. It runs as its own launchd job.
-- Tests are not in `MANIFEST`. They are in `MANIFEST.tests` (289 tests that name a manifest file, plus `test_queue_config.py`).
+- Tests are not in `MANIFEST`. They are in `MANIFEST.tests` (293 tests that name a manifest file, plus `test_queue_config.py`).
 
 ## Things to know
 - Dashboard files (`ollama-queue-api.py`, `bundle_view.py` and the others) are symlinks into the dashboard repo, and `logq` points into the metrics stack. Copy the targets, not the links.

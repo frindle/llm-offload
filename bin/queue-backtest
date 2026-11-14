@@ -62,7 +62,13 @@ def worker(bin_dir):
         for r in req["records"]:
             d = {}
             for field, fn in (("bundle", lambda: q.default_bundle_from_label(r.get("label"))),
-                              ("ctx_ceiling", lambda: q.resolve_ctx_ceiling(r.get("host_pref"), r.get("model")))):
+                              ("ctx_ceiling", lambda: q.resolve_ctx_ceiling(r.get("host_pref"), r.get("model"))),
+                              # the worker trims an Unraid window to this cap at run time (clamp_unraid_ctx)
+                              ("unraid_clamp", lambda: (q.worker().UNRAID_CONFIRMED_SAFE_CTX.get(r.get("model"))
+                                                        if r.get("host_pref") == "unraid" else None)),
+                              # the same test resolve_ctx_ceiling makes before it asks Darkbloom
+                              ("darkbloom_lane", lambda: (r.get("host_pref") in q.DARKBLOOM_PREFS
+                                                          and q._darkbloom_url() is not None))):
                 try:
                     d[field] = fn()
                 except Exception as e:  # noqa: BLE001
@@ -202,11 +208,18 @@ def part_b1(ctx):
         if old is not None and old[i]["ctx_ceiling"] != ceil:
             diff(p, jid, "ctx_ceiling", old[i]["ctx_ceiling"], ceil, "new code differs from old code")
             bad = True
-        if isinstance(r.get("num_ctx"), int) and isinstance(ceil, int) and r["num_ctx"] > ceil:
-            diff(p, jid, "num_ctx<=ceiling", r["num_ctx"], ceil, "recorded window above the new ceiling")
-            bad = True
-        elif not isinstance(r.get("num_ctx"), int):
+        win = r.get("num_ctx")
+        if isinstance(win, int) and isinstance(n.get("unraid_clamp"), int):
+            win = min(win, n["unraid_clamp"])               # what the job really ran with on Unraid
+        if not isinstance(win, int):
             nc(p, "num_ctx not recorded")
+        elif n.get("darkbloom_lane") is True:
+            # derived from Darkbloom's live memory and the model's config (both read on the Mac; the container asks
+            # the Mac status service); a scratch copy cannot reproduce the Mac's memory at the time of the job
+            nc(p, "Darkbloom window: derived from live memory at run time (checked live at cutover)")
+        elif isinstance(ceil, int) and win > ceil:
+            diff(p, jid, "num_ctx<=ceiling", win, ceil, "recorded window above the new ceiling")
+            bad = True
         if isinstance(ceil, str) and ceil.startswith("ERROR"):
             diff(p, jid, "ctx_ceiling", "a number", ceil, "new code raised")
             bad = True

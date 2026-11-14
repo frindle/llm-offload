@@ -5632,21 +5632,8 @@ def _darkbloom_model_config_ctx(model):
     """max_position_embeddings from `model`'s own config.json in Darkbloom's HF
     cache, or None. OPT-IN (DARKBLOOM_CTX_FROM_MODEL_CONFIG): this is the model's
     architectural maximum, not a promise about what this box will actually serve."""
-    root = _darkbloom_cache_dir()
-    if root is None or not model:
-        return None
-    want = f"models--{model}".lower()
-    try:
-        dirs = [d for d in root.iterdir() if d.is_dir() and d.name.lower() == want]
-    except OSError:
-        return None
-    for d in dirs:
-        for cfg in sorted((d / "snapshots").glob("*/config.json")) if (d / "snapshots").is_dir() else []:
-            try:
-                return ctx_from_meta(json.loads(cfg.read_text()))
-            except (OSError, ValueError):
-                continue
-    return None
+    cfg = _darkbloom_model_config(model)
+    return ctx_from_meta(cfg) if cfg else None
 
 
 # ---- `darkbloom status` (reliability pass 2026-10-01) ------------------------
@@ -5857,7 +5844,41 @@ def derive_ctx_ceiling(cfg, usable_gb, slots, safety=DARKBLOOM_CTX_SAFETY,
     return ok[-1] if ok else None
 
 
+# In the container Darkbloom's HF cache is on the Mac, so the model configs (KV bytes per token, the window derived
+# from them, the second-slot memory check) come from the Mac status service: GET /v1/darkbloom-model-configs, one map
+# for every cached model. Kept an hour (the files only change when a model is downloaded), retried after a minute when
+# the service did not answer, and never fetched while the state flock is held (no network I/O under the lock: the
+# daemon warms it before locking). Without it the container fell back to the 64K window and never ran a second
+# Darkbloom slot (back-test B1 on the standby copy, 11-13).
+DARKBLOOM_CFG_REMOTE_TTL = 3600.0
+DARKBLOOM_CFG_REMOTE_RETRY = 60.0
+_DARKBLOOM_CFG_REMOTE = {"at": 0.0, "ok": False, "configs": {}}
+
+
+def _darkbloom_model_configs_remote(now=None, get=None, cache=None):
+    """Container: {lowercased HF cache folder name: config.json} from the Mac status service. Cache only while the
+    state flock is held; the last good map is kept when a refresh fails. Never raises."""
+    c = _DARKBLOOM_CFG_REMOTE if cache is None else cache
+    now = time.time() if now is None else now
+    age_ok = DARKBLOOM_CFG_REMOTE_TTL if c["ok"] else DARKBLOOM_CFG_REMOTE_RETRY
+    if (c["at"] and now - c["at"] < age_ok) or _STATE_LOCK_DEPTH > 0:
+        return c["configs"]
+    try:
+        r = (get or queue_config.agent_get)("/v1/darkbloom-model-configs", timeout=5)
+    except Exception:
+        r = None
+    cfgs = r.get("configs") if isinstance(r, dict) else None
+    if isinstance(cfgs, dict):
+        c.update(at=now, ok=True,
+                 configs={str(k).lower(): v for k, v in cfgs.items() if isinstance(v, dict)})
+    else:
+        c.update(at=now, ok=False)
+    return c["configs"]
+
+
 def _darkbloom_model_config(model):
+    if queue_config.agent_url():
+        return _darkbloom_model_configs_remote().get(f"models--{model}".lower()) if model else None
     root = _darkbloom_cache_dir()
     if root is None or not model:
         return None
@@ -15778,6 +15799,12 @@ def cmd_run(args):
         try:
             if load_slot_config().get("gate_slots", 0) > 0 and _darkbloom_url() is not None:
                 darkbloom_status()
+        except Exception:
+            pass
+        # Container: the model configs come from the Mac status service; fetch them here, not under the lock.
+        try:
+            if queue_config.agent_url():
+                _darkbloom_model_configs_remote()
         except Exception:
             pass
         # Darkbloom's own account of why it is not serving (sandbox hold, unreadable model cache, a

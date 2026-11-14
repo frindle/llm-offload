@@ -67,6 +67,20 @@ with tempfile.TemporaryDirectory() as t:
     rc, res, _ = run(t, "B1", [])
     p = res["parts"][0]
     check("B1: planted recorded window above the ceiling caught", any(d["field"] == "num_ctx<=ceiling" for d in p["differences"]))
+    # an Unraid job that asked for more than the worker's cap ran at the cap: compared at the cap, not flagged
+    w(os.path.join(st, "ollama-queue-logs", "%012x.done.json" % 10),
+      json.dumps({"id": "%012x" % 10, "label": "unraid-big", "host_pref": "unraid", "model": "qwen3.5:9b",
+                  "num_ctx": 49152, "persisted_at": "2026-01-10T00:00:00"}))
+    rc, res, _ = run(t, "B1", [])
+    p = res["parts"][0]
+    check("B1: Unraid window above the worker cap is compared at the cap (not a difference)",
+          not any(d["case"] == "%012x" % 10 for d in p["differences"]))
+    # a Darkbloom-lane job: the window comes from live memory, so it is not comparable on a copy
+    rc, res, _ = run(t, "B1", [], env_extra={"DARKBLOOM_BASE_URL": "http://127.0.0.1:9"})
+    p = res["parts"][0]
+    check("B1: Darkbloom-lane windows are not comparable, with the reason",
+          not any(d["field"] == "num_ctx<=ceiling" for d in p["differences"])
+          and any(k.startswith("Darkbloom window") for k in p.get("not_comparable", {})))
     # B2 fixtures: made-up holds
     rows = []
     for s, e in ((1000.0, 1500.0), (3000.0, 3200.0), (5000.0, 5005.0)):

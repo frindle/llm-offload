@@ -383,6 +383,46 @@ def darkbloom_status_payload(now=None, run=None):
         return {"generated_at": now, "text": _status_cache["text"], "cached_s": round(now - _status_cache["at"], 1)}
 
 
+# ------------------------------------------------------------------ /v1/darkbloom-model-configs
+MODEL_CONFIG_MAX_BYTES = 262144
+MODEL_CONFIGS_MAX = 64
+
+
+def darkbloom_model_configs_payload(now=None, root=None):
+    """config.json of each model in Darkbloom's HF cache, keyed by its cache folder name (models--<id>), the way the
+    queue looks them up (_darkbloom_model_config): the container sizes Darkbloom windows and second slots from them.
+    First readable snapshot per model, files over MODEL_CONFIG_MAX_BYTES skipped, at most MODEL_CONFIGS_MAX models.
+    Model metadata only (no weights, no keys). Read-only; {} when the cache is not configured or unreadable."""
+    now = _now() if now is None else now
+    if root is None:
+        root = queue_mod()._darkbloom_cache_dir()
+    out = {}
+    try:
+        dirs = sorted(Path(root).iterdir()) if root is not None else []
+    except OSError:
+        dirs = []
+    for d in dirs:
+        if len(out) >= MODEL_CONFIGS_MAX:
+            break
+        try:
+            if not (d.name.lower().startswith("models--") and d.is_dir() and (d / "snapshots").is_dir()):
+                continue
+            cfgs = sorted((d / "snapshots").glob("*/config.json"))
+        except OSError:
+            continue
+        for cfg in cfgs:
+            try:
+                if cfg.stat().st_size > MODEL_CONFIG_MAX_BYTES:
+                    continue
+                v = json.loads(cfg.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(v, dict):
+                out[d.name] = v
+                break
+    return {"generated_at": now, "configs": out}
+
+
 # ------------------------------------------------------------------ /v1/bloomgauge-ledger
 LEDGER_TAIL_BYTES = 262144
 
@@ -735,7 +775,7 @@ class Ctx:
     """What the handler needs. Tests build their own."""
 
     def __init__(self, token=None, notify_limiter=None, notify=None, mirror=None, hold=None, mac=None, lane=None,
-                 dbstatus=None, ledger=None, bgtick=None):
+                 dbstatus=None, ledger=None, bgtick=None, dbconfigs=None):
         self.token = token
         self.limiter = notify_limiter or RateLimiter()
         self.notify = notify
@@ -744,6 +784,7 @@ class Ctx:
         self.mac = mac or mac_payload
         self.lane = lane or lane_plan_payload
         self.dbstatus = dbstatus or darkbloom_status_payload
+        self.dbconfigs = dbconfigs or darkbloom_model_configs_payload
         self.ledger = ledger or bloomgauge_ledger_payload
         self.bgtick = bgtick or BloomTick(notify=notify)
 
@@ -792,6 +833,8 @@ def make_handler(ctx):
                     return self._send(200, ctx.lane())
                 if u.path == "/v1/darkbloom-status":
                     return self._send(200, ctx.dbstatus())
+                if u.path == "/v1/darkbloom-model-configs":
+                    return self._send(200, ctx.dbconfigs())
                 if u.path == "/v1/bloomgauge-ledger":
                     return self._send(200, ctx.ledger())
                 if u.path == "/v1/bloomgauge-tick":

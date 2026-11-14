@@ -292,7 +292,8 @@ class HttpTests(unittest.TestCase):
             mac=lambda: {"screen_locked": None, "generated_at": 1},
             lane=lambda: {"facts": {}, "generated_at": 1},
             dbstatus=lambda: {"text": "Provider: running\n", "generated_at": 1},
-            ledger=lambda: {"mode": "on", "ledger": "ok", "rows": [], "generated_at": 1})
+            ledger=lambda: {"mode": "on", "ledger": "ok", "rows": [], "generated_at": 1},
+            dbconfigs=lambda: {"configs": {"models--org--m": {"num_hidden_layers": 4}}, "generated_at": 1})
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
@@ -320,6 +321,36 @@ class HttpTests(unittest.TestCase):
         self.assertEqual((st, body["text"]), (200, "Provider: running\n"))
         st, body, _ = self.req("GET", "/v1/bloomgauge-ledger")
         self.assertEqual((st, body["mode"], body["rows"]), (200, "on", []))
+        st, body, _ = self.req("GET", "/v1/darkbloom-model-configs")
+        self.assertEqual((st, body["configs"]), (200, {"models--org--m": {"num_hidden_layers": 4}}))
+
+    def test_model_configs_payload(self):
+        root = Path(tempfile.mkdtemp(prefix="qagent-hf-"))
+        def put(folder, snap, text):
+            d = root / folder / "snapshots" / snap
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text(text)
+        put("models--Org--Model-A", "a1", "not json")                 # first snapshot unreadable: the next one counts
+        put("models--Org--Model-A", "b2", json.dumps({"num_hidden_layers": 40}))
+        put("models--Org--Big", "s", json.dumps({"pad": "x" * (qa.MODEL_CONFIG_MAX_BYTES + 1)}))   # too big: skipped
+        put("datasets--x", "s", json.dumps({"a": 1}))                   # not a model folder
+        put("models--Org--List", "s", json.dumps([1, 2]))               # not an object
+        (root / "models--Org--NoSnap").mkdir()
+        (root / "stray.txt").write_text("x")
+        out = qa.darkbloom_model_configs_payload(now=5, root=root)
+        self.assertEqual(out, {"generated_at": 5, "configs": {"models--Org--Model-A": {"num_hidden_layers": 40}}})
+        self.assertEqual(qa.darkbloom_model_configs_payload(now=5, root=root / "missing")["configs"], {})
+        # unset cache directory: empty map, no error
+        class FakeQ:
+            @staticmethod
+            def _darkbloom_cache_dir():
+                return None
+        saved = qa.queue_mod
+        qa.queue_mod = lambda: FakeQ
+        try:
+            self.assertEqual(qa.darkbloom_model_configs_payload(now=5)["configs"], {})
+        finally:
+            qa.queue_mod = saved
 
     def test_status_cli_timeout_under_client_wait(self):
         # the container's client waits 5 s; the agent's CLI run must give up before that
@@ -358,7 +389,8 @@ class HttpTests(unittest.TestCase):
         self.assertIn("generated_at", body)
 
     def test_auth_required(self):
-        for p in ("/v1/hold", "/v1/mac", "/v1/lane-plan", "/v1/darkbloom-status", "/v1/bloomgauge-ledger"):
+        for p in ("/v1/hold", "/v1/mac", "/v1/lane-plan", "/v1/darkbloom-status", "/v1/bloomgauge-ledger",
+                  "/v1/darkbloom-model-configs"):
             st, body, _ = self.req("GET", p, token=None)
             self.assertEqual((st, body["status"]), (401, 401), p)
             st, _, _ = self.req("GET", p, token="wrong")

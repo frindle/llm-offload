@@ -29,6 +29,7 @@ claude-sandbox only). Launchd template: `LaunchAgents-staged/com.example.queue-a
 | `GET /v1/mac` | `screen_locked`, `memory`, `load_avg` | below |
 | `GET /v1/lane-plan` | vendor-file facts, pid | below |
 | `GET /v1/darkbloom-status` | raw `darkbloom status` text (`{"text": ...}`), run with a timeout, cached 10 s | the queue container, when `QUEUE_AGENT_URL` is set |
+| `GET /v1/darkbloom-model-configs` | `config.json` of each model in Darkbloom's HF cache, keyed by cache folder name (`{"configs": {...}}`); model metadata only | the queue container (Darkbloom window size and second-slot memory check), fetched outside the state lock, kept an hour |
 | `GET /v1/bloomgauge-ledger` | BloomGauge control mode plus the last 256 KB of `bloomgauge-control.jsonl` (`rows` are raw JSON lines; `ledger` = ok / missing / unreadable) | `escalation_index_janitor` (closes `bloomgauge-control-*` alerts), same bearer auth |
 | `POST /v1/notify` | notification | below |
 | `POST /v1/bloomgauge-tick` | runs the queue's BloomGauge control step here (body `{busy, why, target, ack, epoch}`; answer `{epoch, mode, wanted, started, running, last_step_at, alerts}`) | the queue container's `bloomgauge_hook`, when `QUEUE_AGENT_URL` is set |

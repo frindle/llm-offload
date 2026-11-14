@@ -290,4 +290,6 @@ test_watcher_git_timeout.py
 test_watcher_needsinfo.py
 test_queue_config.py
 test-queue-standby.py
+test_queue_agent.py
+test-darkbloom-model-configs-remote.py
 test-queue-drain.py

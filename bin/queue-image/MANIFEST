@@ -169,4 +169,6 @@ test-repo-toolchain.py
 test-docsum-container.py
 test-queue-backtest.py
 queue-backtest
+# queue-backtest's B2/B7 parts load the Mac status service's code to replay its hold and memory logic (not run here)
+queue-agent.py
 repo-toolchain-check
