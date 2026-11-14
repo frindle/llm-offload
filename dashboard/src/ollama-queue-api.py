@@ -8698,6 +8698,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/standby/import":
             return self._standby_import(urllib.parse.parse_qs(qs))
+        if path == "/api/standby/cases":
+            return self._standby_cases()
         if path == "/api/standby/backtest":
             return self._standby_backtest_start()
         self._refuse_unread("not found", 404)
@@ -8705,6 +8707,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _standby_import(self, qs):
         """POST /api/standby/import[?replace=1]: body = one state tarball, header X-Content-SHA256 = its sha256 (hex).
         See queue_standby.py for what it may hold and how it is extracted. 200 {ok, tar_sha256, files, bytes, ...}."""
+        import queue_standby
+        replace = (qs.get("replace") or [""])[0] in ("1", "true", "yes")
+        state_dir, disp = queue_config.state_dir(), queue_config.dispatch_dir()
+
+        def do(up, sha):
+            res = queue_standby.import_state(up, state_dir, disp, sha256=sha, replace=replace,
+                                             around_swap=lambda: q._Locked())
+            _invalidate_response_cache()
+            return res
+        return self._standby_upload("import", state_dir, do)
+
+    def _standby_cases(self):
+        """POST /api/standby/cases: body = one tarball holding only cases/ (the back-test's case files, made from the
+        Mac's real history), header X-Content-SHA256. Replaces <backtest root>/cases whole; queue-backtest reads it by
+        default. 200 {ok, tar_sha256, files, bytes, cases: {b3: n, ...}}."""
+        import queue_standby
+        root = queue_standby.backtest_root()
+        return self._standby_upload("cases import", root,
+                                    lambda up, sha: queue_standby.import_cases(up, root, sha256=sha))
+
+    def _standby_upload(self, what, spool_dir, do):
+        """Shared by the standby upload routes: header and size checks, refused while a back-test runs, the body
+        streamed to a spool file in spool_dir (same volume as the target), then do(spool_path, sha) -> JSON answer."""
         import queue_standby
         sha = (self.headers.get("X-Content-SHA256") or "").strip().lower()
         if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
@@ -8721,16 +8746,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if any((queue_standby.read_run(root, d.name) or {}).get("state") == "running"
                for d in (root.iterdir() if root.is_dir() else ())):
             return self._refuse_unread("a back-test is running; wait for it", 409)
-        state_dir, disp = queue_config.state_dir(), queue_config.dispatch_dir()
-        state_dir.mkdir(parents=True, exist_ok=True)
-        up = state_dir / (".standby-upload-%s.tar" % uuid.uuid4().hex[:8])
-        replace = (qs.get("replace") or [""])[0] in ("1", "true", "yes")
+        spool_dir = Path(spool_dir)
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        up = spool_dir / (".standby-upload-%s.tar" % uuid.uuid4().hex[:8])
         try:
             queue_upload.stream_to_file(self.rfile, length, up, queue_standby.upload_max_bytes())
-            res = queue_standby.import_state(up, state_dir, disp, sha256=sha, replace=replace,
-                                             around_swap=lambda: q._Locked())
-            _invalidate_response_cache()
-            self._json(res)
+            self._json(do(up, sha))
         except queue_standby.StandbyError as e:
             self.close_connection = True
             self._json({"ok": False, "error": e.msg}, e.status)
@@ -8739,8 +8760,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text(e.msg, e.status)
         except Exception as e:  # noqa: BLE001
             self.close_connection = True
-            sys.stderr.write("[queue-api] standby import failed: %s: %s\n" % (type(e).__name__, str(e)[:300]))
-            self._json({"ok": False, "error": "import failed: %s" % type(e).__name__}, 500)
+            sys.stderr.write("[queue-api] standby %s failed: %s: %s\n" % (what, type(e).__name__, str(e)[:300]))
+            self._json({"ok": False, "error": "%s failed: %s" % (what, type(e).__name__)}, 500)
         finally:
             try:
                 up.unlink()

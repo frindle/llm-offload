@@ -6,7 +6,9 @@ Proves: outside standby nothing changes (writes reach their own validation, /api
 POST / PUT / DELETE (the /api/cpu/* writes too) answers 503 {"error":"standby"} before auth, GETs still work, the admin
 routes need the bearer (401 / 403, no loopback exemption); the import refuses absolute paths, '..', links, devices,
 names outside the allowlist, a bad or missing sha256, an oversize archive and a non-empty state dir without ?replace=1;
-a good import lands the files, a replace keeps the old state as a backup; agent_post and notify do nothing in standby.
+a good import lands the files, a replace keeps the old state as a backup; the cases upload (POST /api/standby/cases)
+takes only cases/, keeps the exec bit, replaces the folder whole, leaves no stage or backup folder and is refused while a
+back-test runs; agent_post and notify do nothing in standby.
 
 Usage: test-queue-standby.py [--api PATH]. Exit 0 = all pass. Run it on the sandbox, never on the Mac.
 """
@@ -21,6 +23,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 os.environ["DISPATCH_VERIFY_SANDBOX"] = "1"
@@ -69,7 +72,7 @@ def call(srv, method, path, body=None, headers=None, raw=None):
 
 
 def tar_bytes(members, manifest=None):
-    """members: list of (name, bytes | ('link', target) | ('dev',) | ('dir',))."""
+    """members: list of (name, bytes | ('exec', bytes) | ('link', target) | ('dev',) | ('dir',))."""
     bio = io.BytesIO()
     with tarfile.open(fileobj=bio, mode="w") as tf:
         for name, content in members:
@@ -80,6 +83,9 @@ def tar_bytes(members, manifest=None):
             elif isinstance(content, tuple) and content[0] == "dev":
                 ti.type = tarfile.CHRTYPE
                 tf.addfile(ti)
+            elif isinstance(content, tuple) and content[0] == "exec":
+                ti.size, ti.mode = len(content[1]), 0o755
+                tf.addfile(ti, io.BytesIO(content[1]))
             elif isinstance(content, tuple) and content[0] == "dir":
                 ti.type = tarfile.DIRTYPE
                 tf.addfile(ti)
@@ -127,6 +133,7 @@ def main():
     check("off: standby() False", queue_config.standby(), False)
     check("off: POST /api/jobs reaches its own validation", call(srv, "POST", "/api/jobs", {})[0], 400)
     check("off: /api/standby/import is 404", call(srv, "POST", "/api/standby/import", raw=b"x", headers=bearer)[0], 404)
+    check("off: /api/standby/cases is 404", call(srv, "POST", "/api/standby/cases", raw=b"x", headers=bearer)[0], 404)
     check("off: GET /api/standby/backtest/abc is 404", call(srv, "GET", "/api/standby/backtest/abc", headers=bearer)[0], 404)
 
     # ---- standby ---------------------------------------------------------------------------------------------------
@@ -213,6 +220,53 @@ def main():
     backups = [p for p in state.iterdir() if p.name.startswith(".standby-backup-")]
     check("import: replace kept a backup of the old state", len(backups) == 1 and (backups[0] / "ollama-queue-state.json").read_bytes() == b'{"jobs": []}', True)
     check("import: old-only files are gone from the live dir", (state / "ollama-queue-logs" / "j1.json").exists(), False)
+
+    # ---- cases upload (POST /api/standby/cases): the back-test's case files ------------------------------------------
+    bt = Path(os.environ["QUEUE_BACKTEST_DIR"])
+    cases_dir = bt / "cases"
+
+    def cases(blob, sha_hex=None):
+        h = dict(bearer)
+        h["X-Content-SHA256"] = sha_hex if sha_hex is not None else sha(blob)
+        return call(srv, "POST", "/api/standby/cases", raw=blob, headers=h)
+
+    def bt_clean():
+        return [p.name for p in bt.iterdir() if p.name.startswith((".standby-stage-", ".standby-backup-", ".standby-upload-"))] if bt.is_dir() else []
+    cgood = [("cases/b3.jsonl", b'{"id": "a"}\n{"id": "b"}\n'), ("cases/bases/x/verify.sh", b"exit 0\n"),
+             ("cases/bases/x/run.sh", ("exec", b"#!/bin/sh\nexit 0\n")),
+             ("cases/diffs/a.diff", b""), ("cases/b6/routes.json", b"[]")]
+    for nm, members in {"state top": [("state/ollama-queue-state.json", b"{}")],
+                        "manifest": [("manifest.json", b"{}")],
+                        "symlink": [("cases/bases/x/link", ("link", "/etc/passwd"))],
+                        "dot-dot": [("cases/../evil", b"x")],
+                        "device": [("cases/dev", ("dev",))],
+                        "cases as a file": [("cases", b"x")]}.items():
+        st, _ = cases(tar_bytes(members))
+        check("cases: refuses %s (%s)" % (nm, st), st in (400, 422), True)
+        check("cases: refused %s wrote nothing" % nm, (cases_dir.exists(), bt_clean()), (False, []))
+    check("cases: wrong sha -> 422", cases(tar_bytes(cgood), "0" * 64)[0], 422)
+    check("cases: missing sha header -> 400", call(srv, "POST", "/api/standby/cases", raw=tar_bytes(cgood), headers=bearer)[0], 400)
+    check("cases: without bearer -> 401", call(srv, "POST", "/api/standby/cases", raw=b"x")[0], 401)
+    check("cases: wrong sha / no bearer wrote nothing", (cases_dir.exists(), bt_clean()), (False, []))
+    st, body = cases(tar_bytes(cgood))
+    check("cases: good tarball -> 200 ok", (st, body.get("ok") if isinstance(body, dict) else None), (200, True))
+    check("cases: counts b3 lines and sees b6", (body.get("cases") or {}).get("b3"), 2)
+    check("cases: b6 routes seen", (body.get("cases") or {}).get("b6"), True)
+    check("cases: files landed", (cases_dir / "bases" / "x" / "verify.sh").read_bytes(), b"exit 0\n")
+    check("cases: exec bit kept", (os.stat(cases_dir / "bases" / "x" / "run.sh").st_mode & 0o111) != 0, True)
+    check("cases: plain file not executable", (os.stat(cases_dir / "bases" / "x" / "verify.sh").st_mode & 0o111), 0)
+    check("cases: no stage, backup or upload left behind", bt_clean(), [])
+    st, body = cases(tar_bytes([("cases/b3.jsonl", b'{"id": "c"}\n')]))
+    check("cases: second upload -> 200", st, 200)
+    check("cases: second upload replaced the folder whole", ((cases_dir / "bases").exists(), (cases_dir / "b3.jsonl").read_bytes()),
+          (False, b'{"id": "c"}\n'))
+    check("cases: state untouched by a cases upload", (state / "ollama-queue-state.json").read_bytes(), b'{"jobs": [1]}')
+    run = bt / "abcdef012345"
+    run.mkdir(parents=True)
+    (run / "status.json").write_text(json.dumps({"state": "running", "started": time.time()}))
+    check("cases: refused while a back-test runs -> 409", cases(tar_bytes(cgood))[0], 409)
+    check("cases: refused while running left the old cases", (cases_dir / "b3.jsonl").read_bytes(), b'{"id": "c"}\n')
+    (run / "status.json").write_text(json.dumps({"state": "done"}))
 
     # ---- nothing leaves the container in standby ------------------------------------------------------------------
     import http.server

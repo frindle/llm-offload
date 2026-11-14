@@ -59,6 +59,7 @@ KEEP_BACKUPS = 2
 MARKER = ".standby-imported"
 BACKUP_PREFIX = ".standby-backup-"
 STAGE_PREFIX = ".standby-stage-"
+CASES_TOP = "cases"
 
 
 class StandbyError(Exception):
@@ -121,8 +122,10 @@ def clean_name(name):
     return tuple(parts)
 
 
-def scan(tar_path, max_unpacked=None, max_members=MAX_MEMBERS):
-    """First pass: validate every member without writing anything. -> {"files": n, "bytes": total, "tops": {...}}"""
+def scan(tar_path, max_unpacked=None, max_members=MAX_MEMBERS, rule=None):
+    """First pass: validate every member without writing anything. -> {"files": n, "bytes": total, "tops": {...}}
+    rule(parts, member) raises StandbyError for a name the archive may not hold (default: the state allowlist)."""
+    rule = rule or _state_rule
     max_unpacked = import_max_bytes() if max_unpacked is None else max_unpacked
     total = files = count = 0
     seen_roots = set()
@@ -143,20 +146,8 @@ def scan(tar_path, max_unpacked=None, max_members=MAX_MEMBERS):
                 parts = clean_name(m.name)
                 if not parts:
                     continue
-                top = parts[0]
-                if top not in TOP_NAMES:
-                    raise StandbyError("top-level name not allowed: " + _show(top))
-                seen_roots.add(top)
-                if top == "manifest.json":
-                    if len(parts) != 1 or not m.isreg():
-                        raise StandbyError("manifest.json must be a single file")
-                    if m.size > MAX_MANIFEST_BYTES:
-                        raise StandbyError("manifest.json too large", 413)
-                elif len(parts) == 1:
-                    if not m.isdir():
-                        raise StandbyError("%s must be a folder" % top)
-                elif parts[1] not in ROOT_NAMES[top]:
-                    raise StandbyError("name not allowed under %s/: %s" % (top, _show(parts[1])))
+                rule(parts, m)
+                seen_roots.add(parts[0])
                 if m.isreg():
                     if m.size < 0:
                         raise StandbyError("bad size in archive")
@@ -167,6 +158,31 @@ def scan(tar_path, max_unpacked=None, max_members=MAX_MEMBERS):
         except (tarfile.TarError, EOFError, OSError) as e:
             raise StandbyError("damaged tar archive: %s" % type(e).__name__, 400)
     return {"files": files, "bytes": total, "tops": sorted(seen_roots)}
+
+
+def _state_rule(parts, m):
+    """What a state tarball may hold: TOP_NAMES at the top, the allowlisted names under state/ and dispatch/."""
+    top = parts[0]
+    if top not in TOP_NAMES:
+        raise StandbyError("top-level name not allowed: " + _show(top))
+    if top == "manifest.json":
+        if len(parts) != 1 or not m.isreg():
+            raise StandbyError("manifest.json must be a single file")
+        if m.size > MAX_MANIFEST_BYTES:
+            raise StandbyError("manifest.json too large", 413)
+    elif len(parts) == 1:
+        if not m.isdir():
+            raise StandbyError("%s must be a folder" % top)
+    elif parts[1] not in ROOT_NAMES[top]:
+        raise StandbyError("name not allowed under %s/: %s" % (top, _show(parts[1])))
+
+
+def _cases_rule(parts, m):
+    """What a cases tarball may hold: everything under cases/ and nothing else."""
+    if parts[0] != CASES_TOP:
+        raise StandbyError("a cases archive holds only cases/: " + _show(parts[0]))
+    if len(parts) == 1 and not m.isdir():
+        raise StandbyError("cases must be a folder")
 
 
 def extract(tar_path, stage_dirs, manifest_out=None):
@@ -345,6 +361,50 @@ def import_state(tar_path, state_dir, dispatch_dir, sha256=None, replace=False, 
             shutil.rmtree(p, ignore_errors=True)
     return {"ok": True, "tar_sha256": got, "files": info["files"], "bytes": info["bytes"],
             "manifest_ok": manifest_ok, "replaced": bool(why), "backup": res["backup"]}
+
+
+def import_cases(tar_path, root, sha256=None, max_unpacked=None):
+    """The back-test's case files (cases/b3.jsonl, cases/bases/..., cases/b6/routes.json ...), made from the Mac's real
+    history by the operator step, into <root>/cases (root = backtest_root(), where queue-backtest looks by default).
+    Same strict scan and extraction as the state import (files and folders only, no links, no '..', size and count
+    caps, nothing written unless the whole archive passed); the staged folder then replaces <root>/cases whole.
+    -> {"ok", "tar_sha256", "files", "bytes", "cases": {"b3": n, ...}}; raises StandbyError for every refusal."""
+    root = Path(root)
+    got = sha256_file(tar_path)
+    if sha256 and got != str(sha256).strip().lower():
+        raise StandbyError("sha256 of the upload does not match the one sent", 422)
+    info = scan(tar_path, max_unpacked, rule=_cases_rule)
+    if CASES_TOP not in info["tops"]:
+        raise StandbyError("the archive holds no cases/ folder")
+    root.mkdir(parents=True, exist_ok=True)
+    sid = uuid.uuid4().hex[:8]
+    stage, old, target = root / (STAGE_PREFIX + sid), root / (BACKUP_PREFIX + "cases-" + sid), root / CASES_TOP
+    try:
+        stage.mkdir(exist_ok=False)
+        os.chmod(stage, 0o700)
+        extract(tar_path, {CASES_TOP: stage})
+        os.chmod(stage, 0o755)
+        if target.exists() or target.is_symlink():
+            os.rename(target, old)
+        try:
+            os.rename(stage, target)
+        except OSError:
+            if old.exists():
+                os.rename(old, target)
+            raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(old, ignore_errors=True)
+    counts = {}
+    for name in ("b3", "b4", "b5"):
+        try:
+            with open(target / (name + ".jsonl")) as f:
+                counts[name] = sum(1 for line in f if line.strip())
+        except OSError:
+            pass
+    counts["b6"] = (target / "b6" / "routes.json").is_file()
+    counts["b7"] = (target / "b7" / "mac").is_dir()
+    return {"ok": True, "tar_sha256": got, "files": info["files"], "bytes": info["bytes"], "cases": counts}
 
 
 # ---- export (the reverse of the import: fallback pulls it back to the Mac; the Mac's cutover packs the same way) ---
