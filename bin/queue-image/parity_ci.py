@@ -342,13 +342,16 @@ def p16():
     return (not bad, "; ".join(bad))
 
 
-@guard("STANDBY writes answer 503, safe import refuses bad archives, nothing is sent to the Mac (61 checks)")
+@guard("STANDBY writes answer 503, safe import refuses bad archives, nothing is sent to the Mac (99 checks)")
 def standby():
     t = CODE / "test-queue-standby.py"
     if not t.exists():
         return (False, "test-queue-standby.py not in the image")
-    rc, out = sh([sys.executable, str(t)], timeout=300)
-    return (rc == 0, out[-300:])
+    p = subprocess.run([sys.executable, str(t)], capture_output=True, text=True, timeout=300, env=BASE_ENV)
+    # the API's request log goes to stderr; a failure is reported by the test's own FAIL lines (with got/want)
+    fails = [ln for ln in (p.stdout or "").splitlines() if ln.startswith(("FAIL ", "     got=", "    want="))]
+    detail = "\n".join(fails[-15:]) or (p.stdout or "")[-400:] or (p.stderr or "")[-400:]
+    return (p.returncode == 0, detail)
 
 
 def main():

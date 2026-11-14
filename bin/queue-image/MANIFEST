@@ -78,6 +78,11 @@ scope-check.py
 scope_creep.py
 source_text_harness.py
 verify-relevance.py
+# its TS/JS mutant and parse sidecars (also shipped to CPU stages by cpu_stage.py); the Dockerfile runs npm ci there
+ts-mutator/package.json
+ts-mutator/package-lock.json
+ts-mutator/ts-mutator.mjs
+ts-mutator/ts-parse.mjs
 
 # gate, landing and verification
 conformance_log.py

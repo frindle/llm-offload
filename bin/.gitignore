@@ -71,3 +71,7 @@ cashback-unwrap/
 !ladder-log
 !graphify-lane
 !configs/graphify-lane.json
+# ts-mutator: the TS/JS mutant and parse sidecars verify-relevance.py and the TS verify scripts call (the queue image installs them)
+!ts-mutator/*.mjs
+!ts-mutator/package.json
+!ts-mutator/package-lock.json

@@ -38,11 +38,15 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && npm install -g pnpm tsx@^4.23.13 \
     && npm cache clean --force
 
-# Python packages the queue code imports that are not stdlib (checked with an import scan of the queue files):
+# Python packages: the Mac's own set at the Mac's versions (requirements-mac.txt), since jobs' checks fall back to the
+# system python3 and their verdicts must match the Mac's. It includes what the queue code imports that is not stdlib:
 #   pyyaml, jinja2   mini-swe-runner.py
 #   pypdf, pdfplumber, trafilatura   ollama-worker.py (each import is optional there; docsum and web fetch use them)
-#   uv               the CPU lane's setup phase (lane_remote.py) builds venvs with it
-RUN pip install --no-cache-dir pyyaml jinja2 pypdf pdfplumber trafilatura uv
+# uv: the CPU lane's setup phase (lane_remote.py) builds venvs with it (a separate binary on the Mac).
+COPY requirements-mac.txt /tmp/requirements-mac.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-mac.txt uv \
+    && rm /tmp/requirements-mac.txt \
+    && python3 -c "import yaml, jinja2, pypdf, pdfplumber, trafilatura, flask, fastapi, httpx, pytest"
 
 # mini-swe-agent and litellm in their own venv, at the Mac's version (mini_swe_agent 2.4.6, litellm 1.105.1 as
 # resolved there). MINI_BIN points at it, so it does not sit under the volume-mounted ~/.ollama-dispatch.
@@ -59,6 +63,15 @@ RUN (getent group "${PGID}" >/dev/null || groupadd -g "${PGID}" queue) \
 # Code: staged by stage.sh from the files in MANIFEST. Owned by queue, so a script that writes next to
 # itself does not crash (state is meant to live in QUEUE_STATE_DIR, not here).
 COPY --chown=queue build/bin/ /opt/queue/bin/
+# ts-mutator's typescript dependency, from its lockfile (dev dependencies left out). verify-relevance.py runs these
+# sidecars from /opt/queue/bin/ts-mutator, and the TS verify scripts parse with ts-parse.mjs there.
+RUN cd /opt/queue/bin/ts-mutator \
+    && npm ci --omit=dev --no-audit --no-fund \
+    && npm cache clean --force \
+    && chown -R queue:"${PGID}" /opt/queue/bin/ts-mutator \
+    && printf 'const x: number = 1;\n' > /tmp/probe.ts \
+    && node /opt/queue/bin/ts-mutator/ts-parse.mjs /tmp/probe.ts \
+    && rm /tmp/probe.ts
 COPY every.sh throttle.sh /usr/local/bin/
 # The container checks the workflow runs in the built image (parity-ci.sh), with the scanner they use.
 COPY parity-ci.sh parity_ci.py scan-private-info.py scan-allow.txt every.sh /opt/queue/ci/

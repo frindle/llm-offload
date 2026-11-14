@@ -1,0 +1,66 @@
+# The Mac's Python 3.14 packages (Homebrew site plus the user site), pinned so a job's check runs against the same
+# libraries in the container as on the Mac. Target repos' verify.sh scripts fall back to the system python3 when
+# their own venv fails to build, so these versions decide some check verdicts (the 11-13 back-test, part B3).
+# Taken 2026-11-13 with `pip list --format=freeze` over both sites, minus pip itself. Refresh it the same way when
+# the Mac's packages change, and re-run B3.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+APScheduler==3.10.4
+babel==2.18.0
+bcrypt==5.0.0
+blinker==1.9.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+click==8.5.0
+courlan==1.4.0
+cryptography==50.0.0
+dateparser==1.4.2
+fastapi==0.142.2
+Flask==3.0.3
+gguf==0.19.0
+h11==0.16.0
+htmldate==1.10.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.1
+invoke==3.0.3
+itsdangerous==2.2.0
+Jinja2==3.1.6
+jusText==3.0.2
+lxml==6.1.2
+lxml_html_clean==0.4.5
+MarkupSafe==3.0.3
+numpy==2.5.2
+opentelemetry-api==1.45.0
+packaging==26.3
+paramiko==5.0.0
+pdfminer.six==20260107
+pdfplumber==0.11.10
+pillow==12.3.0
+pluggy==1.7.0
+pycparser==3.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+PyNaCl==1.6.2
+pypdf==6.16.2
+pypdfium2==5.13.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+pytz==2026.3.post1
+PyYAML==6.0.3
+regex==2026.7.19
+requests==2.34.2
+six==1.17.0
+starlette==1.7.0
+tld==0.13.2
+tqdm==4.70.0
+trafilatura==2.2.0
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+tzlocal==5.4.4
+urllib3==2.7.0
+Werkzeug==3.1.8

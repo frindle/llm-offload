@@ -100,6 +100,7 @@ with tempfile.TemporaryDirectory() as t:
     check("B2: planted old-path difference caught", rc == 1 and len(p.get("differences", [])) > 0)
     # B3
     base = os.path.join(cases, "b3base")
+    tooldir = os.path.join(t, "tool-here")
     w(os.path.join(base, "v.txt"), "one\n")
     w(os.path.join(cases, "good.diff"), "--- a/v.txt\n+++ b/v.txt\n@@ -1 +1 @@\n-one\n+two\n")
     w(os.path.join(cases, "bad.diff"), "--- a/v.txt\n+++ b/v.txt\n@@ -1 +1 @@\n-one\n+three\n")
@@ -110,12 +111,32 @@ with tempfile.TemporaryDirectory() as t:
       # the check sees a git repo whose HEAD is the base: only the diff's file changed, the helper stays untracked
       json.dumps({"id": "c4", "base": "b3base", "diff": "good.diff", "untracked": ["h.txt"], "recorded": "pass",
                   "check": "test \"$(git diff --name-only HEAD)\" = v.txt && git status --porcelain | grep -qx '?? h.txt'"
-                           " && test \"$(git log --format=%s)\" = base"}) + "\n")
+                           " && test \"$(git log --format=%s)\" = base"}) + "\n" +
+      # no check verdict on the Mac (job stopped first): not comparable, with the case's own reason
+      json.dumps({"id": "c5", "base": "b3base", "diff": "good.diff", "check": "true", "recorded": "unknown",
+                  "why": "Mac job force-stopped before its check"}) + "\n" +
+      # the Mac's absolute tool path, in the base tree and in the diff, mapped to where the tool lives here
+      json.dumps({"id": "c6", "base": "b3base", "diff": "tool.diff", "check": "sh run.sh && sh run2.sh", "recorded": "pass",
+                  "path_map": {"/nonexistent-mac/bin/tool": tooldir}}) + "\n" +
+      # a differing verdict carries the end of the check's output
+      json.dumps({"id": "c7", "base": "b3base", "diff": "good.diff", "check": "echo b3-tail-marker; exit 3",
+                  "recorded": "pass"}) + "\n")
     w(os.path.join(base, "h.txt"), "helper\n")
+    w(os.path.join(base, "run.sh"), "sh /nonexistent-mac/bin/tool/ok.sh\n")
+    w(os.path.join(cases, "tool.diff"), "--- /dev/null\n+++ b/run2.sh\n@@ -0,0 +1 @@\n+sh /nonexistent-mac/bin/tool/ok.sh\n")
+    w(os.path.join(tooldir, "ok.sh"), "exit 0\n")
     rc, res, _ = run(t, "B3")
     p = res["parts"][0] if res else {}
-    check("B3: three matching verdicts, planted wrong record caught", p.get("cases") == 4 and p.get("matched") == 3
-          and [d["case"] for d in p.get("differences", [])] == ["c3"])
+    check("B3: matching verdicts, planted wrong records caught", p.get("cases") == 7 and p.get("matched") == 4
+          and [d["case"] for d in p.get("differences", [])] == ["c3", "c7"])
+    check("B3: no recorded verdict is not comparable, with its reason",
+          (p.get("not_comparable") or {}).get("Mac job force-stopped before its check") == 1)
+    check("B3: Mac tool path mapped in the base tree and the diff (case c6 matched)",
+          "c6" not in [d["case"] for d in p.get("differences", [])]
+          and "/nonexistent-mac/" in open(os.path.join(base, "run.sh")).read()
+          and "/nonexistent-mac/" in open(os.path.join(cases, "tool.diff")).read())
+    check("B3: a difference shows the end of the check's output",
+          any(d["case"] == "c7" and "b3-tail-marker" in d.get("tail", "") for d in p.get("differences", [])))
     check("B3: base tree untouched (no .git left in it)", open(os.path.join(base, "v.txt")).read() == "one\n"
           and not os.path.exists(os.path.join(base, ".git")))
     # B4 / B5

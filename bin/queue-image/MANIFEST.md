@@ -14,7 +14,8 @@
 
 ## Things to know
 - Dashboard files (`ollama-queue-api.py`, `bundle_view.py` and the others) are symlinks into the dashboard repo, and `logq` points into the metrics stack. Copy the targets, not the links.
-- `ts-mutator/` (node files that `cpu_stage.py` ships) is not tracked in git. Add it to the image by hand if CPU stages use it.
+- `ts-mutator/`: the TS/JS sidecars `verify-relevance.py` runs and `cpu_stage.py` ships. Tracked since 11-13 (the
+  `.gitignore` lets its `.mjs` and package files through); the Dockerfile installs its `typescript` dependency with `npm ci`.
 - Mac-only members are listed because code imports them: `bloomgauge_*`, `darkbloom-field-probe*`, `darkbloom-keepwarm.py`. They do nothing useful without the Mac. Open question: ship them or stub them.
 - The alert script was renamed to `notify-operator.py` (its log is `notify-operator.jsonl`, its symbols `notify_operator`) so no name is in the code. Its old alert-dedupe history starts fresh.
 - `QUEUE_API` clients still point at `127.0.0.1:7684`. That is for the later task.

@@ -335,12 +335,67 @@ def _within(base, path):
     return path if path == base or path.startswith(base + os.sep) else None
 
 
-def run_cmd(argv_or_str, cwd, env, timeout, shell=False):
+def run_cmd(argv_or_str, cwd, env, timeout, shell=False, log=None):
+    """Exit code, or "timeout". With log=path, the command's stdout and stderr are written there."""
     try:
-        r = subprocess.run(argv_or_str, cwd=cwd, env=env, shell=shell, capture_output=True, text=True, timeout=timeout)
-        return r.returncode
-    except subprocess.TimeoutExpired:
-        return "timeout"
+        r = subprocess.run(argv_or_str, cwd=cwd, env=env, shell=shell, capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+        out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+    except subprocess.TimeoutExpired as e:
+        out = "".join(x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "") for x in (e.stdout, e.stderr))
+        rc = "timeout"
+    if log:
+        with open(log, "w") as f:
+            f.write(out)
+    return rc
+
+
+def _tail(path, lines=25, chars=3000):
+    try:
+        with open(path, errors="replace") as f:
+            t = "".join(f.readlines()[-lines:])
+    except OSError:
+        return ""
+    return t[-chars:]
+
+
+def _is_text(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\0" not in f.read(8192)
+    except OSError:
+        return False
+
+
+def _map_paths(work, pairs):
+    """Rewrite each (old, new) path prefix in the copied tree's text files, before it becomes the base commit.
+    The Mac's recorded checks name tools by the Mac's absolute paths (a verify.sh calling the TS mutator under the
+    Mac's home); the case says where the same tool lives here. Returns the files changed."""
+    changed = []
+    for root, dirs, files in os.walk(work):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        for n in files:
+            fp = os.path.join(root, n)
+            if os.path.islink(fp) or not _is_text(fp):
+                continue
+            with open(fp, "rb") as f:
+                b = f.read()
+            nb = b
+            for old, new in pairs:
+                nb = nb.replace(old.encode(), new.encode())
+            if nb != b:
+                with open(fp, "wb") as f:
+                    f.write(nb)
+                changed.append(os.path.relpath(fp, work))
+    return changed
+
+
+def _path_pairs(c):
+    pm = c.get("path_map")
+    if not isinstance(pm, dict):
+        return []
+    return [(k, os.path.expanduser(v)) for k, v in pm.items()
+            if isinstance(k, str) and isinstance(v, str) and k.startswith("/") and len(k) > 1]
 
 
 def _seed_repo(work, untracked, env, scratch):
@@ -371,31 +426,51 @@ def part_b3(ctx):
     if not cases:
         p["note"] = "no cases file (cases/b3.jsonl)"
         return p
+    logs = os.path.join(ctx["scratch"], "b3-logs")
+    os.makedirs(logs, exist_ok=True)
     for c in cases:
         p["cases"] += 1
         cid = c.get("id")
+        if c.get("recorded") not in ("pass", "fail"):
+            # e.g. the Mac stopped the job (operator stop, thrash, no convergence) before its check gave a verdict:
+            # the job's exit code is not a check result, so there is nothing to compare against
+            nc(p, str(c.get("why") or "the Mac recorded no check verdict for this job"))
+            continue
         base, dfile = _within(ctx["cases"], c.get("base", "")), _within(ctx["cases"], c.get("diff", ""))
         if not base or not dfile or not os.path.isdir(base) or not os.path.isfile(dfile) or not c.get("check"):
             diff(p, cid, "case", "usable case", "bad paths or no check", "case file is incomplete")
             continue
-        work = os.path.join(ctx["scratch"], "b3-%s" % re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid)))
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid))
+        work = os.path.join(ctx["scratch"], "b3-%s" % safe)
         shutil.rmtree(work, ignore_errors=True)
         shutil.copytree(base, work, symlinks=True)
+        pairs = _path_pairs(c)
+        if pairs:
+            _map_paths(work, pairs)
+            with open(dfile, "rb") as f:
+                d = f.read()
+            for old, new in pairs:
+                d = d.replace(old.encode(), new.encode())
+            dfile = os.path.join(ctx["scratch"], "b3-%s.diff" % safe)
+            with open(dfile, "wb") as f:
+                f.write(d)
         env = sandbox_env(os.path.join(ctx["scratch"], "home"))
         why = _seed_repo(work, c.get("untracked"), env, ctx["scratch"])
         if why:
             diff(p, cid, "case", "usable case", why, "could not rebuild the base as a git repo")
             continue
-        rc = run_cmd(["git", "apply", "--whitespace=nowarn", dfile], work, env, 120)
+        log = os.path.join(logs, safe + ".log")
+        rc = run_cmd(["git", "apply", "--whitespace=nowarn", dfile], work, env, 120, log=log)
         if rc != 0:
             got = "apply-failed"
         else:
-            rc = run_cmd(c["check"], work, env, int(c.get("timeout") or 300), shell=True)
+            rc = run_cmd(c["check"], work, env, int(c.get("timeout") or 300), shell=True, log=log)
             got = "pass" if rc == 0 else ("timeout" if rc == "timeout" else "fail")
         if got == c.get("recorded"):
             p["matched"] += 1
         else:
             diff(p, cid, "verdict", c.get("recorded"), got, "check verdict differs from the Mac's record")
+            p["differences"][-1]["tail"] = _tail(log)
     return p
 
 
