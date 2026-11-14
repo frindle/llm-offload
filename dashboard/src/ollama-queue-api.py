@@ -8794,6 +8794,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 1 <= lim <= 100000:
                 return self._text("limit must be 1..100000", 400)
             argv += ["--limit", str(lim)]
+        # B6/B7 read this server's own routes (GET only) on the port it really listens on
+        argv += ["--api-url", "http://127.0.0.1:%d" % self.server.server_address[1]]
         root = queue_standby.backtest_root()
         root.mkdir(parents=True, exist_ok=True)
         for d in root.iterdir():
@@ -8803,7 +8805,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         out = root / rid
         out.mkdir()
         (out / "status.json").write_text(json.dumps({"state": "running", "started": time.time()}))
-        env = dict(os.environ, QUEUE_STANDBY="1", OLLAMA_QUEUE_NO_NOTIFY="1")
+        env = dict(os.environ, QUEUE_STANDBY="1", OLLAMA_QUEUE_NO_NOTIFY="1", QUEUE_API_TOKEN=_queue_api_token())
         try:
             logf = open(out / "run.log", "wb")
             subprocess.Popen([sys.executable, os.path.join(_BIN_DIR, "queue-backtest"), "run", "--out", str(out)] + argv,

@@ -268,6 +268,29 @@ def main():
     check("cases: refused while running left the old cases", (cases_dir / "b3.jsonl").read_bytes(), b'{"id": "c"}\n')
     (run / "status.json").write_text(json.dumps({"state": "done"}))
 
+    # ---- back-test start: the child gets --api-url for this server and the API token (never runs here) ------------
+    started = []
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            started.append((argv, kw.get("env") or {}))
+    real_popen = api.subprocess.Popen
+    api.subprocess.Popen = FakePopen
+    try:
+        st, body = call(srv, "POST", "/api/standby/backtest", {"parts": ["B6"], "limit": 5}, headers=bearer)
+    finally:
+        api.subprocess.Popen = real_popen
+    check("backtest start -> 200 with an id", (st, bool(isinstance(body, dict) and body.get("id"))), (200, True))
+    argv, env = started[0] if started else ([], {})
+    url = argv[argv.index("--api-url") + 1] if "--api-url" in argv else None
+    check("backtest start: --api-url is this server's real port", url, "http://127.0.0.1:%d" % srv.server_address[1])
+    check("backtest start: parts and limit passed", (argv[argv.index("--parts") + 1] if "--parts" in argv else None,
+                                                     argv[argv.index("--limit") + 1] if "--limit" in argv else None), ("B6", "5"))
+    check("backtest start: child env has the API token and standby", (env.get("QUEUE_API_TOKEN") == TOK, env.get("QUEUE_STANDBY")),
+          (True, "1"))
+    if isinstance(body, dict) and body.get("id"):
+        (bt / body["id"] / "status.json").write_text(json.dumps({"state": "done"}))
+
     # ---- nothing leaves the container in standby ------------------------------------------------------------------
     import http.server
     hits = []
