@@ -106,12 +106,18 @@ with tempfile.TemporaryDirectory() as t:
     w(os.path.join(cases, "b3.jsonl"),
       json.dumps({"id": "c1", "base": "b3base", "diff": "good.diff", "check": "grep -q two v.txt", "recorded": "pass"}) + "\n" +
       json.dumps({"id": "c2", "base": "b3base", "diff": "bad.diff", "check": "grep -q two v.txt", "recorded": "fail"}) + "\n" +
-      json.dumps({"id": "c3", "base": "b3base", "diff": "bad.diff", "check": "grep -q two v.txt", "recorded": "pass"}) + "\n")
+      json.dumps({"id": "c3", "base": "b3base", "diff": "bad.diff", "check": "grep -q two v.txt", "recorded": "pass"}) + "\n" +
+      # the check sees a git repo whose HEAD is the base: only the diff's file changed, the helper stays untracked
+      json.dumps({"id": "c4", "base": "b3base", "diff": "good.diff", "untracked": ["h.txt"], "recorded": "pass",
+                  "check": "test \"$(git diff --name-only HEAD)\" = v.txt && git status --porcelain | grep -qx '?? h.txt'"
+                           " && test \"$(git log --format=%s)\" = base"}) + "\n")
+    w(os.path.join(base, "h.txt"), "helper\n")
     rc, res, _ = run(t, "B3")
     p = res["parts"][0] if res else {}
-    check("B3: two matching verdicts, planted wrong record caught", p.get("cases") == 3 and p.get("matched") == 2
+    check("B3: three matching verdicts, planted wrong record caught", p.get("cases") == 4 and p.get("matched") == 3
           and [d["case"] for d in p.get("differences", [])] == ["c3"])
-    check("B3: base tree untouched", open(os.path.join(base, "v.txt")).read() == "one\n")
+    check("B3: base tree untouched (no .git left in it)", open(os.path.join(base, "v.txt")).read() == "one\n"
+          and not os.path.exists(os.path.join(base, ".git")))
     # B4 / B5
     w(os.path.join(cases, "job1", "run.py"),
       "import json,subprocess,sys\nr=subprocess.run(['git','push'],capture_output=True)\n"

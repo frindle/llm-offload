@@ -338,6 +338,28 @@ def run_cmd(argv_or_str, cwd, env, timeout, shell=False):
         return "timeout"
 
 
+def _seed_repo(work, untracked, env, scratch):
+    """Make the copied base a git repo whose HEAD is the base tree, as the Mac's worktree was when the check ran.
+    Files the case lists as untracked (helpers that were never committed) stay untracked. Returns None or the reason."""
+    g = ["git", "-c", "user.name=backtest", "-c", "user.email=backtest@invalid", "-c", "commit.gpgsign=false",
+         "-c", "init.defaultBranch=main", "-c", "core.hooksPath=/dev/null", "--literal-pathspecs"]
+    if run_cmd(g + ["init", "-q"], work, env, 60) != 0:
+        return "git init failed"
+    if run_cmd(g + ["add", "-A", "-f"], work, env, 300) != 0:
+        return "git add failed"
+    names = [u for u in (untracked or []) if isinstance(u, str) and u and _within(work, u)]
+    if names:
+        lst = os.path.join(scratch, "b3-untracked.lst")
+        with open(lst, "w") as f:
+            f.write("\0".join(names))
+        if run_cmd(g + ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=" + lst,
+                        "--pathspec-file-nul"], work, env, 120) != 0:
+            return "git rm --cached failed"
+    if run_cmd(g + ["commit", "-q", "--no-verify", "--allow-empty", "-m", "base"], work, env, 300) != 0:
+        return "git commit failed"
+    return None
+
+
 def part_b3(ctx):
     p = new_part("B3", "checks")
     cases = read_jsonl(os.path.join(ctx["cases"], "b3.jsonl"))[:ctx["limit"]]
@@ -355,6 +377,10 @@ def part_b3(ctx):
         shutil.rmtree(work, ignore_errors=True)
         shutil.copytree(base, work, symlinks=True)
         env = sandbox_env(os.path.join(ctx["scratch"], "home"))
+        why = _seed_repo(work, c.get("untracked"), env, ctx["scratch"])
+        if why:
+            diff(p, cid, "case", "usable case", why, "could not rebuild the base as a git repo")
+            continue
         rc = run_cmd(["git", "apply", "--whitespace=nowarn", dfile], work, env, 120)
         if rc != 0:
             got = "apply-failed"
