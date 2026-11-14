@@ -66,6 +66,15 @@ h = scan.line_hash("y " + J(["10", "0", "0", "2"]))
 check("allow by hash", scan.scan_text("a.py", text, [], [("*.py", "sha1:" + h, "r")]) != [], True)
 check("allow by hash covers that line", [x[1] for x in scan.scan_text("a.py", text, [], [("*.py", "sha1:" + h, "r")])], [1])
 
+# the shipped allowlist passes npm lockfile integrity hashes, and only those lines of only that file
+shipped = scan.load_allow(HERE / "scan-allow.txt")
+b64 = "Ab1" + "x9Y" * 20 + "=="
+lock = '    "integrity": "sha512-' + b64 + '",\n    "token": "' + b64 + '"\n'
+check("lockfile integrity line allowed, other base64 still caught",
+      [x[1] for x in scan.scan_text("ts-mutator/package-lock.json", lock, [], shipped)], [2])
+check("integrity allowance is scoped to the lockfile",
+      [x[1] for x in scan.scan_text("other.json", lock, [], shipped)], [1, 2])
+
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     (d / "allow.txt").write_text("a.txt : FAKE : why\n")

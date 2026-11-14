@@ -6,3 +6,4 @@ mini-swe-runner.py : @(pytest|m|mock)\. : decorator text inside a generated-test
 infra_incidents.py : python@3\.x : Homebrew formula name, not an email
 mini_ext/mini_ctx.py : k-SECRET-SELFTEST : fake token inside a self-test assertion
 queue-image/scan-private-info.py : 100\.64\.0\.0/10 : the CGNAT network the scanner itself defines
+ts-mutator/package-lock.json : ^\s*"integrity": "sha(1|256|384|512)-[A-Za-z0-9+/]+={0,2}",?\s*$ : npm registry integrity hashes of public packages (lockfile pins), not secrets
