@@ -112,7 +112,7 @@ environment:
   timeout: 300
 model:
   # Context control (mini_ext/mini_ctx.py, API-bound copy only): old tool output shrunk, 32k-token ceiling. strip_old_thinking drops
-  # old `<think>` text and deviates from the model card (preserve_thinking), so it stays off until the owner approves it.
+  # old `<think>` text and deviates from the model card (preserve_thinking), so it stays off until the operator approves it.
   model_class: mini_ctx.CtxLitellmModel
   strip_old_thinking: false
   shrink_obs: true

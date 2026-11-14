@@ -113,6 +113,11 @@ mini-triage
 mini-validate
 mini_ext/mini_ctx.py
 mini_ext/single_shot_call.py
+# mini-swe-runner's overlay configs: it reads ~/bin/configs/mini-*.yaml for every mini job (found missing by the 11-14 back-test)
+configs/mini-local.yaml
+configs/mini-diagnose.yaml
+configs/mini-testwrite.yaml
+configs/mini-diagnose-polish.yaml
 mini_graph.py
 mini_mutate.py
 mini_rule_coverage.py

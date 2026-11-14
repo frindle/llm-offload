@@ -4,8 +4,11 @@
 
 ## How the list was found
 1. Start from the 8 queue jobs: the daemon (`ollama-queue.py`), the api (`ollama-queue-api.py`, lives in the dashboard repo), `queue-event-log.py`, `cpu-prefetch.py`, `dispatch-ack-reconcile.py`, `dispatch-escalation-watcher.py`, `verify-orphan-reap.py`, `log-rotate`.
-2. Follow the closure: `import` and `importlib` loads, `subprocess` calls of other `~/bin` scripts, files the workers exec, and the tool files `cpu_stage.py` ships to the CPU runner (`_TOOL_FILES`). This gave 128 files by script, plus a few hand-added ones (see below). 133 are listed.
+2. Follow the closure: `import` and `importlib` loads, `subprocess` calls of other `~/bin` scripts, files the workers exec, and the tool files `cpu_stage.py` ships to the CPU runner (`_TOOL_FILES`). This gave 128 files by script, plus a few hand-added ones (see below). 161 are listed (11-14).
 3. Groups in `MANIFEST` carry a `# why` comment each.
+4. Data files code opens by a literal path are not found by following imports. `check-data-files.py --base DIR` lists any
+   such file under `DIR` that is not in `MANIFEST` (CI runs it on the staged tree). It found `configs/mini-*.yaml`
+   on 11-14, after the back-test showed every Darkbloom mini job failing without them.
 
 ## Left out, and why
 - Mentioned only in docs or comments, never loaded by code: `bloom_power_lib`, `bloom_ledger`, `mini-bench`, `doc-summary`, `mini-answer`, `qwen-dispatch.sh`, `start-llama-server-bonsai.sh`.
