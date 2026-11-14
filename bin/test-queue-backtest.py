@@ -49,12 +49,15 @@ with tempfile.TemporaryDirectory() as t:
     # B1 fixtures: made-up sidecars
     for i, (label, ctx) in enumerate([("auto-author-demo-widget-s2-r1", 8192), ("gate-demo-widget-s3", 16384),
                                       ("plain-label", 4096)]):
-        w(os.path.join(st, "ollama-queue-logs", "%012x.done.json" % i),
-          json.dumps({"id": "%012x" % i, "label": label, "host_pref": "studio", "model": "demo-model:1b", "num_ctx": ctx,
-                      "bundle": "demo-widget" if "widget" in label else None, "persisted_at": "2026-01-0%dT00:00:00" % (i + 1)}))
+        rec = json.dumps({"id": "%012x" % i, "label": label, "host_pref": "studio", "model": "demo-model:1b", "num_ctx": ctx,
+                          "bundle": "demo-widget" if "widget" in label else None, "persisted_at": "2026-01-0%dT00:00:00" % (i + 1)})
+        # log rotation moves older jobs into archive/: the last one lives only there, the first is in both (counted once)
+        w(os.path.join(st, "ollama-queue-logs", *(("archive",) if i == 2 else ()), "%012x.done.json" % i), rec)
+        if i == 0:
+            w(os.path.join(st, "ollama-queue-logs", "archive", "%012x.done.json" % i), rec)
     rc, res, _ = run(t, "B1", ["--old-bin", os.path.join(HERE)])
     p = res["parts"][0] if res else {}
-    check("B1: same code old and new, all matched, no differences", rc == 0 and p.get("cases") == 3 and p.get("matched") == 3
+    check("B1: same code old and new, all matched, no differences (archive/ read, duplicates once)", rc == 0 and p.get("cases") == 3 and p.get("matched") == 3
           and p.get("differences") == [])
     check("B1: lane, model, priority are reported as not comparable with reasons",
           any(k.startswith("lane") for k in p.get("not_comparable", {})) and any(k.startswith("priority") for k in p.get("not_comparable", {})))

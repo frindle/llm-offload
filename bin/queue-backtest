@@ -159,17 +159,21 @@ def read_jsonl(path):
 def load_records(state_dir, limit):
     recs = []
     logs = os.path.join(state_dir, "ollama-queue-logs")
-    try:
-        names = [n for n in os.listdir(logs) if n.endswith(".done.json")]
-    except OSError:
-        names = []
-    for n in names:
+    paths = []
+    for d in (logs, os.path.join(logs, "archive")):      # log rotation moves older jobs into archive/
         try:
-            with open(os.path.join(logs, n)) as f:
+            paths += [os.path.join(d, n) for n in sorted(os.listdir(d)) if n.endswith(".done.json")]
+        except OSError:
+            pass
+    seen = set()
+    for path in paths:
+        try:
+            with open(path) as f:
                 d = json.load(f)
         except (OSError, ValueError):
             continue
-        if isinstance(d, dict) and d.get("label"):
+        if isinstance(d, dict) and d.get("label") and d.get("id") not in seen:
+            seen.add(d.get("id"))
             recs.append(d)
     try:
         with open(os.path.join(state_dir, "ollama-queue-state.json")) as f:
