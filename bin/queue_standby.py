@@ -34,7 +34,11 @@ TOP_NAMES = ("manifest.json", "state", "dispatch")
 # state/: the queue state JSON and the per-job records. (The lock files are never imported.)
 STATE_NAMES = frozenset((
     "ollama-queue-state.json", "ollama-queue-logs", "ollama-queue-livelogs", "signoff.json", "signoff-rules.json",
+    "ollama-worker-logs",
 ))
+# ollama-worker-logs/ goes in whole (~55 MB): the web-search usage page counts its metrics files, and log rotation
+# keeps a transcript while a job log names it, so the container's rotation preview matches the Mac's and the old
+# transcripts age out where the new ones are written.
 
 # dispatch/: the small live state of ~/.ollama-dispatch. Never worktrees, mini-work, mini-runs, mini-venv,
 # node_modules-cache, retired*, scratch or backup folders.
@@ -48,8 +52,17 @@ DISPATCH_NAMES = frozenset((
     "slice-plans", "plans", "auto-runs", "triage", "unsat-seen.json", "scope-creep.jsonl", "excluded.jsonl",
     "conformance", "continuation.disabled", "lane-plan.disabled", "unraid-research-quality.json",
     "slot-measure.jsonl", "darkbloom-usable-peak.json",
+    # read by the dashboard: the log-rotation audit (last run), the CPU lane's stage log (why jobs ran locally), and
+    # the handoff pages (handoff panel; log rotation will not delete without them). The container's config puts
+    # paths.handoff_dir at ~/.ollama-dispatch/handoff; on the Mac it lives elsewhere (build_export handoff_dir=).
+    "log-rotate.log", "cpu-lane.log", "handoff",
 ))
 ROOT_NAMES = {"state": STATE_NAMES, "dispatch": DISPATCH_NAMES}
+
+# Folders whose files' birth times (= job launch) the export records in <folder>/BIRTH_SIDECAR: a copy keeps the
+# modification time (_keep_mtime) but not the birth time, and the dashboard's job history reads start times from it.
+BIRTH_FOLDERS = frozenset(("ollama-queue-livelogs", "ollama-queue-logs"))
+BIRTH_SIDECAR = ".birthtimes.json"
 
 MAX_MEMBERS = 400_000
 MAX_DEPTH = 40
@@ -188,7 +201,8 @@ def _cases_rule(parts, m):
 def extract(tar_path, stage_dirs, manifest_out=None):
     """Second pass: write the validated members under stage_dirs {"state": Path, "dispatch": Path}.
     Returns {tar path: sha256} for every regular file written (the manifest.json itself is parsed into manifest_out)."""
-    written = {}
+    written, dirs = {}, []
+    now = time.time()
     with tarfile.open(tar_path, "r:*") as tf:
         for m in tf:
             parts = clean_name(m.name)
@@ -208,6 +222,7 @@ def extract(tar_path, stage_dirs, manifest_out=None):
             if m.isdir():
                 dest.mkdir(parents=True, exist_ok=True)
                 os.chmod(dest, 0o755)
+                dirs.append((dest, m.mtime))
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             h = hashlib.sha256()
@@ -222,8 +237,27 @@ def extract(tar_path, stage_dirs, manifest_out=None):
                     h.update(b)
                     out.write(b)
             os.chmod(dest, 0o755 if m.mode & 0o111 else 0o644)
+            _keep_mtime(dest, m.mtime, now)
             written["/".join(parts)] = h.hexdigest()
+    # directories last, deepest first: writing a file into a directory resets the directory's mtime
+    for d, mt in reversed(dirs):
+        _keep_mtime(d, mt, now)
     return written
+
+
+def _keep_mtime(path, mtime, now):
+    """Keep the exported file's modification time. The queue orders completed jobs and runs, and picks log-retention
+    and staleness candidates, by mtime; extract-time mtimes would make every imported file look brand new.
+    Times in the future (more than a day) or not set are left as they are."""
+    try:
+        mt = float(mtime)
+    except (TypeError, ValueError):
+        return
+    if 0 < mt <= now + 86400:
+        try:
+            os.utime(path, (mt, mt), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
 
 
 def check_manifest(manifest, written):
@@ -291,6 +325,10 @@ def swap(stage_dirs, targets, stamp=None):
             target = Path(targets[root])
             target.mkdir(parents=True, exist_ok=True)
             bdir = target / (BACKUP_PREFIX + stamp)
+            n = 1
+            while bdir.exists() or bdir.is_symlink():      # a second import within the same second
+                bdir = target / ("%s%s-%d" % (BACKUP_PREFIX, stamp, n))
+                n += 1
             backups[root] = str(bdir)
             for name in sorted(ROOT_NAMES[root]):
                 cur = target / name
@@ -409,12 +447,15 @@ def import_cases(tar_path, root, sha256=None, max_unpacked=None):
 
 # ---- export (the reverse of the import: fallback pulls it back to the Mac; the Mac's cutover packs the same way) ---
 def _add_tree(tf, src, arc, files, skip_sqlite_sidecars=True):
-    """Add `src` (file or folder) as `arc`: regular files only (no links), sha256 per file into `files`."""
+    """Add `src` (file or folder) as `arc`: regular files only (no links), sha256 per file into `files`. A folder
+    goes in as a folder entry too, so the import can put back its modification time (log rotation ages a job's
+    folder by the newest time in it, the folder's own included)."""
     src = Path(src)
     if src.is_symlink() or not src.exists():
         return 0
     n = 0
     if src.is_dir():
+        tf.add(str(src), arcname=arc, recursive=False)
         for child in sorted(src.iterdir()):
             n += _add_tree(tf, child, arc + "/" + child.name, files, skip_sqlite_sidecars)
         return n
@@ -422,14 +463,44 @@ def _add_tree(tf, src, arc, files, skip_sqlite_sidecars=True):
         return 0
     if skip_sqlite_sidecars and src.name.endswith(("-wal", "-shm")):
         return 0
+    if src.name == BIRTH_SIDECAR:                 # rebuilt by build_export (_birth_times)
+        return 0
     files[arc] = sha256_file(src)
     tf.add(str(src), arcname=arc, recursive=False)
     return 1
 
 
-def build_export(state_dir, dispatch_dir, out_tar, scratch=None):
+def _birth_times(folder):
+    """{file name: birth time} for the files directly in `folder` (st_birthtime, macOS), merged over the folder's own
+    BIRTH_SIDECAR (a folder that was itself imported). {} when the platform has no birth times and no sidecar."""
+    out = {}
+    try:
+        old = json.loads((folder / BIRTH_SIDECAR).read_text()).get("files")
+        if isinstance(old, dict):
+            out.update({k: v for k, v in old.items() if isinstance(k, str) and isinstance(v, (int, float))})
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        it = list(os.scandir(folder))
+    except OSError:
+        return out
+    for e in it:
+        if e.name == BIRTH_SIDECAR or not e.is_file(follow_symlinks=False):
+            continue
+        try:
+            b = getattr(e.stat(follow_symlinks=False), "st_birthtime", None)
+        except OSError:
+            continue
+        if b:
+            out[e.name] = b
+    return out
+
+
+def build_export(state_dir, dispatch_dir, out_tar, scratch=None, handoff_dir=None):
     """Pack the small live state (the same allowlist the import takes) into out_tar with a manifest.json of sha256s.
     The CPU-lane sqlite is copied with the sqlite backup API (a consistent snapshot, WAL folded in), never file-copied.
+    handoff_dir: the handoff pages' folder (queue_config.handoff_dir()), packed as dispatch/handoff when the dispatch
+    folder has no handoff/ of its own (the Mac keeps it outside; the container inside).
     -> {"tar_sha256", "files", "bytes"}. Links, devices and anything outside the allowlist are left out."""
     state_dir, dispatch_dir, out_tar = Path(state_dir), Path(dispatch_dir), Path(out_tar)
     import tempfile
@@ -442,7 +513,19 @@ def build_export(state_dir, dispatch_dir, out_tar, scratch=None):
                 for name in sorted(names):
                     if top == "dispatch" and name == "cpu-jobs":
                         continue                                          # handled below (sqlite by backup)
-                    _add_tree(tf, root / name, top + "/" + name, files)
+                    src = root / name
+                    if top == "dispatch" and name == "handoff" and handoff_dir and not (src.exists() or src.is_symlink()):
+                        src = Path(handoff_dir).expanduser()
+                    _add_tree(tf, src, top + "/" + name, files)
+                    if name in BIRTH_FOLDERS and (root / name).is_dir() and not (root / name).is_symlink():
+                        # a copy loses the files' birth times (= job launch); the dashboard reads them from here
+                        births = _birth_times(root / name)
+                        if births:
+                            side = scratch / ("%s-%s" % (top, name))
+                            side.write_text(json.dumps({"format": 1, "files": births}, sort_keys=True))
+                            arc = "%s/%s/%s" % (top, name, BIRTH_SIDECAR)
+                            files[arc] = sha256_file(side)
+                            tf.add(str(side), arcname=arc, recursive=False)
             lane = dispatch_dir / "cpu-jobs"
             db = lane / "jobs.sqlite"
             if db.is_file() and not db.is_symlink():

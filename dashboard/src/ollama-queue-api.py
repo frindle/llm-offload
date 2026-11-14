@@ -5402,9 +5402,10 @@ def _job_summary(j, jobs=None):
         try:
             st = os.stat(log_path)
             # st_ctime on macOS/Linux is last-metadata-change, not creation, so it
-            # collapses to ~mtime once a job finishes -- use st_birthtime (true file
-            # creation = daemon launch) where the platform has it, ctime as fallback.
-            start = getattr(st, "st_birthtime", st.st_ctime)
+            # collapses to ~mtime once a job finishes -- use the file's birth time
+            # (true creation = daemon launch: st_birthtime on macOS, the import's
+            # sidecar or statx in the container), ctime as fallback.
+            start = _log_file_start(log_path, st) or st.st_ctime
             elapsed_s = (time.time() - start) if j.get("status") == "running" else (st.st_mtime - start)
         except OSError:
             pass
@@ -7394,6 +7395,18 @@ def _triage_summary():
         return {"open": 0, "repeats": 0, "oldest": None}
 
 
+def _log_file_start(path, st):
+    """bundle_view.file_start (birth time on macOS and in the container), or st_birthtime if it will not load."""
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import bundle_view as _bv
+        return _bv.file_start(path, st)
+    except Exception:
+        return getattr(st, "st_birthtime", None)
+
+
 def _bundle_view_lib():
     """bundle_view lives next to this file (the repo's src/); dispatch_progress is a
     shared PIPELINE lib (written by preflight / verify-relevance) that stays in the
@@ -8916,7 +8929,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         out = state_dir / (".export-%s.tar" % uuid.uuid4().hex[:8])
         try:
             with q._Locked():
-                res = queue_standby.build_export(state_dir, queue_config.dispatch_dir(), out)
+                res = queue_standby.build_export(state_dir, queue_config.dispatch_dir(), out,
+                                                 handoff_dir=queue_config.handoff_dir())
             size = out.stat().st_size
             self.send_response(200)
             self.send_header("Content-Type", "application/x-tar")

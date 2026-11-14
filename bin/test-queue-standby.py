@@ -88,7 +88,12 @@ def tar_bytes(members, manifest=None):
                 tf.addfile(ti, io.BytesIO(content[1]))
             elif isinstance(content, tuple) and content[0] == "dir":
                 ti.type = tarfile.DIRTYPE
+                if len(content) > 1:
+                    ti.mtime = content[1]
                 tf.addfile(ti)
+            elif isinstance(content, tuple) and content[0] == "dated":
+                ti.size, ti.mtime = len(content[2]), content[1]
+                tf.addfile(ti, io.BytesIO(content[2]))
             else:
                 ti.size = len(content)
                 tf.addfile(ti, io.BytesIO(content))
@@ -220,6 +225,20 @@ def main():
     backups = [p for p in state.iterdir() if p.name.startswith(".standby-backup-")]
     check("import: replace kept a backup of the old state", len(backups) == 1 and (backups[0] / "ollama-queue-state.json").read_bytes() == b'{"jobs": []}', True)
     check("import: old-only files are gone from the live dir", (state / "ollama-queue-logs" / "j1.json").exists(), False)
+    # file and directory modification times survive the import (job order, retention and staleness read them);
+    # a time far in the future is not copied
+    t_old, t_dir = 1_700_000_000, 1_700_000_500
+    blob3 = tar_bytes([("state/ollama-queue-state.json", ("dated", t_old, b'{"jobs": [1]}')),
+                       ("state/ollama-queue-logs", ("dir", t_dir)),
+                       ("state/ollama-queue-logs/j2.json", ("dated", t_old + 60, b"{}")),
+                       ("dispatch/hosts.json", ("dated", time.time() + 30 * 86400, b'{"a":2}'))])
+    st, body = imp(blob3, qs="?replace=1")
+    check("import: dated tarball -> 200", st, 200)
+    check("import: file mtime kept", int((state / "ollama-queue-state.json").stat().st_mtime), t_old)
+    check("import: nested file mtime kept", int((state / "ollama-queue-logs" / "j2.json").stat().st_mtime), t_old + 60)
+    check("import: directory mtime kept after its files were written",
+          int((state / "ollama-queue-logs").stat().st_mtime), t_dir)
+    check("import: future mtime not copied", (disp / "hosts.json").stat().st_mtime < time.time() + 86400, True)
 
     # ---- cases upload (POST /api/standby/cases): the back-test's case files ------------------------------------------
     bt = Path(os.environ["QUEUE_BACKTEST_DIR"])

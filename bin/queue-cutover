@@ -220,7 +220,7 @@ def cmd_export(cx, a):
             cx.say("step 4: would upload to %s/api/standby/import and check the returned sha256" % cx.url)
             return
         cx.work.mkdir(parents=True, exist_ok=True)
-        res = queue_standby.build_export(cx.state_dir, cx.disp, tar)
+        res = queue_standby.build_export(cx.state_dir, cx.disp, tar, handoff_dir=queue_config.handoff_dir())
         cx.say("packed %d files, %d bytes, sha256 %s" % (res["files"], res["bytes"], res["tar_sha256"]))
         replace = a.replace or bool(cx.load().get("imported"))
         path = "/api/standby/import" + ("?replace=1" if replace else "")

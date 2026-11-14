@@ -19,6 +19,11 @@ Parts (pass marks: Queue Move Cutover Plan, "Back-test before going live"):
   B4 live runs   <cases>/b4.jsonl: re-run chosen past jobs in a scratch environment (push and notify neutralised).
   B5 graph jobs  <cases>/b5.jsonl: same runner; compares the graph output (node and edge counts, file set).
   B6 read routes <cases>/b6/routes.json: GET each route on --api-url and compare with the Mac's recorded output.
+     A route may list "ignore": ["/key/path", ...] for values that differ by design (e.g. a config path),
+     "ties": [{"list": "/path", "key": "/timestamp", "by": "/id"}] for a list whose order inside a run of equal "key"
+     values is not fixed (same-second job results come out in set order, which changes on every restart of the Mac's
+     own API; add "limit": N when the route stops at N items, so a tie run cut off there is compared by count and key),
+     and "unordered": ["/path"] for a list that is a set. A route's "why" says why it has any of these.
   B7 events      the session-event mirror run into a scratch folder, compared with the Mac's own event file.
 Case files are made from the real history by the operator step and stay out of git; the test uses made-up ones.
 """
@@ -452,7 +457,82 @@ def part_run(ctx, name, title, graph):
 
 
 # ---------------------------------------------------------------------------------------------- B6
-VOLATILE = re.compile(r"(^|_)(at|ts|time|now|uptime|age|elapsed|generated|updated|since|mtime)(_|$)|_at$|_s$", re.I)
+VOLATILE = re.compile(r"(^|_)(at|ts|time|now|uptime|age|ago|elapsed|generated|updated|since|mtime)(_|$)|_at$|_s$", re.I)
+
+
+def drop_keys(doc, paths):
+    """Remove each "/a/b" key path a route case lists under "ignore": values that differ by design between the Mac and
+    the container, such as a config file's path. A "*" part stands for every item of a list (or every value of a
+    dict): "/runners/*/caps" drops caps from each runner."""
+    def drop(cur, parts):
+        k, rest = parts[0], parts[1:]
+        if k == "*":
+            kids = cur if isinstance(cur, list) else list(cur.values()) if isinstance(cur, dict) else []
+            for x in kids if rest else []:
+                drop(x, rest)
+        elif isinstance(cur, dict):
+            if rest:
+                drop(cur.get(k), rest)
+            else:
+                cur.pop(k, None)
+    for p in paths or []:
+        parts = [x for x in str(p).split("/") if x]
+        if parts:
+            drop(doc, parts)
+    return doc
+
+
+def _at(doc, path):
+    cur = doc
+    for k in [x for x in str(path or "").split("/") if x]:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _canon(v):
+    return json.dumps(v, sort_keys=True, default=str)
+
+
+def order_ties(doc, ties):
+    """Sort each run of adjacent items with an equal "key" value by their "by" value, in the list at "list" ("" is
+    the document itself). Only the order inside such a run changes, so a real ordering difference still shows.
+    With "limit": N and a list of N items (the route cut it there), the last run may go on past the cut, so which
+    of its tied items made the cut is file order too: each of them becomes {"cut_tie": key}, so only how many there
+    are and their key are compared."""
+    for t in ties or []:
+        lst = _at(doc, t.get("list", "")) if isinstance(t, dict) else None
+        if not isinstance(lst, list):
+            continue
+        key, by = t.get("key", ""), t.get("by", "")
+        out, i = [], 0
+        while i < len(lst):
+            j = i
+            while j + 1 < len(lst) and _canon(_at(lst[j + 1], key)) == _canon(_at(lst[i], key)):
+                j += 1
+            run = sorted(lst[i:j + 1], key=lambda x: _canon(_at(x, by)))
+            if j == len(lst) - 1 and isinstance(t.get("limit"), int) and len(lst) >= t["limit"]:
+                run = [{"cut_tie": _canon(_at(x, key))} for x in run]
+            out += run
+            i = j + 1
+        lst[:] = out
+    return doc
+
+
+def order_sets(doc, paths):
+    """Sort each list named in "unordered" (compared as a set)."""
+    for pth in paths or []:
+        lst = _at(doc, pth)
+        if isinstance(lst, list):
+            lst.sort(key=_canon)
+    return doc
+
+
+def b6_view(doc, rt):
+    """What B6 compares: ties ordered (before scrub, which drops the timestamp keys they sort on), ignored keys and
+    volatile keys removed, then set-like lists sorted."""
+    return order_sets(scrub(drop_keys(order_ties(doc, rt.get("ties")), rt.get("ignore"))), rt.get("unordered"))
 
 
 def scrub(v):
@@ -520,7 +600,7 @@ def part_b6(ctx):
         except Exception as e:  # noqa: BLE001
             diff(p, path, "fetch", "JSON", type(e).__name__, "route or recorded output unreadable")
             continue
-        d = first_diff(scrub(want), scrub(got))
+        d = first_diff(b6_view(want, rt), b6_view(got, rt))
         if d:
             diff(p, path, d, "Mac output", "container output", "differs apart from timestamps")
         else:
@@ -559,7 +639,7 @@ def part_b7(ctx):
                 ev = [e for e in events if int(e.get("seq") or 0) > after][:lim]
                 return {"events": ev, "failed": None}
             return {"files": esc}
-    m = agent.Mirror("http://backtest.invalid", None, fetch=fetch, edir=out, esc_dir=os.path.join(out, "escalations"))
+    m = agent.Mirror(api or "http://backtest.invalid", None, fetch=fetch, edir=out, esc_dir=os.path.join(out, "escalations"))
     try:
         m.once()
     except Exception as e:  # noqa: BLE001
@@ -573,7 +653,14 @@ def part_b7(ctx):
     for name, want, got in pairs:
         p["cases"] += 1
         if name.endswith(".jsonl"):
+            # Lines written before events were numbered have no seq: the mirror pages by seq, so it never
+            # sends them, and it appends to the Mac's own file, which keeps them. Compare numbered lines only.
             a, b = read_jsonl(want), read_jsonl(got)
+            old = sum(1 for e in a if e.get("seq") is None)
+            if old:
+                a = [e for e in a if e.get("seq") is not None]
+                p["note"] = ("%d %s lines have no seq (written before events were numbered); the Mac keeps them "
+                             "in its own file and the mirror never sends them, so they are not compared" % (old, name))
             if a == b:
                 p["matched"] += 1
             else:

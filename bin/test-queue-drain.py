@@ -77,6 +77,11 @@ def main():
     (state / "ollama-queue-state.json").write_text(json.dumps({"jobs": [
         {"id": "aaaa00000001", "status": "done"}, {"id": "aaaa00000002", "status": "pending"}]}))
     (state / "ollama-queue-logs" / "aaaa00000001.log").write_text("made-up log\n")
+    # a folder that was itself imported: its birth-time sidecar (export format) must come through once, merged
+    (state / "ollama-queue-livelogs").mkdir()
+    (state / "ollama-queue-livelogs" / "aaaa00000001-x.livelog").write_text("made-up\n")
+    births = {"format": 1, "files": {"aaaa00000001-x.livelog": 1794000000.5}}
+    (state / "ollama-queue-livelogs" / ".birthtimes.json").write_text(json.dumps(births, sort_keys=True))
     (disp / "hosts.json").write_text('{"example": {"url": "http://example.invalid"}}')
     (disp / "queue-events.jsonl").write_text('{"seq": 1}\n')
     (disp / "worktrees").mkdir()
@@ -112,6 +117,11 @@ def main():
           all(n in names for n in ("state/ollama-queue-state.json", "dispatch/hosts.json", "dispatch/cpu-jobs/jobs.sqlite",
                                    "dispatch/cpu-jobs/blobs/j1/in.bin", "manifest.json")), True)
     check("export: sha256 is the file's", res["tar_sha256"], hashlib.sha256(out.read_bytes()).hexdigest())
+    side = [n for n in names if n.endswith("/.birthtimes.json")]
+    check("export: one birth-time sidecar, in the livelogs folder", side, ["state/ollama-queue-livelogs/.birthtimes.json"])
+    with tarfile.open(out) as tf:
+        got_b = json.loads(tf.extractfile("state/ollama-queue-livelogs/.birthtimes.json").read())
+    check("export: the sidecar keeps the imported birth time", got_b["files"].get("aaaa00000001-x.livelog"), 1794000000.5)
     s2, d2 = tmp / "s2", tmp / "d2"
     s2.mkdir(); d2.mkdir()
     imp = queue_standby.import_state(out, s2, d2, sha256=res["tar_sha256"])
@@ -120,10 +130,58 @@ def main():
     check("round trip: sqlite row from the WAL arrived", c2.execute("select id from jobs").fetchall(), [("c1",)])
     c2.close()
     h1, h2 = tree_hashes(state), tree_hashes(s2)
+    check("round trip: the birth-time sidecar arrived", (s2 / "ollama-queue-livelogs" / ".birthtimes.json").is_file(), True)
     check("round trip: state files identical (marker aside)", {k: v for k, v in h2.items() if not k.startswith(".standby")},
           {k: v for k, v in h1.items() if not k.startswith(".")})
     rc = queue_standby.running_counts(state, disp)
     check("running_counts: made-up state", rc, {"running": 0, "cpu_running": 0, "pending": 1})
+
+    # ---- export: the whole worker-log folder; the handoff pages from outside the dispatch folder ----------------------
+    s4, d4, ho = tmp / "s4", tmp / "d4", tmp / "ho"
+    (s4 / "ollama-worker-logs").mkdir(parents=True)
+    d4.mkdir()
+    (ho / "pending").mkdir(parents=True)
+    (s4 / "ollama-worker-logs" / "dispatch-metrics.jsonl").write_text('{"web_searches": 1}\n')
+    (s4 / "ollama-worker-logs" / "20260901T000000Z.json").write_text("{}")
+    os.utime(s4 / "ollama-worker-logs" / "20260901T000000Z.json", (1_700_000_200, 1_700_000_200))
+    (ho / "pending" / "aaaa00000001.md").write_text("made-up\n")
+    (ho / "acted.json").write_text("{}")
+    (d4 / "log-rotate.log").write_text("2026-11-13T00:00:00 rotate mode=apply deleted=1\n")
+    (d4 / "cpu-lane.log").write_text("{}\n")
+    jd = s4 / "ollama-queue-logs" / "aaaa00000001-review"
+    jd.mkdir(parents=True)
+    (jd / "run.json").write_text("{}")
+    os.utime(jd / "run.json", (1_700_000_000, 1_700_000_000))
+    os.utime(jd, (1_700_000_100, 1_700_000_100))
+    out4 = tmp / "x4.tar"
+    queue_standby.build_export(s4, d4, out4, handoff_dir=ho)
+    with tarfile.open(out4) as tf:
+        n4 = sorted(m.name for m in tf.getmembers() if m.isfile())
+        d4m = {m.name: m.mtime for m in tf.getmembers() if m.isdir()}
+    check("export: a job folder goes in as a folder entry with its own time",
+          d4m.get("state/ollama-queue-logs/aaaa00000001-review"), 1_700_000_100)
+    check("export: worker logs = metrics and transcripts", [n for n in n4 if "ollama-worker-logs" in n],
+          ["state/ollama-worker-logs/20260901T000000Z.json", "state/ollama-worker-logs/dispatch-metrics.jsonl"])
+    check("export: handoff pages come from handoff_dir", [n for n in n4 if n.startswith("dispatch/handoff/")],
+          ["dispatch/handoff/acted.json", "dispatch/handoff/pending/aaaa00000001.md"])
+    check("export: rotation audit and CPU lane log are in", ("dispatch/log-rotate.log" in n4, "dispatch/cpu-lane.log" in n4),
+          (True, True))
+    s5, d5 = tmp / "s5", tmp / "d5"
+    s5.mkdir(); d5.mkdir()
+    r5 = queue_standby.import_state(out4, s5, d5, sha256=hashlib.sha256(out4.read_bytes()).hexdigest())
+    check("round trip: handoff pages and worker metrics import",
+          (r5["ok"], (d5 / "handoff" / "pending" / "aaaa00000001.md").is_file(),
+           (s5 / "ollama-worker-logs" / "dispatch-metrics.jsonl").is_file()), (True, True, True))
+    check("round trip: a transcript keeps its time (rotation ages it by mtime)",
+          int((s5 / "ollama-worker-logs" / "20260901T000000Z.json").stat().st_mtime), 1_700_000_200)
+    check("round trip: the job folder keeps its time (rotation would see a new folder as just written)",
+          int((s5 / "ollama-queue-logs" / "aaaa00000001-review").stat().st_mtime), 1_700_000_100)
+    (d4 / "handoff").mkdir()
+    (d4 / "handoff" / "acted.json").write_text('{"own": 1}')
+    queue_standby.build_export(s4, d4, out4, handoff_dir=ho)
+    with tarfile.open(out4) as tf:
+        n5 = [m.name for m in tf.getmembers() if m.isfile() and m.name.startswith("dispatch/handoff/")]
+    check("export: the dispatch folder's own handoff/ wins over handoff_dir", n5, ["dispatch/handoff/acted.json"])
 
     # ---- routes ------------------------------------------------------------------------------------------------------
     check("no token configured: 403", call(srv, "POST", "/api/admin/drain", {"on": True})[0], 403)

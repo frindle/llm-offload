@@ -139,7 +139,17 @@ with tempfile.TemporaryDirectory() as t:
     check("B5: matching graph, planted node-count difference caught", p5.get("matched") == 1 and [d["case"] for d in p5["differences"]] == ["g2"])
     check("B4: git push inside a re-run hit the blocking shim (rc 0; a real push outside a repo gives 128)", p4.get("matched") == 1)
     # B6: stub API
-    docs = {"/api/a": {"jobs": 3, "updated_at": 5, "name": "x"}, "/api/b": {"n": 1}}
+    docs = {"/api/a": {"jobs": 3, "updated_at": 5, "name": "x", "r": [{"seen_s_ago": 1.5}]}, "/api/b": {"n": 1},
+            "/api/c": {"cfg": {"path": "/config/hosts.json", "n": 1}}, "/api/d": {"cfg": {"path": "/x", "n": 2}},
+            "/api/e": [{"id": "b", "timestamp": 7}, {"id": "a", "timestamp": 7}, {"id": "c", "timestamp": 5}],
+            "/api/f": [{"id": "c", "timestamp": 5}, {"id": "a", "timestamp": 7}, {"id": "b", "timestamp": 7}],
+            "/api/g": {"unattached": ["y", "x"], "n": 1},
+            "/api/h": [{"row": {"id": "q", "timestamp": 3}, "children": []},
+                       {"row": {"id": "p", "timestamp": 3}, "children": []}],
+            "/api/i": {"runners": [{"id": "r1", "n": 1}, {"id": "r2", "n": 2}]},
+            "/api/j": {"runners": [{"id": "r1", "n": 1}, {"id": "r2", "n": 5}]},
+            "/api/k": [{"id": "a", "timestamp": 9}, {"id": "b", "timestamp": 5}, {"id": "d", "timestamp": 5}],
+            "/api/l": [{"id": "a", "timestamp": 9}, {"id": "b", "timestamp": 5}, {"id": "d", "timestamp": 5}]}
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -153,13 +163,52 @@ with tempfile.TemporaryDirectory() as t:
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d" % srv.server_address[1]
-    w(os.path.join(cases, "b6", "a.json"), json.dumps({"jobs": 3, "updated_at": 999, "name": "x"}))
+    w(os.path.join(cases, "b6", "a.json"), json.dumps({"jobs": 3, "updated_at": 999, "name": "x", "r": [{"seen_s_ago": 40.0}]}))
     w(os.path.join(cases, "b6", "b.json"), json.dumps({"n": 2}))
-    w(os.path.join(cases, "b6", "routes.json"), json.dumps([{"path": "/api/a", "mac_file": "a.json"}, {"path": "/api/b", "mac_file": "b.json"}]))
+    w(os.path.join(cases, "b6", "c.json"), json.dumps({"cfg": {"path": "/Users/x/hosts.json", "n": 1}}))
+    w(os.path.join(cases, "b6", "d.json"), json.dumps({"cfg": {"path": "/y", "n": 3}}))
+    tie = [{"list": "", "key": "/timestamp", "by": "/id"}]
+    w(os.path.join(cases, "b6", "e.json"), json.dumps([{"id": "a", "timestamp": 7}, {"id": "b", "timestamp": 7},
+                                                       {"id": "c", "timestamp": 5}]))
+    w(os.path.join(cases, "b6", "f.json"), json.dumps([{"id": "a", "timestamp": 7}, {"id": "b", "timestamp": 7},
+                                                       {"id": "c", "timestamp": 5}]))
+    w(os.path.join(cases, "b6", "g.json"), json.dumps({"unattached": ["x", "y"], "n": 1}))
+    w(os.path.join(cases, "b6", "h.json"), json.dumps([{"row": {"id": "p", "timestamp": 3}, "children": []},
+                                                       {"row": {"id": "q", "timestamp": 3}, "children": []}]))
+    runners = {"runners": [{"id": "r1", "n": 1, "caps": {"node": 26}, "disk": {"free": 9}},
+                           {"id": "r2", "n": 2, "caps": {"node": 24}}]}
+    w(os.path.join(cases, "b6", "i.json"), json.dumps(runners))
+    w(os.path.join(cases, "b6", "j.json"), json.dumps(runners))
+    each = ["/runners/*/caps", "/runners/*/disk"]
+    cut = [{"id": "a", "timestamp": 9}, {"id": "c", "timestamp": 5}, {"id": "b", "timestamp": 5}]
+    w(os.path.join(cases, "b6", "k.json"), json.dumps(cut))
+    w(os.path.join(cases, "b6", "l.json"), json.dumps(cut))
+    w(os.path.join(cases, "b6", "routes.json"), json.dumps([
+        {"path": "/api/a", "mac_file": "a.json"}, {"path": "/api/b", "mac_file": "b.json"},
+        {"path": "/api/c", "mac_file": "c.json", "ignore": ["/cfg/path"]},
+        {"path": "/api/d", "mac_file": "d.json", "ignore": ["/cfg/path"]},
+        {"path": "/api/e", "mac_file": "e.json", "ties": tie}, {"path": "/api/f", "mac_file": "f.json", "ties": tie},
+        {"path": "/api/g", "mac_file": "g.json", "unordered": ["/unattached"]},
+        {"path": "/api/h", "mac_file": "h.json", "ties": [{"list": "", "key": "/row/timestamp", "by": "/row/id"}]},
+        {"path": "/api/i", "mac_file": "i.json", "ignore": each}, {"path": "/api/j", "mac_file": "j.json", "ignore": each},
+        {"path": "/api/k", "mac_file": "k.json", "ties": [dict(tie[0], limit=3)]},
+        {"path": "/api/l", "mac_file": "l.json", "ties": [dict(tie[0], limit=4)]}]))
     rc, res, _ = run(t, "B6", ["--api-url", url])
     p = res["parts"][0] if res else {}
-    check("B6: timestamp-only difference ignored, planted value difference caught",
-          p.get("matched") == 1 and [d["case"] for d in p["differences"]] == ["/api/b"])
+    check("B6: timestamp and *_ago differences ignored, planted value difference caught",
+          [d["case"] for d in p.get("differences", [])][:1] == ["/api/b"])
+    check("B6: an ignored key path is skipped, a value beside it still compared",
+          [d["case"] for d in p.get("differences", [])][:2] == ["/api/b", "/api/d"])
+    check("B6: same-timestamp ties in another order match (flat and nested key), a real order difference is caught",
+          (p.get("matched"), [d["case"] for d in p.get("differences", [])]) == (7, ["/api/b", "/api/d", "/api/f", "/api/j", "/api/l"]))
+    check("B6: an unordered list matches in any order",
+          "/api/g" not in [d["case"] for d in p.get("differences", [])] and p.get("cases") == 12)
+    check("B6: an ignore path with * drops the key from every list item, a value beside it still compared",
+          "/api/i" not in [d["case"] for d in p.get("differences", [])]
+          and [d.get("field") for d in p.get("differences", []) if d["case"] == "/api/j"] == ["/runners[1]/n"])
+    check("B6: a tie run cut off at the route's limit compares by count and key only; under the limit it is compared",
+          "/api/k" not in [d["case"] for d in p.get("differences", [])]
+          and [d.get("field") for d in p.get("differences", []) if d["case"] == "/api/l"] == ["[2]/id"])
     srv.shutdown()
     # B7
     evs = [{"seq": i, "kind": "done", "text": "job %d finished" % i} for i in range(1, 6)]
@@ -175,6 +224,14 @@ with tempfile.TemporaryDirectory() as t:
     rc, res, _ = run(t, "B7")
     p = res["parts"][0] if res else {}
     check("B7: planted event text difference caught at its seq", rc == 1 and p["differences"] and p["differences"][0]["case"] == "seq 3")
+    evs[2]["text"] = "job 3 finished"
+    pre = [{"kind": "done", "text": "before numbering %d" % i} for i in range(2)]
+    for side in ("source", "mac"):
+        w(os.path.join(cases, "b7", side, "queue-events.jsonl"), "".join(json.dumps(e) + "\n" for e in pre + evs))
+    rc, res, _ = run(t, "B7")
+    p = res["parts"][0] if res else {}
+    check("B7: lines from before events had a seq are left out and counted in the note",
+          rc == 0 and p.get("matched") == 2 and p.get("note", "").startswith("2 queue-events.jsonl lines have no seq"))
     # whole run: status files, table, scratch gone, state untouched
     before = sorted(os.listdir(os.path.join(st, "ollama-queue-logs")))
     rc, res, out = run(t, "B1,B7", ["--old-bin", HERE])
