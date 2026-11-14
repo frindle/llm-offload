@@ -8,7 +8,7 @@ Plan and contract: `Queue Docker Build.md` and `Queue to Unraid Docker.md` in th
 
 | File | What it does |
 |---|---|
-| `Dockerfile` | python 3.14 slim bookworm plus git, tini, supervisor, procps, lsof, build tools, node 26 (copied from the official image), pnpm, tsx, uv, a mini-swe-agent venv. User `queue` (PUID 99, PGID 100 by build arg). Code at `/opt/queue/bin`, `~/bin` links to it |
+| `Dockerfile` | python 3.14 slim bookworm plus git, tini, supervisor, procps, lsof, build tools, node 26 (copied from the official image), pnpm, tsx, uv, a mini-swe-agent venv, a repo-toolchain venv (`/opt/repo-toolchain/difvenv`, Python 3.12 web packages for pet-portrait-studio's check; pins in `requirements-difvenv.txt`), and Python 3.13 under `/opt/uv-python` for the graph job's own venv (the back-test's B5 test runner). User `queue` (PUID 99, PGID 100 by build arg). Code at `/opt/queue/bin`, `~/bin` links to it |
 | `supervisord.conf` | one program per launchd job (8), with the plist's env, restart, stop and schedule rules |
 | `PROCESS-MAP.md` | each plist mapped to its program, every env var and where it went, and what cannot run in Linux |
 | `every.sh`, `throttle.sh` | replace launchd StartInterval / StartCalendarInterval and ThrottleInterval |

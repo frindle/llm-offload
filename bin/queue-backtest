@@ -17,7 +17,9 @@ Parts (pass marks: Queue Move Cutover Plan, "Back-test before going live"):
                  and the CPU lane's own hold check, at the edges of each hold, tolerance 10 s.
   B3 checks      <cases>/b3.jsonl: apply each recorded diff to its recorded base tree and run its recorded check.
   B4 live runs   <cases>/b4.jsonl: re-run chosen past jobs in a scratch environment (push and notify neutralised).
-  B5 graph jobs  <cases>/b5.jsonl: same runner; compares the graph output (node and edge counts, file set).
+  B5 graph jobs  <cases>/b5.jsonl: same runner. Each case drives one real graph job through this code's CPU-lane API to
+                 a test copy of the CPU runner (case-local, all writes under the scratch dir) and compares the graph
+                 output with the Mac's (node and edge counts, file set) plus the result fields the case lists.
   B6 read routes <cases>/b6/routes.json: GET each route on --api-url and compare with the Mac's recorded output.
      A route may list "ignore": ["/key/path", ...] for values that differ by design (e.g. a config path),
      "ties": [{"list": "/path", "key": "/timestamp", "by": "/id"}] for a list whose order inside a run of equal "key"
@@ -493,12 +495,18 @@ def part_run(ctx, name, title, graph):
         shutil.rmtree(work, ignore_errors=True)
         shutil.copytree(cwd, work, symlinks=True)
         env = sandbox_env(os.path.join(ctx["scratch"], "home"))
-        rc = run_cmd(argv, work, env, int(c.get("timeout") or 900))
+        # the sandbox env drops everything else; a case names the variables its argv needs (endpoints, tokens, code
+        # dir) and they come from the container's own environment at run time, never from the case file
+        for k in c.get("env_pass") or []:
+            if isinstance(k, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k) and k in os.environ:
+                env[k] = os.environ[k]
+        logs = os.path.join(ctx["scratch"], "%s-logs" % name.lower())
+        os.makedirs(logs, exist_ok=True)
+        log = os.path.join(logs, re.sub(r"[^A-Za-z0-9_.-]", "_", str(cid)) + ".log")
+        rc = run_cmd(argv, work, env, int(c.get("timeout") or 900), log=log)
         exp = c.get("expect") or {}
         ok = True
-        if "exit" in exp and rc != exp["exit"]:
-            diff(p, cid, "exit", exp["exit"], rc, "exit status differs from the Mac's record")
-            ok = False
+        n_diff = len(p["differences"])
         rf = _within(work, c.get("result_file", "")) if c.get("result_file") else None
         res = None
         if rf:
@@ -506,11 +514,25 @@ def part_run(ctx, name, title, graph):
                 with open(rf) as f:
                     res = json.load(f)
             except (OSError, ValueError):
-                diff(p, cid, "result_file", "readable JSON", "missing or invalid", "the re-run wrote no result")
-                ok = False
+                res = None
+        if isinstance(res, dict) and res.get("not_comparable"):
+            # the re-run could not be judged (the lane was busy, the model provider was held): not a pass or a failure
+            nc(p, str(res["not_comparable"])[:200])
+            continue
+        if "exit" in exp and rc != exp["exit"]:
+            diff(p, cid, "exit", exp["exit"], rc, "exit status differs from the Mac's record")
+            ok = False
+        if rf and res is None:
+            diff(p, cid, "result_file", "readable JSON", "missing or invalid", "the re-run wrote no result")
+            ok = False
+        if isinstance(res, dict) and isinstance(res.get("info"), dict):
+            # reported, not graded (B5: how a from-scratch graph compares with the Mac's incrementally grown one)
+            p.setdefault("info", []).append({"case": str(cid), "info": res["info"]})
         if res is not None:
             if "verdict" in exp and res.get("verdict") != exp["verdict"]:
                 diff(p, cid, "verdict", exp["verdict"], res.get("verdict"), "check verdict differs from the Mac's record")
+                if isinstance(res, dict) and res.get("raw_verdict"):
+                    p["differences"][-1]["detail"] = _short(res["raw_verdict"])
                 ok = False
             for k, v in (exp.get("result") or {}).items():
                 if res.get(k) != v:
@@ -520,13 +542,20 @@ def part_run(ctx, name, title, graph):
                 for k in ("nodes", "edges"):
                     if k in exp:
                         got = len(res.get(k) or []) if isinstance(res.get(k), list) else res.get(k)
-                        if got != exp[k]:
+                        # <k>_tol: a case may allow a small relative gap (listed as tolerated, never silent)
+                        tol = float(c.get(k + "_tol") or 0)
+                        if got != exp[k] and tol and isinstance(got, (int, float)) and abs(got - exp[k]) <= tol * exp[k]:
+                            p.setdefault("tolerated", []).append({"case": str(cid), "field": k, "expected": exp[k],
+                                                                  "got": got, "tolerance": tol})
+                        elif got != exp[k]:
                             diff(p, cid, k, exp[k], got, "graph %s count differs from the Mac's record" % k)
                             ok = False
                 if "files" in exp and sorted(res.get("files") or []) != sorted(exp["files"]):
                     diff(p, cid, "files", sorted(exp["files"]), sorted(res.get("files") or []),
                          "graph file set differs from the Mac's record")
                     ok = False
+        for d in p["differences"][n_diff:]:
+            d["tail"] = _tail(log)
         p["matched"] += 1 if ok else 0
     return p
 

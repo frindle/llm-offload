@@ -55,6 +55,23 @@ RUN python3 -m venv /opt/mini-venv \
     && /opt/mini-venv/bin/pip install --no-cache-dir "mini-swe-agent==2.4.6" ruff \
     && /opt/mini-venv/bin/python -c "import litellm, yaml, jinja2, minisweagent"
 
+# Repo toolchains the Mac's checks call by absolute path, in venvs of their own (uv fetches the interpreter; the dir is
+# readable by the queue user). The back-test's path_map points the Mac paths at them (queue-backtest B3):
+#   /opt/repo-toolchain/difvenv   Python 3.12 + the web packages of /Volumes/NVMe-Models/image-models/.difvenv (fastapi
+#                                 0.141.1, starlette 1.6.0, uvicorn 0.52.4, python-multipart 0.0.32). pet-portrait-studio's verify.sh.
+# Python 3.13 under UV_PYTHON_INSTALL_DIR: the graph job script (graphify_job.sh setup, `uv venv --python 3.13`) builds
+# its own venv from the Mac's pins, as on the Unraid runner. The back-test's B5 test runner finds it with
+# `uv python find 3.13`; uv never downloads one at run time.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+COPY requirements-difvenv.txt /tmp/
+RUN uv venv /opt/repo-toolchain/difvenv --python 3.12 \
+    && uv pip install --python /opt/repo-toolchain/difvenv/bin/python --no-cache -r /tmp/requirements-difvenv.txt \
+    && /opt/repo-toolchain/difvenv/bin/python -c "import fastapi, starlette, uvicorn, multipart, httpx, PIL; from fastapi.testclient import TestClient" \
+    && uv python install 3.13 \
+    && UV_PYTHON_DOWNLOADS=never uv python find 3.13 \
+    && chmod -R a+rX /opt/uv-python /opt/repo-toolchain \
+    && rm /tmp/requirements-difvenv.txt
+
 # The unprivileged user. Unraid's default owner of appdata is 99:100 (nobody:users). GID 100 already
 # exists in Debian (users), so reuse a group when the GID is taken.
 RUN (getent group "${PGID}" >/dev/null || groupadd -g "${PGID}" queue) \

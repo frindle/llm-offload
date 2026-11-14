@@ -142,22 +142,54 @@ with tempfile.TemporaryDirectory() as t:
     # B4 / B5
     w(os.path.join(cases, "job1", "run.py"),
       "import json,subprocess,sys\nr=subprocess.run(['git','push'],capture_output=True)\n"
-      "json.dump({'verdict':'pass','pushed_rc':r.returncode,'nodes':[1,2],'edges':[1],'files':['a.py']},open('out.json','w'))\n"
+      "json.dump({'verdict':'pass','pushed_rc':r.returncode,'nodes':[1,2],'edges':[1],'files':['a.py'],"
+      "'info':{'mac_nodes_not_rebuilt':3}},open('out.json','w'))\n"
       "sys.exit(0)\n")
+    w(os.path.join(cases, "job2", "run.py"),
+      "import json,os,sys\nprint('b45-tail-marker')\n"
+      "if os.environ.get('B45_BUSY'):\n json.dump({'not_comparable':'Darkbloom busy'},open('out.json','w')); sys.exit(3)\n"
+      "json.dump({'verdict':'FAIL','raw_verdict':'FAIL (gates) class=MODEL','seen':os.environ.get('B45_TOKEN_NAME','-'),"
+      "'leak':os.environ.get('B45_NOT_PASSED','-')},open('out.json','w'))\nsys.exit(1)\n")
+    os.environ["B45_TOKEN_NAME"] = "tok-from-env"
+    os.environ["B45_NOT_PASSED"] = "secret"
     w(os.path.join(cases, "b4.jsonl"),
       json.dumps({"id": "j1", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json",
                   "expect": {"exit": 0, "verdict": "pass", "result": {"pushed_rc": 0}}}) + "\n" +
       json.dumps({"id": "j2", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json",
-                  "expect": {"exit": 0, "verdict": "fail"}}) + "\n")
+                  "expect": {"exit": 0, "verdict": "fail"}}) + "\n" +
+      json.dumps({"id": "j3", "cwd": "job2", "argv": [sys.executable, "run.py"], "result_file": "out.json",
+                  "env_pass": ["B45_TOKEN_NAME", "B45_BUSY"],
+                  "expect": {"exit": 1, "verdict": "PASS", "result": {"seen": "tok-from-env", "leak": "-"}}}) + "\n")
     w(os.path.join(cases, "b5.jsonl"),
       json.dumps({"id": "g1", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json",
                   "expect": {"exit": 0, "nodes": 2, "edges": 1, "files": ["a.py"]}}) + "\n" +
       json.dumps({"id": "g2", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json",
+                  "expect": {"exit": 0, "nodes": 3, "edges": 1, "files": ["a.py"]}}) + "\n" +
+      json.dumps({"id": "g3", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json", "edges_tol": 0.5,
+                  "expect": {"exit": 0, "nodes": 2, "edges": 2, "files": ["a.py"]}}) + "\n" +
+      json.dumps({"id": "g4", "cwd": "job1", "argv": [sys.executable, "run.py"], "result_file": "out.json", "nodes_tol": 0.1,
                   "expect": {"exit": 0, "nodes": 3, "edges": 1, "files": ["a.py"]}}) + "\n")
     rc, res, _ = run(t, "B4,B5")
     p4, p5 = res["parts"] if res else ({}, {})
-    check("B4: matching re-run, planted verdict difference caught", p4.get("matched") == 1 and [d["case"] for d in p4["differences"]] == ["j2"])
-    check("B5: matching graph, planted node-count difference caught", p5.get("matched") == 1 and [d["case"] for d in p5["differences"]] == ["g2"])
+    check("B4: matching re-run, planted verdict differences caught", p4.get("matched") == 1
+          and [d["case"] for d in p4["differences"]] == ["j2", "j3"])
+    d3 = [d for d in p4["differences"] if d["case"] == "j3"]
+    check("B4: a verdict difference carries the raw verdict and the end of the run's output",
+          d3 and d3[0].get("detail") == "FAIL (gates) class=MODEL" and "b45-tail-marker" in d3[0].get("tail", ""))
+    check("B4: env_pass hands the case only the variables it names (token read from the environment, other one withheld)",
+          not [d for d in p4["differences"] if d["case"] == "j3" and d["field"] in ("seen", "leak")])
+    rc, res, _ = run(t, "B4", env_extra={"B45_BUSY": "1"})
+    pb = res["parts"][0] if res else {}
+    check("B4: a not-comparable result is counted with its reason, not as a match or a difference",
+          pb.get("not_comparable") == {"Darkbloom busy": 1} and pb.get("matched") == 1
+          and [d["case"] for d in pb["differences"]] == ["j2"])
+    check("B5: matching graph, planted node-count differences caught (g2 exact, g4 outside its tolerance)",
+          p5.get("matched") == 2 and [d["case"] for d in p5["differences"]] == ["g2", "g4"])
+    check("B5: an edge count inside the case's tolerance matches and is listed as tolerated",
+          [(t["case"], t["field"], t["expected"], t["got"]) for t in p5.get("tolerated", [])] == [("g3", "edges", 2, 1)])
+    check("B5: a run's info block is reported per case, outside the grading",
+          [(i["case"], i["info"]) for i in p5.get("info", [])] == [(g, {"mac_nodes_not_rebuilt": 3})
+                                                                   for g in ("g1", "g2", "g3", "g4")])
     check("B4: git push inside a re-run hit the blocking shim (rc 0; a real push outside a repo gives 128)", p4.get("matched") == 1)
     # B6: stub API
     docs = {"/api/a": {"jobs": 3, "updated_at": 5, "name": "x", "r": [{"seen_s_ago": 1.5}]}, "/api/b": {"n": 1},
