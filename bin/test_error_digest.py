@@ -129,7 +129,7 @@ def test_signature_and_level():
         sig("2026-11-13 10:00:01 boom failed"))
     s = sig("request failed token=abc123secretvalue api_key: xyz789 password=hunter2 for bob@example.com")
     chk("secrets and emails never reach the kind", all(x not in s for x in ("abc123", "xyz789", "hunter2", "bob@")), s)
-    s = sig("GET https://host.example/api/v1/items/123?apikey=SECRET1&x=2 failed")
+    s = ED.shape("GET https://host.example/api/v1/items/123?apikey=SECRET1&x=2 failed")
     chk("a URL keeps its host and path shape, never its query string", "SECRET1" not in s and "?…" in s
         and "host.example" in s, s)
     chk("words with double letters survive the number collapse", "CPU_RUNNER_TOKEN" in sig("WARNING: CPU_RUNNER_TOKEN is not set"),
@@ -140,15 +140,46 @@ def test_signature_and_level():
         sig("[WARN] Plugin 'libx.so' has been disabled") == sig("[WARN] Plugin 'liby_long.so' has been disabled"))
     j = sig('{"level":"warn","ts":1731500000.1,"logger":"http","msg":"HTTP/2 skipped","addr":":80"}')
     chk("a JSON log line reads as level logger: msg", j.startswith("warn http: HTTP/N skipped"), j)
+    chk("short hashes fold ('8a3f1b2c' / '1234b567' one kind)",
+        sig("history lookup for 8a3f1b2c failed") == sig("history lookup for 1234b567 failed"),
+        (sig("history lookup for 8a3f1b2c failed"), sig("history lookup for 1234b567 failed")))
+    chk("plain words and codec names are not short hashes", "decade" in sig("decade check for h264 failed"))
+    chk("request paths on one host are one kind",
+        sig('ERR Request failed error="context canceled" dest=https://storage.example.com/plugins/gpustat?x=1 type=http')
+        == sig('ERR Request failed error="context canceled" dest=https://storage.example.com/Plugins type=http'))
+    chk("different hosts stay different kinds",
+        sig("ERR dest=https://a.example.com/x failed") != sig("ERR dest=https://b.example.com/x failed"))
+    s = sig("[Warn] HTTP Error [GET] http://192.0.2.9:9117/api/v2.0/x/api?t=s&apikey=SECRET2&q=Some%20Show&season=2 failed")
+    chk("a redacted key does not cut the URL short (the query after it goes too)",
+        "SECRET2" not in s and "Some" not in s and "season" not in s, s)
+    chk("quoted titles with spaces and apostrophes fold",
+        sig("Couldn't add release 'Lincoln Rhyme S01 1080p WEBRip' from Indexer to download queue.")
+        == sig("Couldn't add release 'Grey's Anatomy S20 720p' from Indexer to download queue."))
+    chk("an apostrophe inside a word is not a quote", "add release" in sig("Couldn't add release now, failed"))
+    chk("id=value fields fold", sig('lvl=warn msg="deprecated" log_id=0aBcDeFgHi') == sig('lvl=warn msg="deprecated" log_id=0ZzYyXxWw1'))
     lv = ED.level
     cases = [("[Warn] HttpClient: HTTP Error 503", "warn"), ("2026-11-13 10:00:00,1 INFO waiting for critical-exit to die", None),
              ("[Info] Rss sync failed 0 times", None), ("Sync done: 0 errors, failed=0", None),
              ("rebroadcast error Error: timeout", "error"), ("level=ERROR msg=\"server terminated\"", "error"),
              ("time=x level=WARN msg=\"OOM detected; error clearing\"", "warn"), ("[supervisor] x is non-critical", None),
              ("app - ERROR - db failed", "error"), ("WARNING:root:odd", "warn"), ("[error] Error in process", "error"),
-             ("status fetch failed, keeping provided info", "error")]
+             ("status fetch failed, keeping provided info", "error"),
+             ("2026-11-12T10:00:00Z INF | ERROR: Allow outbound TCP on port 7844. |", None),
+             ("2026-11-12T10:00:00Z WRN Serve tunnel error error=\"timeout\"", "warn"),
+             ("2026-11-12T10:00:00Z ERR Request failed error=\"unexpected EOF\"", "error")]
     bad = [(l, lv(l), w) for l, w in cases if lv(l) != w]
     chk("levels: the logger's tag wins, then the words; '0 errors' is not an error", not bad, bad)
+
+
+def test_render_caps():
+    mk = lambda i, lvl, n: {"id": "%s%02d" % (lvl[0], i), "level": lvl, "count": n, "text": "%s kind %d" % (lvl, i),
+                            "first_ns": 0, "last_ns": 0, "new": True}
+    sigs = [mk(i, "error", 100 - i) for i in range(15)] + [mk(i, "warn", 50 - i) for i in range(8)]
+    md = ED.render({"day": "2026-11-14", "containers": {"app": {"sigs": sigs}}, "model": {}})
+    chk("new kinds per container are capped (10 errors, 5 warnings) with the rest counted",
+        md.count("`error kind") == 10 + 1 and md.count("`warn kind") == 5
+        and "plus 5 rarer new error kinds and 3 rarer new warning kinds" in md, md[:1500])
+    chk("the most frequent new kinds are the ones shown", "error kind 0`" in md and "error kind 14`" not in md)
 
 
 def test_noise():
@@ -178,6 +209,8 @@ def test_build_and_new(base, tmp):
                         (ns_at(d2, 6), "sync to deluge failed: timeout")],
         "sonarr": [(ns_at(d2, 3), "[Warn] HealthCheckService: Indexers unavailable due to failures")],
         "quiet": [(ns_at(d2, 3), "all fine")],
+        "priceless_brattain": [(ns_at(d3, 2), "[ERROR] tile build failed: no admin table")],
+        "sharp_visvesvaraya": [(ns_at(d3, 7), "[ERROR] tile build failed: no admin table")],
     }
     ED.PAGE = 2   # forces paging through query_range
     rc, out, err = quiet(ED.main, ["backfill", "--days", "0"])
@@ -203,6 +236,15 @@ def test_build_and_new(base, tmp):
         and not r2["containers"]["sonarr"]["sigs"], r2["containers"].get("sonarr"))
     chk("a container with no error lines is not in the digest", "quiet" not in r2["containers"])
     chk("day 3: history covers both earlier days", r3["history_days"] == [d1, d2] and not r3["baseline"], r3["history_days"])
+    oo = r3["containers"].get(ED.ONE_OFF) or {}
+    chk("docker-named one-off containers share one heading and one kind",
+        oo.get("names") == ["priceless_brattain", "sharp_visvesvaraya"] and len(oo.get("sigs") or []) == 1
+        and oo["sigs"][0]["count"] == 2 and "priceless_brattain" not in r3["containers"], r3["containers"].keys())
+    chk("the one-off heading names its containers", "### (one-off containers) (priceless_brattain, sharp_visvesvaraya)"
+        in (tmp / "digests" / (d3 + ".md")).read_text())
+    chk("only docker's own adjective_name pattern is one-off",
+        [ED.group_of(x) for x in ("home_assistant", "ollama-queue", "sharp_visvesvaraya", "zen_lovelace2")]
+        == ["home_assistant", "ollama-queue", ED.ONE_OFF, ED.ONE_OFF])
     md = (tmp / "digests" / (d2 + ".md")).read_text()
     chk("markdown: headline counts new kinds, the new error is listed under its container",
         "2 new kinds of error" in md and "### app" in md and "disk full" in md and "## Known noise" in md, md)
@@ -343,6 +385,7 @@ def main():
     try:
         test_signature_and_level()
         test_noise()
+        test_render_caps()
         r2 = test_build_and_new(lbase, tmp)
         test_model_step(tmp, r2, obase)
         test_supervisor_and_allowlist()

@@ -65,7 +65,8 @@ _SUBS = [
                 r"passwd|pwd|cookie|session(?:id)?|sig(?:nature)?|auth)\b(\"?\s*[:=]\s*\"?|\s+)[^\s\"',;&]+"),
      r"\1\2<redacted>"),
     (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"), "<email>"),
-    (re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>)]+"), lambda m: _url_shape(m.group(0))),
+    (re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>)]+(?:<redacted>[^\s\"'<>)]*)*"), lambda m: _url_shape(m.group(0))),
+    (re.compile(r"\b(\w+_id|\w+_ID|[a-z]+Id|id|ID|Id)(\"?\s*[=:]\s*\"?)[A-Za-z0-9._:-]{3,}"), r"\1\2<id>"),
     (re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<uuid>"),
     (re.compile(r"\b\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?)?"), "<time>"),
     (re.compile(r"\b\d\d:\d\d:\d\d(?:[.,]\d+)?\b"), "<time>"),
@@ -75,11 +76,13 @@ _SUBS = [
     (re.compile(r"(?i)\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b"), "<ip>"),
     (re.compile(r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b"), "<mac>"),
     (re.compile(r"(?i)\b(?=[0-9a-f]*\d)[0-9a-f]{12,}\b"), "<hex>"),
+    (re.compile(r"(?i)\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,11}\b"), "<hex>"),   # short hashes ('8a3f1b2c')
     (re.compile(r"(?i)\b0x[0-9a-f]+\b"), "<hex>"),
     (re.compile(r"(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[a-z])[A-Za-z0-9+/_-]{32,}={0,2}"), "<blob>"),
     (re.compile(r"\d+(?:\.\d+)*"), "N"),
 ]
-_QUOTED = re.compile(r"'[^'\s]{1,80}'")
+_QUOTED = re.compile(r"(?<!\w)'(?:[^'\n]|'(?=\w)){1,160}'(?!\w)")     # 'a name', 'A Title (N)', 'Grey's'
+_URL_PATH = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s?\"'<>)]+)[^\s\"'<>)]+")
 
 
 def _url_shape(u):
@@ -134,22 +137,24 @@ def shape(line):
 
 
 def signature(line):
-    """The kind of an error line: its shape() with short single-quoted names folded ('libfoo.so' -> '<q>'), so two
-    lines that differ only in a number, id, address or plugin/file name are one kind."""
-    return _QUOTED.sub("'<q>'", shape(line))
+    """The kind of an error line: its shape() with single-quoted names folded ('libfoo.so', 'A Show SN' -> '<q>') and
+    URLs cut to their host, so two lines that differ only in a number, id, address, title or request path are one
+    kind (the digest still shows the first line's own shape)."""
+    return _URL_PATH.sub(r"\1/…", _QUOTED.sub("'<q>'", shape(line)))
 
 
 def sig_id(container, sig):
     return hashlib.sha1((container + "\0" + sig).encode()).hexdigest()[:10]
 
 
-_LV = r"(trace|debug|info|notice|warn|warning|err|error|eror|fatal|crit|critical|panic|alert|emerg)"
+_LV = r"(trace|trc|debug|dbg|info|inf|notice|warn|warning|wrn|err|error|eror|fatal|crit|critical|panic|alert|emerg)"
 _TAG_BRACKET = re.compile(r"[\[<(]" + _LV + r"[\]>)]", re.I)
 _TAG_KV = re.compile(r"\b(?:level|lvl|severity|loglevel)[\"']?\s*[:=]\s*[\"']?" + _LV + r"\b", re.I)
-_TAG_LEAD = re.compile(r"^[\d\-/:.,TZ+ ]*(?:[A-Za-z_][\w.\-]*:?\s+)?(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|"
-                       r"FATAL|CRIT|CRITICAL|PANIC)\b")
+_TAG_LEAD = re.compile(r"^[\d\-/:.,TZ+ ]*(?:[A-Za-z_][\w.\-]*:?\s+)?(TRACE|TRC|DEBUG|DBG|INFO|INF|NOTICE|WARN|"
+                       r"WARNING|WRN|ERROR|ERR|FATAL|CRIT|CRITICAL|PANIC)\b")       # INF/WRN/ERR: zerolog (cloudflared)
 _TAG_DASH = re.compile(r"\s[-|]\s(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s[-|:]")
-_LV_MAP = {"trace": None, "debug": None, "info": None, "notice": None, "warn": "warn", "warning": "warn"}
+_LV_MAP = {"trace": None, "trc": None, "debug": None, "dbg": None, "info": None, "inf": None, "notice": None,
+           "warn": "warn", "warning": "warn", "wrn": "warn"}
 
 
 def level_tag(s):
@@ -365,19 +370,46 @@ def summarize_lines(container, rows, rules):
             "benign": benign, "sigs": sorted(sigs.values(), key=lambda r: (-r["count"], r["id"]))}
 
 
+# Docker's own name generator (adjective_surname) names a container started without --name: a one-off run such as a
+# tile build. Their lines go under one heading, so the same one-off job run twice is not two sets of "new" kinds.
+ONE_OFF = "(one-off containers)"
+_DOCKER_ADJ = set("""admiring adoring affectionate agitated amazing angry awesome beautiful blissful bold boring brave busy
+charming clever compassionate competent condescending confident cool cranky crazy dazzling determined distracted dreamy
+eager ecstatic elastic elated elegant eloquent epic exciting fervent festive flamboyant focused friendly frosty funny
+gallant gifted goofy gracious great happy hardcore heuristic hopeful hungry infallible inspiring intelligent interesting
+jolly jovial keen kind laughing loving lucid magical modest musing mystifying naughty nervous nice nifty nostalgic
+objective optimistic peaceful pedantic pensive practical priceless quirky quizzical recursing relaxed reverent romantic
+sad serene sharp silly sleepy stoic strange stupefied suspicious sweet tender thirsty trusting unruffled upbeat vibrant
+vigilant vigorous wizardly wonderful xenodochial youthful zealous zen""".split())
+
+
+def group_of(container):
+    a, _, b = (container or "").partition("_")
+    return ONE_OFF if a in _DOCKER_ADJ and re.fullmatch(r"[a-z]+\d*", b or "") else container
+
+
 def build_day(loki, day, ddir, rules, say=print):
     start, end = day_bounds(day)
     counts = loki.error_counts(start, end)
     seen, hist_days = history(ddir, day)
     rec = {"day": day, "window": [_iso(start), _iso(end)], "generated": _iso(time.time()),
            "history_days": hist_days, "baseline": not hist_days, "containers": {}, "model": None}
+    groups = {}
     for c in sorted(counts, key=lambda k: -counts[k]):
-        if counts[c] <= 0:
-            continue
-        rows, capped = loki.lines(c, start, end)
+        if counts[c] > 0:
+            groups.setdefault(group_of(c), []).append(c)
+    for c, names in groups.items():
+        rows, capped = [], False
+        for n in names:
+            r, cp = loki.lines(n, start, end)
+            rows += r
+            capped = capped or cp
+        rows.sort(key=lambda x: x[0])
         info = summarize_lines(c, rows, rules)
         info["capped"] = capped
-        info["loki_count"] = counts[c]
+        info["loki_count"] = sum(counts[n] for n in names)
+        if c == ONE_OFF:
+            info["names"] = sorted(names)
         prior = seen.get(c, set())
         for s in info["sigs"]:
             s["new"] = bool(hist_days) and s["id"] not in prior
@@ -397,6 +429,9 @@ def _hm(ns):
 
 
 # ---------------------------------------------------------------------------------------------------- rendering
+SHOW_NEW_ERRORS, SHOW_NEW_WARNINGS = 10, 5       # per container in "New today"; the rest are counted, kept in the JSON
+
+
 def render(rec, top=5):
     day = rec["day"]
     cs = rec.get("containers") or {}
@@ -429,12 +464,21 @@ def render(rec, top=5):
             by_c.setdefault(c, []).append(s)
         for c, ss in sorted(by_c.items(), key=lambda kv: (all(s["level"] != "error" for s in kv[1]),
                                                          -max(s["count"] for s in kv[1]))):
-            out += ["### %s" % c, ""]
-            for s in ss:
+            out += ["### %s" % c + (" (%s)" % ", ".join(cs[c]["names"]) if cs[c].get("names") else ""), ""]
+            errs = [s for s in ss if s["level"] == "error"]
+            warns = [s for s in ss if s["level"] != "error"]
+            shown = errs[:SHOW_NEW_ERRORS] + warns[:SHOW_NEW_WARNINGS]
+            for s in shown:
                 when = _hm(s["first_ns"]) if s["count"] == 1 else "%s to %s" % (_hm(s["first_ns"]), _hm(s["last_ns"]))
                 out.append("- %s, %s×, %s: `%s`" % (s["level"], f"{s['count']:,}", when, _short(s["text"])))
                 if meaning.get(s["id"]):
                     out.append("  Probably: " + meaning[s["id"]])
+            more_e, more_w = len(errs) - len([s for s in shown if s["level"] == "error"]), len(ss) - len(shown)
+            more_w -= more_e
+            if more_e or more_w:
+                bits = ["%d rarer new %s kind%s" % (n, what, "" if n == 1 else "s")
+                        for what, n in (("error", more_e), ("warning", more_w)) if n]
+                out.append("- plus %s (all in %s.json)" % (" and ".join(bits), day))
             out.append("")
     out += ["## By container", "", "| Container | Lines | Kinds | New | Most frequent |", "|---|---|---|---|---|"]
     for c, i in sorted(cs.items(), key=lambda kv: -sum(s["count"] for s in kv[1]["sigs"])):
