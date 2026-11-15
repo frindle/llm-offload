@@ -75,3 +75,4 @@ cashback-unwrap/
 !ts-mutator/*.mjs
 !ts-mutator/package.json
 !ts-mutator/package-lock.json
+!error_digest_noise.json

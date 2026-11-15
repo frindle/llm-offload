@@ -211,6 +211,9 @@ ALLOWED_RUNNERS = {
     str(Path.home() / "bin" / "darkbloom-field-probe-runner.py"),
     # 2026-11-01: private scenario-focused PDF summaries (doc-summary CLI). The runner prints only opaque ids / counts / E_* codes.
     str(Path.home() / "bin" / "docsum_run.py"),
+    # 2026-11-15: the nightly container error digest's model step (one "probably means" line per NEW error kind,
+    # free model on the Unraid lane). Reads one digest JSON, prints only counts. error_digest.py queues it.
+    str(Path.home() / "bin" / "error-digest-runner.py"),
 }
 # RESOLVED FORMS TOO (2026-10-06, found by pipeline-canary.py): enqueue compares
 # Path(--runner).resolve() against these Path.home() strings, so a HOME that has a
