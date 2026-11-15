@@ -37,6 +37,11 @@ WORKER = Path(os.environ.get("WORKER_SRC") or HERE / "ollama-worker.py")
 DBCHAT = Path(os.environ.get("DBCHAT_SRC") or HERE / "darkbloom_chat.py")
 DB = "http://127.0.0.1:8000"
 UNRAID = "http://198.51.100.145:11434"
+# Hermetic Darkbloom endpoint: a fake key and base laid over local.json (queue_config.darkbloom_apply_env), so the
+# test neither reads the Mac's real key nor, in a HOME with no ~/.darkbloom/local.json (the sandbox gate), waits out
+# the 8 s key re-read on every call (that made it run past the gate's 300 s).
+os.environ["DARKBLOOM_BASE_URL"] = DB
+os.environ["DARKBLOOM_API_KEY"] = "test-coldload-key"
 BUSY = b'{"error":{"message":"2 model slot(s) are active; cannot load \'gemma-4-26b-qat-4bit\'"}}'
 BUSY2 = b"1 cached model slot(s) are active; try again when a request finishes"
 CAPACITY = b'{"error":{"type":"invalid_request_error","message":"Provider capacity is temporarily unavailable."}}'
@@ -193,6 +198,10 @@ def dbchat_tests(d):
 
 def main():
     w = load(WORKER, "ollama_worker_coldload")
+    # call_ollama's normal retry backoff (3 s, 5 s x attempt) is real time and adds ~100 s; these checks count
+    # attempts, not seconds. Cap every sleep at 10 ms (the slot-busy steps are already 0.5 ms).
+    _sleep = w.time.sleep
+    w.time.sleep = lambda s: _sleep(min(s, 0.01))
     worker_tests(w)
     d = load(DBCHAT, "darkbloom_chat_coldload")
     dbchat_tests(d)

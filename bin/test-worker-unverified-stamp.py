@@ -14,7 +14,7 @@ Run: python3 test-worker-unverified-stamp.py
 import importlib.util
 import sys
 
-WORKER = "/Users/user/bin/ollama-worker.py"
+WORKER = str(__import__("pathlib").Path(__file__).resolve().parent / "ollama-worker.py")
 
 
 def _load():

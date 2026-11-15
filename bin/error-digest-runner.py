@@ -26,9 +26,28 @@ import error_digest as ED  # noqa: E402
 MAX_WORDS = 25
 SYSTEM = (
     "You explain error lines from home-server docker containers to the owner, who is not a programmer. "
-    "For each line, say in at most 20 plain words what it most likely means (what broke or what was refused). "
-    "Use only what the line itself and the container name show. Do not guess causes the line does not show, do not "
-    "suggest fixes, do not mention numbers or ids (they were removed). If you cannot tell, answer exactly: unclear. "
+    "For each line, say in at most 20 plain words what the line reports: what broke, what was refused, or what "
+    "happened.\n"
+    "Rules:\n"
+    "- Use only what the line and the container name show. Never add a cause, reason or effect the line does not "
+    "state. Restating the line in plain words is fine; guessing why it happened is wrong.\n"
+    "- Placeholders stand for removed values: N (a number), <ip>, <id>, <hex>, <uuid>, <blob>, <email>, <time>, "
+    "<redacted>, '<q>' (a name or title). They are never the problem: <ip> is just whichever address was involved.\n"
+    "- A word in parentheses or brackets is usually a name (a client, a category, a job, a plugin), not an event.\n"
+    "- If the line reports success, a recovery, or a normal start or stop, say so. Do not call it a failure.\n"
+    "- If the line is too short or too cut off to tell what happened, answer exactly: unclear\n"
+    "- No fixes, no numbers, no ids.\n"
+    "Examples:\n"
+    "  [Warn] SyncService: Unable to fetch item list from Transmission (tv-archive)\n"
+    "    good: The app could not read the item list from Transmission.\n"
+    "    wrong: ...during archiving (tv-archive is a name, not something that happened)\n"
+    "  Health probe to backend <ip> port N succeeded after N retries\n"
+    "    good: A health check reached the backend after a few retries.\n"
+    "  Login rejected for user <email> from <ip>: bad credentials\n"
+    "    good: Someone tried to log in with the wrong password.\n"
+    "    wrong: Login blocked because of a bad IP address\n"
+    "  E! [agent] N result=N\n"
+    "    good: unclear\n"
     "Answer with JSON only.")
 SCHEMA = {"type": "object", "properties": {"lines": {"type": "array", "items": {
     "type": "object", "properties": {"id": {"type": "string"}, "meaning": {"type": "string"}},

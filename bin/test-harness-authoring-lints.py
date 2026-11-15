@@ -114,11 +114,7 @@ def main():
         (wt / "refimpl.py").write_text("def run(t):\n    try:\n        return t.x.y()\n    except KeyError:\n        return None\n")
         (wt / "verify.test.ts").write_text(GOOD)
         check("healthy worktree -> no authoring finding", hg.harness_authoring_findings(wt, "") == [])
-    au = (HERE / "ollama-dispatch-auto").read_text()
-    check("authoring prompt carries the JS recipes (import node:test, Module._load, self-contained evaluate, compressed timers)",
-          all(s in au for s in ("JS_FIXTURE_RECIPES_RULE", "Module as any)._load", "SELF-CONTAINED", "Math.ceil(ms / 50)"))
-          and "import_rule += MOCK_MODULE_RULE + JS_FIXTURE_RECIPES_RULE" in au)
-    check("refimpl authoring section carries the no-swallow hygiene rule", "what it deleted, even though its own verify may go green.\n{REFIMPL_HYGIENE_RULE}" in au)
+    # (the authoring-prompt checks read ollama-dispatch-auto, removed 2026-11-02 in commit 2637810)
     print("HARNESS_AUTHORING_LINTS_OK" if not FAILS else f"FAILED: {FAILS}")
     return 1 if FAILS else 0
 

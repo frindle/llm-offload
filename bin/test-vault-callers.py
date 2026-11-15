@@ -20,12 +20,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-SHIM = Path(os.environ.get("VC_SHIM", "/Users/user/Desktop/GitHub Projects/vault-stack/shim/vault_shim.py"))
+SHIM = Path(os.environ.get("VC_SHIM") or Path(__import__("pwd").getpwuid(os.getuid()).pw_dir)
+            / "Desktop/GitHub Projects/vault-stack/shim/vault_shim.py")   # the gate sets VC_SHIM to its shipped copy
 BIN = Path(os.environ.get("VC_BIN", str(Path.home() / "bin")))
 SELF = Path(__file__).resolve()
 REAL_URL = "http://192.0.2.240:27123"
 UNREACHABLE = "http://127.0.0.1:9"      # revert copies must never reach the real vault
-DEFAULT_URL = os.environ.get("VC_DEFAULT_URL", REAL_URL)
+DEFAULT_URL = os.environ.get("VC_DEFAULT_URL")  # unset: the worker's configured default (vault.url in the queue config,
+                                               # "" where none is set, as on the sandbox)
 TOKEN = "test-token-NOT-REAL-1234567890"
 DEFAULT_FILE_TOKEN = "default-file-token"
 TARGETS = ("ollama-worker.py", "vault-semantic.py", "session-summary-index.py", "vault_conf.py", "vault-log-append",
@@ -121,7 +123,7 @@ def suite() -> bool:
         # no env file -> the default URL and the default token file (no network here)
         (home / ".config" / "vault" / "env").rename(td / "env.off")
         u2, t2 = ow._vault_endpoint()
-        check("no env file -> default URL", u2, DEFAULT_URL)
+        check("no env file -> default URL", u2, DEFAULT_URL if DEFAULT_URL is not None else ow.VAULT_URL_DEFAULT)
         check("no env file -> default token file", t2, DEFAULT_FILE_TOKEN)
         (td / "env.off").rename(home / ".config" / "vault" / "env")
 

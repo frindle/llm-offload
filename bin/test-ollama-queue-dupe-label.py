@@ -22,7 +22,7 @@ def run(home, label, extra=()):
     env = dict(os.environ, HOME=str(home))
     cwd = home / "work"
     return subprocess.run(
-        [sys.executable, str(QUEUE), "enqueue", "--model", "m", "--host", "studio",
+        [sys.executable, str(QUEUE), "enqueue", "--model", "Qwen3.5-9B", "--host", "studio",
          "--cwd", str(cwd), "--task-file", str(cwd / "T.md"), "--task-kind", "coding",
          "--num-ctx", "4096", "--verify", "true", "--label", label, "--no-ctx-gate",
          *extra],

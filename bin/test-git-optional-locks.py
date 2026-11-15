@@ -9,8 +9,8 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TOOLS = ["ollama-worker.py", "ollama-dispatch-slice", "ollama-dispatch-auto",
-         "gate-on-complete.py", "ollama-queue.py"]
+# ollama-dispatch-slice and ollama-dispatch-auto were removed 2026-11-02 (commit 2637810); the live pipeline tools remain.
+TOOLS = ["ollama-worker.py", "gate-on-complete.py", "ollama-queue.py"]
 LINE = 'os.environ.setdefault("GIT_OPTIONAL_LOCKS", "0")'
 FAILS = []
 

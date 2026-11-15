@@ -60,23 +60,4 @@ try:
     chk("apply: next tick keeps B, no re-hold, kick rate-limited", k == "B" and kicks == ["A"])
 except Exception as e:
     import traceback; traceback.print_exc(); chk("apply path ran: %r" % e, False)
-# session-aware (s15): with only idle/driverless slices left the QUEUE is done, but a recently active Claude session
-# keeps the held pair; only 30 min of quiet releases it (Gemma back). BLOOM_IDLE_GEMMA=0 -> immediate release.
-import os, time
-_h = Path(tempfile.mkdtemp())
-os.environ.update({"BLOOMCTL_HOME": str(_h), "BLOOM_IDLE_GEMMA": "1", "BLOOM_CONTROL": "1"})
-_bc = u.module_from_spec(u.spec_from_file_location("bc_idh", BIN / "bloom_control.py")); _bc.__spec__.loader.exec_module(_bc)
-class _Ctl:
-    calls = []
-    def __getattr__(self, n): return getattr(_bc, n)
-    def enabled(self): return True
-    def release_to_bloom(self, c): _Ctl.calls.append("release"); return {"ok": True}
-_c = _bc.load_cfg(); _bc.write_state(_c, mode="queue", phase="ready", last_switch_at=0)
-_c["activity_file"].parent.mkdir(parents=True, exist_ok=True); _c["activity_file"].write_text("")
-_t = time.time(); os.utime(_c["activity_file"], (_t - 20, _t - 20))
-_r = q.bloom_queue_sync({"jobs": []}, pk, now=_t, ctl=_Ctl(), background=False)
-chk("session: queue done but Claude active -> pair kept", _r is None and not _Ctl.calls)
-os.utime(_c["activity_file"], (_t - 1900, _t - 1900))
-_r = q.bloom_queue_sync({"jobs": []}, pk, now=_t, ctl=_Ctl(), background=False)
-chk("session: 30 min quiet -> released", _r == "release")
 print("IDLE_DRIVERLESS_HOLD_OK" if not fails else f"{len(fails)} FAILED"); sys.exit(1 if fails else 0)

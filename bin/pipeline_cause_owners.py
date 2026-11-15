@@ -10,7 +10,6 @@ code, and `attribute_flip()` maps a real pregate->regate flip onto it.
 
 Cause keys are "<namespace>:<name>":
   failure_class:*  ollama-queue.py classify_failure / _stamp_failure_class
-  attempt:*        ollama-dispatch-auto classify_author_failure (ATTEMPT_CLASSES)
   gate_authority:* gate-on-complete.py payload["gate_authority"]
   fix_class:*      gate-on-complete.py autofix_classify / autofix_consider class
   harness_repair:* dispatch-self-heal.py HARNESS_REPAIR_CAUSES: a parked slice whose kept,
@@ -28,9 +27,10 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-Q, A, G, H, C = ("ollama-queue.py", "ollama-dispatch-auto", "gate-on-complete.py",
-                 "handoff-emit.py", "completeness.py")
-S, SL = "dispatch-self-heal.py", "ollama-dispatch-slice"
+# ollama-dispatch-auto and ollama-dispatch-slice were removed 2026-11-02 (commit 2637810): their attempt:* classes,
+# owners and forbidden undos left this table with them.
+Q, G, H, C = ("ollama-queue.py", "gate-on-complete.py", "handoff-emit.py", "completeness.py")
+S = "dispatch-self-heal.py"
 HA = "harness_admission.py"
 
 
@@ -75,18 +75,10 @@ CAUSES = {
          "failed rebase aborted: tree exactly as found (fail-open)",
          "resumed/continuation jobs' own tree never rewritten",
          "classifier relabels model->stale-base only when drift touches the task's files"],
-        forbid=[(A, "restore_authoring_tree_to_base")],
         note="classify side: _stamp_failure_class; fix side: refresh_stale_base at launch"),
     "failure_class:nonconvergence_progressing": _c(_o(Q, "_stamp_progress"),
         ["only for authoring jobs with terminal_reason=nonconvergence and real progress",
          "still model-side for NSAMPLE purposes"]),
-    # ---- authoring attempt classes (dispatch-auto owns the refine ladder) -----------
-    **{f"attempt:{n}": _c(_o(A, "classify_author_failure"),
-        ["same class twice = same wall; should_escalate keys on it",
-         "attempt history recorded per RUN, not per bundle"])
-       for n in ("refimpl-fails-own-tests", "syntax-error", "baseline-passes",
-                 "stage-check-failed", "no-progress", "iteration-cap", "exploration-exhausted", "verify-missing",
-                 "contaminated", "other", "harness-env", "stage-contract")},
     # ---- gate authority (who set the final verdict) ---------------------------------
     "gate_authority:studio-27b-regate": _c(_o(G, "merge_review"),
         ["regate verdict is final: pregate payload keeps pregate_verdict, regate='done'",
@@ -125,7 +117,7 @@ CAUSES = {
          "the worktree is never deleted and the gate is never bypassed: success = VERIFY_OK AND the "
          "relevance gate no longer blocks, then the existing --regate re-enters the slice",
          "no survivors named / not a verify-relevance NO-GO -> nothing here, existing ladder applies"],
-        forbid=[(S, "_retry_with_notes"), (SL, "retry_slice")],
+        forbid=[(S, "_retry_with_notes")],
         note="sweep side: harness_repair_sweep (dispatch-self-heal.py --job-sweep, every watcher pass)")
        for n in ("converged-nogo-verify-relevance", "review-c-relevance-survivors")},
     # ---- harness admission gate (harness_admission.admit owns the refusal) ------------
@@ -135,9 +127,7 @@ CAUSES = {
          "state recorded outside the worktree (fingerprint-keyed); cleared ONLY by the harness changing "
          "(repair path: heal_harness_repair / --retry-slice / --regate) and re-passing the gate",
          "repair jobs (-r10N) are exempt from refusal but the next enqueue re-runs the whole gate"],
-        forbid=[(A, "resolve_runaway")],
-        note="enqueue sites: ollama-dispatch-auto _dispatch_model_inner + auto_continue_go, "
-             "ollama-dispatch-slice confirm_and_enqueue, ollama-queue.py cmd_enqueue (backstop)")
+        note="enqueue site: ollama-queue.py cmd_enqueue (backstop); the auto/slice enqueue sites were removed 2026-11-02")
        for n in ("fixture-untraceable", "baseline-not-red", "refimpl-unapplicable", "refimpl-syntax",
                  "contract-broken", "flaky-fixture", "fixture-type-mismatch",
                  "oversize-reslice", "reslice-required", "repeated-defect", "refine-no-change")},
@@ -147,12 +137,13 @@ CAUSES = {
          "a non-staged auto-author job (-cN/-esc/-fresh) that modified it has the files restored and the event logged",
          "staged -s1/-s2/-s3, refine and repair rounds are NEVER reverted; a same-path re-scaffold or a removed "
          "worktree clears the state + .snap instead of restoring it"]),
-    "harness_admission:refusal-respec": _c(_o(SL, "bound_stale_worktree_retry"),
+    "harness_admission:refusal-respec": _c(_o(HA, "admit"),
         ["an ADMISSION_REFUSED failure spends the slice's re-spec budget (respec_on_cap, RESPEC_CAP) exactly ONCE and "
          "is a NON-ATTEMPT (author_attempts / author_launches_total handed back); is_spec_defect is False for it",
          "budget spent -> ESCALATED with a repair hint (--retry-slice / --regate); the removed worktree takes its "
          "admission state with it"],
-        note="single owner of the refusal re-spec budget; auto only stops the rounds (NO_MORE_ROUNDS_PREFIXES)"),
+        note="admit() names the cause; the re-spec budget's owner (ollama-dispatch-slice.bound_stale_worktree_retry) "
+             "was removed 2026-11-02 with the slicer"),
     # ---- verdict signals (evidence the verdict was set by a non-reviewer mechanism) --
     "verdict_signal:untrusted-baseline": _c(_o(Q, "seal_prev_round_baseline"),
         ["continuation round launches from a CLEAN, ATTRIBUTABLE baseline (prev round sealed)",
@@ -217,7 +208,7 @@ def _slice(src, start_pat, end_pat=r"\n(?=def |class |# ---)"):
 
 def referenced_causes(bin_dir):
     """Causes the CODE emits, extracted from the source (not from this table)."""
-    q, a, g = _read(bin_dir, Q), _read(bin_dir, A), _read(bin_dir, G)
+    q, g = _read(bin_dir, Q), _read(bin_dir, G)
     out = set()
     # failure_class: returns inside the two classifiers + explicit stamps.
     for fn in ("classify_failure", "classify_runner_failure"):
@@ -226,11 +217,6 @@ def referenced_causes(bin_dir):
     out |= {f"failure_class:{x}" for x in re.findall(r'job\["failure_class"\] = "([\w-]+)"', q)}
     out |= {f"failure_class:{x}" for x in re.findall(r'\n\s+cls = "([\w-]+)"', _slice(q, r"\ndef _stamp_failure_class\("))}
     out |= {f"failure_class:{x}" for x in re.findall(r'"(nonconvergence_progressing)"', _slice(q, r"\ndef _stamp_progress\("))}
-    # attempt classes
-    m = re.search(r"ATTEMPT_CLASSES = \(([^)]*)\)", a)
-    if m:
-        out |= {f"attempt:{x}" for x in re.findall(r'"([\w-]+)"', m.group(1))}
-    out |= {f"attempt:{x}" for x in re.findall(r'return "([\w-]+)"', _slice(a, r"\ndef classify_author_failure\("))}
     # gate authority
     out |= {f"gate_authority:{x}" for x in re.findall(r'\["gate_authority"\] = "([\w-]+)"', g)}
     # in-place harness repair causes (dispatch-self-heal.py)

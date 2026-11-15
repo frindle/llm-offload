@@ -70,14 +70,14 @@ for c, s in pco.CAUSES.items():
         check(f"{c} fully specified", False, True)
 check("the five core failure classes are in the table",
       all(f"failure_class:{c}" in pco.CAUSES for c in ("model", "context", "harness", "spec", "stale-base")), True)
-check("stage-check-failed + stale-base are owned",
-      (pco.owner_key("attempt:stage-check-failed"), pco.owner_key("failure_class:stale-base")),
-      ("ollama-dispatch-auto:classify_author_failure", "ollama-queue.py:refresh_stale_base"))
+check("stale-base is owned", pco.owner_key("failure_class:stale-base"), "ollama-queue.py:refresh_stale_base")
+check("no cause names a removed tool (auto/slice, removed 2026-11-02)",
+      [c for c, s in pco.CAUSES.items() if any("ollama-dispatch-" in o["file"] for o in [s["owner"]] + s["forbidden_undo"])], [])
 
 # lint bites: a code-referenced cause missing from the table, and a dangling owner
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
-    for n in (pco.Q, pco.A, pco.G, pco.H, pco.C):
+    for n in (pco.Q, pco.G, pco.H, pco.C, pco.S, pco.HA):
         t = (BIN / n).read_text(errors="replace")
         if n == pco.G:
             t = t.replace('["gate_authority"] = "review-missing-terminal"', '["gate_authority"] = "brand-new-authority"')

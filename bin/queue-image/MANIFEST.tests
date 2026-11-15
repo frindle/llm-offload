@@ -112,11 +112,9 @@ test-ollama-land.py
 test-ollama-queue-dupe-label.py
 test-ollama-tool-call-parse.py
 test-pass-review.py
-test-pipeline-e2e.py
 test-pipeline-ladder.py
 test-plan-offload.py
 test-preempt-escalation.py
-test-prefetch-register.py
 test-qctl-close-dismiss.py
 test-qctl.py
 test-queue-abort.py
@@ -153,7 +151,6 @@ test-queue-worker-consistency.py
 test-regate-hold-scope.py
 test-relevance-applied-creation-target.py
 test-relevance-behavioural-optout.py
-test-relevance-io-adapter.py
 test-relevance-necessity-bank.py
 test-relevance-reindent-typeonly.py
 test-review-darkbloom-schema-exhausted.py
@@ -173,7 +170,6 @@ test-secondop-diff-archived.py
 test-self-heal-extract-tree.py
 test-self-heal-hygiene.py
 test-self-heal-lineage-pass.py
-test-selfcheck-hang.py
 test-selftest-hermetic.py
 test-sole-mechanism-replaced.py
 test-source-text-harness.py

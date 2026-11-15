@@ -12,8 +12,6 @@ tested those branches.
 
   test-relevance-behavioural-optout.py                 # against ~/bin
   RELEVANCE_BIN_FILE=<old verify-relevance.py> ...     # revert-test: must FAIL
-Also exercises the auto-harness-check static rule (HARNESS_CHECK in
-ollama-dispatch-auto) unless RELEVANCE_BIN_FILE is set.
 """
 from __future__ import annotations
 
@@ -163,62 +161,7 @@ def main() -> int:
         for ln in benign:
             check(K(ln) is None, f"honour  {ln.strip()[:70]}", K(ln))
 
-    if os.environ.get("RELEVANCE_BIN_FILE") is None:
-        print("\nC. auto-harness-check fails a refimpl that opts out a behavioural line")
-        auto = SourceFileLoader("auto", os.environ.get("AUTO_FILE", str(BIN / "ollama-dispatch-auto")))
-        aspec = importlib.util.spec_from_loader("auto", auto)
-        amod = importlib.util.module_from_spec(aspec)
-        auto.exec_module(amod)
-        for name, line, want_fail in (
-                ("bad", "  if (rows === 0) { // relevance: unobservable", True),
-                ("bad-py", "    return total >= limit  # relevance: unobservable", True),
-                ("good", "  console.log('rows', rows); // relevance: unobservable", False)):
-            wt = tmp / f"hc-{name}"
-            wt.mkdir()
-            sh(["git", "init", "-q", "-b", "main"], wt)
-            (wt / "TASK.md").write_text("# TASK\nOnly edit `lib/x.ts`.\n\n## Must contain\n- `rows`\n")
-            (wt / "verify.sh").write_text("#!/bin/bash\nexit 1\n")
-            (wt / "test_fixture.py").write_text("import sys\nsys.exit(1)\n")
-            (wt / "refimpl.py").write_text("NEW = r'''\n" + line + "\n'''\n")
-            amod.write_harness_check(wt, "python")
-            r = sh([sys.executable, "auto-harness-check.py"], wt)
-            failed = r.returncode == 1 and "BEHAVIOURAL OPT-OUT" in r.stdout
-            check(failed == want_fail,
-                  f"{name}: self-check {'FAILS on the opt-out' if failed else 'does not flag it'} "
-                  f"(want {'FAIL' if want_fail else 'no flag'})",
-                  (r.stdout + r.stderr).strip()[-160:])
-
-    if os.environ.get("RELEVANCE_BIN_FILE") is None:
-        print("\nD. auto-harness-check fails a scope line that lets the coding job edit the harness")
-        for name, scope, want_fail in (
-                ("harness-in-scope", "Only edit `lib/x.ts` (via refimpl.py), `verify.test.ts`, and `TASK.md`.", True),
-                ("verify-sh-in-scope", "Only edit `lib/x.ts`, `verify.sh`.", True),
-                ("correct", "Only edit `lib/x.ts`; do not edit `verify.sh`, `verify.test.ts` or `TASK.md`.", False),
-                ("test-file-target", "Only edit `lib/x.test.ts`; do not edit `verify.sh`.", False)):
-            wt = tmp / f"scope-{name}"
-            wt.mkdir()
-            sh(["git", "init", "-q", "-b", "main"], wt)
-            (wt / "TASK.md").write_text(f"# TASK\n{scope}\n\n## Must contain\n- `rows`\n")
-            (wt / "verify.sh").write_text("#!/bin/bash\nexit 1\n")
-            (wt / "verify.test.ts").write_text("// fixture\n")
-            (wt / "refimpl.py").write_text("NEW = r'''\n  const rows = 1;\n'''\n")
-            amod.write_harness_check(wt, "ts")
-            r = sh([sys.executable, "auto-harness-check.py"], wt)
-            failed = r.returncode == 1 and "lets the coding job edit harness" in r.stdout
-            check(failed == want_fail,
-                  f"{name}: {'FAILS on scope' if failed else 'scope accepted'} "
-                  f"(want {'FAIL' if want_fail else 'accept'})", r.stdout.strip()[-140:])
-
-    if os.environ.get("RELEVANCE_BIN_FILE") is None:
-        print("\nE. multi-module guard ignores the dispatch's own harness file names")
-        txt = ("refimpl.py must extract it; do not edit verify.sh, verify.test.ts or "
-               "check_literals.py")
-        got = amod.foreign_module_files(txt, "components/X.tsx", None)
-        check(got == [], f"harness names are not foreign modules: {got}")
-        got2 = amod.foreign_module_files(txt + "; also build lib/newThing.ts and lib/other.ts",
-                                         "components/X.tsx", None)
-        check(got2 == ["lib/newThing.ts", "lib/other.ts"],
-              f"real foreign modules are still detected: {got2}")
+    # Parts C-E exercised ollama-dispatch-auto's harness self-check, removed 2026-11-02 (commit 2637810).
 
     print(f"\n{checks - fails}/{checks} checks passed")
     print("BEHAVIOURAL OPT-OUT TEST PASSED" if not fails else "BEHAVIOURAL OPT-OUT TEST FAILED")

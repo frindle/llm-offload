@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REAL_HOME = os.environ["HOME"]
 FAILS = []
-DEFAULT_SRC = Path(REAL_HOME) / "Desktop/GitHub Projects/ollama-queue-dashboard/src/ollama-queue-api.py"
+DEFAULT_SRC = (Path(__file__).resolve().parent / "ollama-queue-api.py").resolve()   # ~/bin's link into the dashboard repo
 
 MUTANTS = [
     ("empty line ignores CPU stages",

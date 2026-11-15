@@ -2,7 +2,7 @@
 """Unsatisfiable-job WARNING (2026-10-13, idea borrowed from ollamaMQ's fail-fast visibility).
 
 A PENDING job whose model NO online host/lane can serve at all (Darkbloom's own arithmetic says it
-cannot load: bloom-control 'infeasible' record / cold-load gate; or the fit table already held it
+cannot load: the provider's cold-load gate; or the fit table already held it
 'no host fits model footprint') that STAYS that way longer than QUEUE_UNSAT_WARN_S (default 600) is
 named in the dashboard waiting banner as a WARNING. WARNING ONLY: nothing is failed, cancelled,
 rerouted, parked or written to the queue state; a busy / loading / briefly-offline backend never
@@ -46,30 +46,29 @@ def job(jid="j1", **kw):
     return d
 
 
-infeasible = lambda m, now=None, state_path=None: WHY          # bloom-control says: cannot load
+infeasible = lambda m, now=None, **k: WHY                     # the cold-load gate says: cannot load
 none = lambda *a, **k: None
-R = lambda j, **kw: q.unsat_reason(j, bloom_note=kw.get("bloom", none), cold_gate=kw.get("cold", none),
+R = lambda j, **kw: q.unsat_reason(j, cold_gate=kw.get("cold", none),
                                    db_url=kw.get("url", lambda: DB), to_dbm=lambda m: "qwen3.6-35b")
 
 # ---- 1. unsat_reason: only a truly unsatisfiable pending job has a reason ------------------------
-r = R(job(), bloom=infeasible)
-chk("bloom-control infeasible record -> reason naming the model and the memory arithmetic",
+r = R(job(), cold=infeasible)
+chk("provider cold-load gate verdict -> reason naming the model and the memory arithmetic",
     r is not None and "qwen3.6-35b" in r and WHY in r)
-chk("provider cold-load gate alone also counts", R(job(), cold=lambda m, *a, **k: WHY) is not None)
 chk("no signal (a BUSY or LOADING/warming backend is not infeasible) -> None", R(job()) is None)
 chk("host_pref darkbloom/studio resolve to the same lane", all(
-    R(job(host_pref=p), bloom=infeasible) for p in ("darkbloom", "studio", "auto")))
-chk("a running job is never unsatisfiable", R(job(status="running"), bloom=infeasible) is None)
-chk("a done/failed job is never unsatisfiable", R(job(status="failed"), bloom=infeasible) is None)
-chk("a human-held pending row is not flagged", R(job(user_hold=True), bloom=infeasible) is None)
-chk("an Unraid-pinned job is not judged by Darkbloom's memory", R(job(host_pref="unraid"), bloom=infeasible) is None)
-chk("with Darkbloom not configured there is no Darkbloom verdict", R(job(), bloom=infeasible, url=lambda: None) is None)
-chk("gpu-exclusive row is skipped", R(job(job_kind=q.GPU_JOB_KIND, runner=q.GPU_JOB_RUNNER), bloom=infeasible) is None)
-chk("an esc-review row is skipped", R(job(label="esc-review-abc"), bloom=infeasible) is None)
+    R(job(host_pref=p), cold=infeasible) for p in ("darkbloom", "studio", "auto")))
+chk("a running job is never unsatisfiable", R(job(status="running"), cold=infeasible) is None)
+chk("a done/failed job is never unsatisfiable", R(job(status="failed"), cold=infeasible) is None)
+chk("a human-held pending row is not flagged", R(job(user_hold=True), cold=infeasible) is None)
+chk("an Unraid-pinned job is not judged by Darkbloom's memory", R(job(host_pref="unraid"), cold=infeasible) is None)
+chk("with Darkbloom not configured there is no Darkbloom verdict", R(job(), cold=infeasible, url=lambda: None) is None)
+chk("gpu-exclusive row is skipped", R(job(job_kind=q.GPU_JOB_KIND, runner=q.GPU_JOB_RUNNER), cold=infeasible) is None)
+chk("an esc-review row is skipped", R(job(label="esc-review-abc"), cold=infeasible) is None)
 def boom(*a, **k):
     raise RuntimeError("boom")
-chk("a raising signal never raises out (None)", R(job(), bloom=boom, cold=boom) is None)
-chk("a raising db_url never raises out", q.unsat_reason(job(), bloom_note=infeasible, cold_gate=none, db_url=boom) is None)
+chk("a raising signal never raises out (None)", R(job(), cold=boom) is None)
+chk("a raising db_url never raises out", q.unsat_reason(job(), cold_gate=infeasible, db_url=boom) is None)
 fh = job(status="held", fit_hold=True, hold_reason="no host fits model footprint", model="huge:200b")
 chk("fit_hold row (the fit router's 'fits no host') is unsatisfiable", "huge:200b" in (R(fh) or ""))
 chk("a fit_hold row that a human ALSO held is not flagged", R(dict(fh, user_hold=True)) is None)
@@ -115,12 +114,10 @@ chk("unsat_track does not mutate its input", st == p0)
 # ---- 3. unsat_warnings_from_state: end to end, read-only, never raises ----------------------------
 sdir = Path(tempfile.mkdtemp(dir=str(HOME)))
 spath, seen = sdir / "queue-state.json", sdir / "unsat-seen.json"
-bstate = sdir / "bloom-control-state.json"
-os.environ["BLOOMCTL_STATE"] = str(bstate)
-bstate.write_text(json.dumps({"infeasible": {"model": "qwen3.6-35b", "reason": WHY, "at": NOW}}))
+GATE = {"why": WHY}                     # the provider cold-load gate's current verdict
 q._darkbloom_url = lambda: DB
 q._darkbloom_model = lambda m: "qwen3.6-35b"
-q.darkbloom_cold_gate = lambda *a, **k: None
+q.darkbloom_cold_gate = lambda m, now=None, **k: GATE["why"]
 state = {"jobs": [job("a1"), job("b2", model="small:7b", status="running")]}
 spath.write_text(json.dumps(state))
 before = spath.read_bytes()
@@ -151,23 +148,20 @@ chk("the job row carries no new field (state not touched)",
 q._UNSAT_MEM.clear()
 chk("after an API restart (memory cleared) the persisted clock still yields the warning",
     len(poll(NOW + 620, NOW + 650, 10)) == 1)
-# BUSY / LOADING / BRIEFLY-OFFLINE: no infeasible record -> never warns however long it waits
-bstate.write_text(json.dumps({}))
-chk("record cleared (model loaded / memory freed): warning goes away at once", call(NOW + 660) == [])
+# BUSY / LOADING / BRIEFLY-OFFLINE: no infeasible verdict -> never warns however long it waits
+GATE["why"] = None
+chk("verdict cleared (model loaded / memory freed): warning goes away at once", call(NOW + 660) == [])
 for dt in (700, 5000, 100000):
-    chk(f"busy/loading backend (no infeasible record) never warns (+{dt}s)", poll(NOW + dt, NOW + dt + 900) == [])
+    chk(f"busy/loading backend (no infeasible verdict) never warns (+{dt}s)", poll(NOW + dt, NOW + dt + 900) == [])
 # a brief infeasible blip (< threshold) that clears does not accumulate toward a later warning
 T1 = NOW + 200000
-bstate.write_text(json.dumps({"infeasible": {"model": "qwen3.6-35b", "reason": WHY, "at": T1}}))
+GATE["why"] = WHY
 poll(T1, T1 + 300)
-bstate.write_text(json.dumps({}))
+GATE["why"] = None
 poll(T1 + 360, T1 + 420)
-bstate.write_text(json.dumps({"infeasible": {"model": "qwen3.6-35b", "reason": WHY, "at": T1 + 480}}))
+GATE["why"] = WHY
 chk("a blip that cleared then recurred restarts the clock (no warning at 11 min after first blip)",
     poll(T1 + 480, T1 + 660) == [])
-# an expired record (older than BLOOM_INFEASIBLE_TTL) is not a live signal either
-bstate.write_text(json.dumps({"infeasible": {"model": "qwen3.6-35b", "reason": WHY, "at": NOW - 99999}}))
-chk("a stale infeasible record is ignored", poll(NOW + 300000, NOW + 301000) == [])
 # a missing / corrupt state file and a corrupt seen file degrade to []
 spath.write_text("{not json")
 chk("corrupt queue state -> [] (never raises)", call(NOW + 310000) == [])
@@ -176,7 +170,6 @@ chk("missing queue state -> []", call(NOW + 310001) == [])
 spath.write_text(json.dumps(state))
 seen.write_text("garbage")
 q._UNSAT_MEM.clear()
-bstate.write_text(json.dumps({"infeasible": {"model": "qwen3.6-35b", "reason": WHY, "at": NOW + 400000}}))
 chk("corrupt seen file -> restarts cleanly", call(NOW + 400000) == [])
 chk("calling with the default paths on a bare HOME never raises", isinstance(q.unsat_warnings_from_state(), list))
 

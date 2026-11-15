@@ -91,10 +91,12 @@ dispatch_harness_gates.py
 failure_ledger.py
 gate-on-complete.py
 gate.py
+tw-class-check.mjs
 gate_finding_check.py
 gate_identity.py
 harness-repair-verify.py
 harness_admission.py
+ha_tscheck.js
 harness_audit_gates.py
 harness_repair.py
 land_adjudicate.py

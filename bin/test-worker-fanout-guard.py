@@ -96,17 +96,7 @@ def main():
         check(f"{r_} classified by failure_ledger", f'"{r_}"' in fl, True)
         check(f"{r_} in the queue's _FAILURE_CONTEXT_REASONS",
               f'"{r_}"' in q.split("_FAILURE_CONTEXT_REASONS = ")[1].split("})")[0], True)
-    import importlib.machinery
-    ld = importlib.machinery.SourceFileLoader("da_fanout", str(HERE / "ollama-dispatch-auto"))
-    dspec = importlib.util.spec_from_loader("da_fanout", ld)
-    da = importlib.util.module_from_spec(dspec)
-    ld.exec_module(da)
-    if hasattr(da, "worker_exit_route"):    # absent in a tree that predates the ladder routing
-        for r_ in ("tool_fanout_loop", "read_past_eof_loop"):
-            k, msg = da.worker_exit_route(r_, "j1")
-            check(f"dispatch-auto routes {r_} to re-spec (not blind retry)",
-                  (k, msg.startswith(da.RESPEC_ROUTE_PREFIX), da.SPEC_DEFECT_ROUTE_PREFIX in msg), ("respec", True, True))
-        check("a plain nav_loop is NOT routed as re-spec", da.worker_exit_route("nav_loop", "j1")[0], None)
+    # (the re-spec routing checks read ollama-dispatch-auto, removed 2026-11-02 in commit 2637810)
 
     print("== sampling ladder hook is inert when the arm is off ==")
     check("ladder off -> on_abort is a no-op", W.SamplingLadder(enabled=False).on_abort("tool_fanout"), ("off", None))

@@ -9,6 +9,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -667,6 +668,259 @@ class BloomTickHttpTests(unittest.TestCase):
         self.bgt.run_async = boom
         st, ans = self.req("POST", "/v1/bloomgauge-tick", {"busy": True, "target": None})
         self.assertEqual((st, ans["error"]), (503, "control step failed"))
+
+
+
+def _free_port(host="127.0.0.1"):
+    s = socket.socket()
+    s.bind((host, 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _lan_ip():
+    """A non-loopback address of this host, or None (no route)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.217", 1))
+        ip = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return None if ip.startswith("127.") else ip
+
+
+class EchoServer:
+    """Loopback stand-in for Darkbloom: echoes bytes upper-cased, closes after the client's EOF."""
+
+    def __init__(self, host="127.0.0.1", port=0):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.peers = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                c, peer = self.sock.accept()
+            except OSError:
+                return
+            self.peers.append(peer[0])
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        with c:
+            while True:
+                b = c.recv(4096)
+                if not b:
+                    return
+                c.sendall(b.upper())
+
+    def close(self):
+        self.sock.close()
+
+
+def _read_all(s, timeout=5):
+    s.settimeout(timeout)
+    out = b""
+    while True:
+        try:
+            b = s.recv(4096)
+        except (ConnectionResetError, socket.timeout):
+            break
+        if not b:
+            break
+        out += b
+    return out
+
+
+class RelayConfigTests(unittest.TestCase):
+    def test_off_unless_true(self):
+        self.assertEqual(qa.relay_config({}), (None, None))
+        self.assertEqual(qa.relay_config({"darkbloom_relay": "yes", "bind": "192.0.2.15"}), (None, None))
+
+    def test_refuses_bad_settings(self):
+        base = {"darkbloom_relay": True, "bind": "192.0.2.15", "darkbloom_relay_allow": ["192.0.2.243"]}
+        for bad in ({"bind": "127.0.0.1"}, {"bind": "0.0.0.0"}, {"bind": None}, {"darkbloom_relay_allow": []},
+                    {"darkbloom_relay_allow": None}, {"darkbloom_relay_target": "203.0.113.178:8000"},
+                    {"darkbloom_relay_port": "x"}):
+            cfg = {**base, **bad}
+            s, err = qa.relay_config(cfg)
+            self.assertIsNone(s, bad)
+            self.assertTrue(err, bad)
+
+    def test_ok_defaults(self):
+        s, err = qa.relay_config({"darkbloom_relay": True, "bind": "192.0.2.15", "darkbloom_relay_allow": "192.0.2.243"})
+        self.assertIsNone(err)
+        self.assertEqual(s["listen"], ("192.0.2.15", 8000))
+        self.assertEqual(s["target"], ("127.0.0.1", 8000))
+        self.assertEqual(s["allow"], frozenset({"192.0.2.243"}))
+        s, _ = qa.relay_config({"darkbloom_relay": True, "bind": "192.0.2.15", "darkbloom_relay_allow": ["192.0.2.243"],
+                                "darkbloom_relay_port": 8100, "darkbloom_relay_target": "[::1]:8001"})
+        self.assertEqual((s["listen"], s["target"]), (("192.0.2.15", 8100), ("::1", 8001)))
+
+
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        self.echo = EchoServer()
+        self.relays = []
+
+    def tearDown(self):
+        for r in self.relays:
+            r.stop()
+        self.echo.close()
+
+    def start(self, allow=("127.0.0.1",), max_conns=4, target_port=None, listen_host="127.0.0.1", port=None,
+              retry_s=0.05):
+        port = port or _free_port(listen_host)
+        r = qa.DarkbloomRelay({"listen": (listen_host, port), "target": ("127.0.0.1", target_port or self.echo.port),
+                               "allow": frozenset(allow), "max_conns": max_conns}, retry_s=retry_s,
+                              log=lambda m: None)
+        threading.Thread(target=r.run, daemon=True).start()
+        self.relays.append(r)
+        return r, port
+
+    def wait_ready(self, r):
+        self.assertTrue(r.ready.wait(5), r.status)
+
+    def test_relays_both_ways_and_eof(self):
+        r, port = self.start()
+        self.wait_ready(r)
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        c.sendall(b"hello ")
+        c.sendall(b"darkbloom")
+        c.shutdown(socket.SHUT_WR)
+        self.assertEqual(_read_all(c), b"HELLO DARKBLOOM")
+        c.close()
+        deadline = time.time() + 5
+        while r.status["active"] and time.time() < deadline:
+            time.sleep(0.02)
+        st = r.status
+        self.assertEqual((st["relayed"], st["active"], st["listening"]), (1, 0, True))
+
+    def test_big_payload(self):
+        r, port = self.start()
+        self.wait_ready(r)
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        data = os.urandom(3_000_000).hex().encode()[:3_000_000].lower()
+        got = {}
+        rd = threading.Thread(target=lambda: got.setdefault("b", _read_all(c, timeout=20)))
+        rd.start()
+        c.sendall(data)
+        c.shutdown(socket.SHUT_WR)
+        rd.join(30)
+        self.assertEqual(got.get("b"), data.upper())
+        c.close()
+
+    def test_peer_not_allowed_is_dropped(self):
+        r, port = self.start(allow=("203.0.113.193",))
+        self.wait_ready(r)
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            c.sendall(b"x")
+        except OSError:
+            pass
+        self.assertEqual(_read_all(c), b"")
+        c.close()
+        deadline = time.time() + 5
+        while not r.status["refused_peer"] and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual((r.status["refused_peer"], r.status["relayed"]), (1, 0))
+        self.assertEqual(self.echo.peers, [])
+
+    def test_target_down_closes_client(self):
+        dead = _free_port()
+        r, port = self.start(target_port=dead)
+        self.wait_ready(r)
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.assertEqual(_read_all(c), b"")
+        c.close()
+        deadline = time.time() + 5
+        while not r.status["target_down"] and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(r.status["target_down"], 1)
+
+    def test_over_limit_is_dropped(self):
+        r, port = self.start(max_conns=1)
+        self.wait_ready(r)
+        a = socket.create_connection(("127.0.0.1", port), timeout=5)
+        a.sendall(b"a")
+        a.settimeout(5)
+        self.assertEqual(a.recv(10), b"A")
+        b = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.assertEqual(_read_all(b), b"")
+        b.close()
+        self.assertEqual(r.status["busy"], 1)
+        a.shutdown(socket.SHUT_WR)
+        _read_all(a)
+        a.close()
+        deadline = time.time() + 5
+        while r.status["active"] and time.time() < deadline:
+            time.sleep(0.02)
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        c.sendall(b"c")
+        c.shutdown(socket.SHUT_WR)
+        self.assertEqual(_read_all(c), b"C")
+        c.close()
+
+    def test_waits_for_a_wildcard_listener_to_go(self):
+        """Darkbloom on 0.0.0.0:P blocks <ip>:P until it restarts on loopback; the relay keeps retrying."""
+        ip = _lan_ip()
+        if not ip:
+            self.skipTest("no non-loopback address here")
+        port = _free_port("0.0.0.0")
+        wild = socket.socket()
+        wild.bind(("0.0.0.0", port))
+        wild.listen(1)
+        r, _ = self.start(listen_host=ip, port=port, allow=(ip,))
+        time.sleep(0.3)
+        self.assertFalse(r.ready.is_set())
+        self.assertIn("cannot listen", r.status["last_error"])
+        wild.close()
+        self.wait_ready(r)
+        self.assertIsNone(r.status["last_error"])
+
+    def test_same_port_as_loopback_darkbloom(self):
+        """Darkbloom on 127.0.0.1:P and the relay on <lan ip>:P at the same time (the real layout)."""
+        ip = _lan_ip()
+        if not ip:
+            self.skipTest("no non-loopback address here")
+        port = _free_port("0.0.0.0")
+        db = EchoServer("127.0.0.1", port)
+        try:
+            r, _ = self.start(listen_host=ip, port=port, allow=(ip,), target_port=port)
+            self.wait_ready(r)
+            c = socket.create_connection((ip, port), timeout=5)
+            c.sendall(b"same port")
+            c.shutdown(socket.SHUT_WR)
+            self.assertEqual(_read_all(c), b"SAME PORT")
+            c.close()
+            self.assertEqual(db.peers, ["127.0.0.1"])
+        finally:
+            db.close()
+
+    def test_health_shows_relay(self):
+        r, port = self.start()
+        self.wait_ready(r)
+        srv, _ = qa.build_server({"bind": "127.0.0.1", "port": 0}, TOKEN, relay=r)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            c.request("GET", "/health")
+            body = json.loads(c.getresponse().read())
+            c.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        rel = body["darkbloom_relay"]
+        self.assertEqual((rel["listening"], rel["port"]), (True, port))
+        self.assertNotIn("allow", rel)
+        self.assertNotIn("127.0.0.1", json.dumps(rel))
 
 
 if __name__ == "__main__":

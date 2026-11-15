@@ -10,8 +10,9 @@ Covers: the verdict matrix over {35B,9B} / {Gemma,9B} busy / {Gemma,9B} idle / o
 load_transition_active / stale state; hold_for_queue never runs start/stop/switch/restart or edits
 provider.toml when the pair is advertised (and DOES, unchanged, when it is not, or BLOOM_NOSWITCH=0);
 noswitch_ensure (one bounded warm, bounded backoff, refusal is never a failure, release on resident);
-the queue's INFRA WAIT gate, capacity-pause resume (uncharged, backoff), lane work, unsat escalation after
-QUEUE_BLOOM_WAIT_WARN_S, and the worker's capacity wait (uncharged, named) vs the legacy path.
+capacity-pause resume (uncharged, backoff). (The worker's own capacity wait went back to the bounded slot-busy wait
+in 7799291, and its scenario with it. The queue's own no-switch gate/sync and its unsat escalation were removed with the queue's
+bloom_control integration in 197b069, and their scenarios with them.)
 
 NEVER touches the real daemon/Darkbloom/BloomGauge: fake daemon-state.json / loaded-models.json, a fake
 Darkbloom HTTP stub and CLI shim (reuses test-bloom-control.py's World for BloomGauge + shim).
@@ -393,80 +394,11 @@ def t_hold(bc, q, wk, tc):
         w.close()
 
 
-# ----------------------------------------------------------------------------------------- gate
-@scenario("gate")
-def t_gate(bc, q, wk, tc):
-    print("--- queue INFRA WAIT gate")
-    p = Prov()
-    try:
-        p.env()
-        q._BLOOM_CTL_MOD[:] = [bc]
-        cfg = bc.load_cfg()
-        p.set(resident=[GEM, SMALL], idle={GEM: 1, SMALL: 1}, usable=16.9)
-        check("sync not alive (no heartbeat): the gate fails OPEN (a dead sync never freezes the queue)",
-              bc.noswitch_gate_reason(BIG) is None)
-        bc.write_state(cfg, noswitch_hb=time.time())
-        g = bc.noswitch_gate_reason(BIG)
-        check("blocked: reason names the blocker, the need and load_usable",
-              bool(g) and GEM in g and "30.3 GB" in g and "16.9 GB" in g, g)
-        wn = q.darkbloom_launch_wait(BIG, time.time(), ready=True)
-        check("launch wait is an INFRA WAIT note naming 'blocked by gemma' (not a failure)",
-              wn is not None and "infra" in json.dumps(wn).lower() and GEM in json.dumps(wn), wn)
-        check("a resident model launches", q.darkbloom_launch_wait(SMALL, time.time(), ready=True) is None)
-        p.set(resident=[GEM, SMALL], idle={GEM: 300, SMALL: 300}, usable=16.9)
-        g2 = bc.noswitch_gate_reason(BIG)
-        check("evict-idle: waits as 'warming' (the background warm makes the provider evict)",
-              bool(g2) and g2.startswith("warming " + BIG), g2)
-        p.set(resident=[BIG, SMALL], idle={BIG: 1, SMALL: 1}, usable=5.0)
-        check("released the moment the model is resident (no interval needed)",
-              q.darkbloom_launch_wait(BIG, time.time(), ready=True) is None)
-        p.set(resident=[GEM, SMALL], idle={GEM: 1, SMALL: 1}, usable=16.9, age=120.0)
-        check("stale provider state: fail open", bc.noswitch_gate_reason(BIG) is None)
-        p.set(age=0.0)
-        check("a model the provider does not advertise is not gated here (existing not-served path)",
-              bc.noswitch_gate_reason("zzz-model") is None)
-        os.environ["BLOOM_NOSWITCH"] = "0"
-        check("BLOOM_NOSWITCH=0: no gate", bc.noswitch_gate_reason(BIG) is None
-              and q.darkbloom_noswitch_gate(BIG, time.time()) is None)
-        os.environ.pop("BLOOM_NOSWITCH")
-        os.environ["BLOOM_CONTROL"] = "0"
-        check("BLOOM_CONTROL=0: integration off -> no gate", bc.noswitch_gate_reason(BIG) is None)
-        os.environ.pop("BLOOM_CONTROL")
-        # sync wiring
-        q._darkbloom_url = lambda: "http://127.0.0.1:1"
-        q._darkbloom_model = lambda m: m
-        jobs = [{"id": "a", "status": "pending", "host_pref": "studio-db", "model": BIG, "label": "x"},
-                {"id": "b", "status": "pending", "host_pref": "unraid", "model": "qwen3:8b", "label": "y"},
-                {"id": "c", "status": "pending", "host_pref": "auto", "model": SMALL, "label": "z"},
-                {"id": "d", "status": "done", "host_pref": "auto", "model": GEM, "label": "w"}]
-        check("only Darkbloom-lane jobs' models are gated; Unraid/Ollama + finished jobs untouched",
-              q.bloom_noswitch_models(jobs) == [BIG, SMALL], q.bloom_noswitch_models(jobs))
-        p.set(resident=[GEM, SMALL], idle={GEM: 300, SMALL: 300}, usable=16.9)
-        q._BLOOM_NS["last"] = 0.0
-        r = q.bloom_noswitch_sync({"jobs": jobs}, now=time.time(), ctl=bc, background=False)
-        check("daemon-tick sync warmed the 35B once (the provider evicted Gemma) and not the resident 9B",
-              r == "sync" and p.chats == [BIG] and BIG in p.resident, (r, p.chats))
-        check("sync is throttled per tick", q.bloom_noswitch_sync({"jobs": jobs}, now=time.time(), ctl=bc,
-                                                                  background=False) is None)
-        qsrc = Path(q.__file__).read_text()
-        check("the daemon tick calls bloom_noswitch_sync right after bloom_queue_sync (wired once)",
-              qsrc.count("            bloom_queue_sync(state, _pk, _now)\n            bloom_noswitch_sync(state, _now)\n") == 1)
-        os.environ["BLOOM_NOSWITCH"] = "0"
-        q._BLOOM_NS["last"] = 0.0
-        p.chats.clear()
-        check("BLOOM_NOSWITCH=0: the sync does nothing", q.bloom_noswitch_sync(
-            {"jobs": jobs}, now=time.time() + 100, ctl=bc, background=False) is None and p.chats == [])
-        os.environ.pop("BLOOM_NOSWITCH")
-    finally:
-        p.close()
-
-
 # ----------------------------------------------------------------------------------------- pause/resume
 @scenario("resume")
 def t_resume(bc, q, wk, tc):
     print("--- capacity pause: uncharged, backoff, resume when resident")
     cause = q.CAPACITY_WAIT_CAUSE + ": " + BIG + " " + BIG + " blocked by " + GEM
-    check("worker and queue agree on the pause-cause prefix", wk.CAPACITY_WAIT_CAUSE == q.CAPACITY_WAIT_CAUSE)
 
     def job(**kw):
         j = {"id": "j1", "label": "l", "status": "paused", "pause_reason": "chat_request_failed",
@@ -510,158 +442,7 @@ def t_resume(bc, q, wk, tc):
     check("cold-infeasible pause unchanged (skip while infeasible)", d[0] == "skip" and "cannot load" in d[1], d)
 
 
-# ----------------------------------------------------------------------------------------- escalation
-@scenario("escalate")
-def t_escalate(bc, q, wk, tc):
-    print("--- dashboard escalation after QUEUE_BLOOM_WAIT_WARN_S")
-    p = Prov()
-    try:
-        p.env()
-        q._BLOOM_CTL_MOD[:] = [bc]
-        q._darkbloom_url = lambda: "http://127.0.0.1:1"
-        q._darkbloom_model = lambda m: m
-        q.darkbloom_cold_gate = lambda *a, **k: None      # hermetic: never consult the LIVE `darkbloom status` memory arithmetic
-        p.set(resident=[GEM, SMALL], idle={GEM: 1, SMALL: 1}, usable=16.9)
-        job = {"id": "ja", "label": "costco-x", "status": "pending", "host_pref": "studio-db", "model": BIG}
-        r = q.unsat_capacity_reason(job)
-        check("blocked job -> 'qwen 35B blocked by Gemma serving' reason",
-              bool(r) and r.startswith("darkbloom capacity wait: " + BIG + " blocked by " + GEM), r)
-        check("Unraid job untouched", q.unsat_capacity_reason(dict(job, host_pref="unraid", model="qwen3:8b")) is None)
-        check("running job untouched", q.unsat_capacity_reason(dict(job, status="running")) is None)
-        check("a resident model's job untouched", q.unsat_capacity_reason(dict(job, model=SMALL)) is None)
-        check("human-held job untouched", q.unsat_capacity_reason(dict(job, user_hold=True)) is None)
-        pj = dict(job, status="paused", pause_reason="chat_request_failed",
-                  pause_meta={"lane_cause": q.CAPACITY_WAIT_CAUSE + ": x"})
-        check("a capacity-paused job is covered too", q.unsat_capacity_reason(pj) is not None)
-        # end to end through the banner path with a real (temp) state file + ledger
-        sp = Path(tempfile.mkdtemp()) / "state.json"
-        sp.write_text(json.dumps({"jobs": [job]}))
-        seen = Path(tempfile.mkdtemp()) / "seen.json"
-        t0 = 2_000_000_000.0
-        w0 = q.unsat_warnings_from_state(now=t0, state_path=sp, seen_path=seen)
-        w1 = q.unsat_warnings_from_state(now=t0 + 300, state_path=sp, seen_path=seen)
-        check("not yet: under QUEUE_BLOOM_WAIT_WARN_S (600) nothing is shown", w0 == [] and w1 == [], (w0, w1))
-        w2 = q.unsat_warnings_from_state(now=t0 + 590, state_path=sp, seen_path=seen)
-        check("599 s: still silent", w2 == [], w2)
-        w3 = q.unsat_warnings_from_state(now=t0 + 610, state_path=sp, seen_path=seen)
-        check("> 600 s: warning names the job, model, blocker and carries kind=capacity",
-              len(w3) == 1 and w3[0]["kind"] == "capacity" and GEM in w3[0]["reason"] and w3[0]["id"] == "ja", w3)
-        check("the job is NOT failed/cancelled/rewritten by the warning",
-              json.loads(sp.read_text())["jobs"][0]["status"] == "pending")
-        p.set(resident=[BIG, SMALL], idle={BIG: 1, SMALL: 1}, usable=5.0)
-        w4 = q.unsat_warnings_from_state(now=t0 + 620, state_path=sp, seen_path=seen)
-        check("cleared as soon as the model is resident", w4 == [], w4)
-        # env override of the threshold
-        os.environ["QUEUE_BLOOM_WAIT_WARN_S"] = "5"
-        p.set(resident=[GEM, SMALL], idle={GEM: 1, SMALL: 1}, usable=16.9)
-        seen2 = Path(tempfile.mkdtemp()) / "seen2.json"
-        q.unsat_warnings_from_state(now=t0 + 1000, state_path=sp, seen_path=seen2)
-        w5 = q.unsat_warnings_from_state(now=t0 + 1010, state_path=sp, seen_path=seen2)
-        check("QUEUE_BLOOM_WAIT_WARN_S is honoured", len(w5) == 1, w5)
-        os.environ.pop("QUEUE_BLOOM_WAIT_WARN_S")
-        # an existing infeasible warning is unaffected (still threshold 600 via the original path)
-        uw = q.unsat_track({}, {"x": {"reason": "r", "label": "l", "model": "m"}}, 100.0, warn_s=10)
-        check("unsat_track without a per-entry threshold behaves as before", uw[1] == [] and
-              q.unsat_track(uw[0], {"x": {"reason": "r"}}, 111.0, warn_s=10)[1][0]["age_s"] == 11.0)
-        # the dashboard banner (node) renders the capacity kind distinctly
-        apisrc = Path(os.environ.get("NSW_API_SRC") or (HERE / "ollama-queue-api.py")).resolve()
-        html = apisrc.read_text() if apisrc.exists() else ""
-        import re
-        import subprocess
-
-        def grab(name):
-            m = re.search(r"^(?:async )?function " + name + r"\(.*?\n}\n", html, re.S | re.M)
-            return m.group(0) if m else None
-        fns = [grab("escapeHtml"), grab("fmtDur"), grab("unsatBannerLines")]
-        check("dashboard page has unsatBannerLines", all(fns))
-        if all(fns):
-            js = "\n".join(fns) + "\nconst W=%s;\nconsole.log(JSON.stringify(unsatBannerLines({unsat:W})));" % json.dumps(
-                [dict(w3[0], age_s=700), {"id": "z", "label": "old", "model": "m", "reason": "r", "age_s": 700}])
-            r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
-            lines = json.loads(r.stdout) if r.returncode == 0 else []
-            check("banner: capacity entry says 'waiting for Darkbloom capacity' + names the blocker, old kind unchanged",
-                  len(lines) == 2 and "waiting for Darkbloom capacity" in lines[0] and GEM in lines[0]
-                  and ("no host can serve" in lines[1] or "cannot be served by any host" in lines[1])
-                  and "no host can serve" not in lines[0] and "cannot be served" not in lines[0], lines)
-    finally:
-        p.close()
-
-
 # ----------------------------------------------------------------------------------------- worker
-@scenario("worker")
-def t_worker(bc, q, wk, tc):
-    print("--- worker: capacity refusal is a named, uncharged wait")
-    host = "http://127.0.0.1:8000"
-    detail = "HTTP Error 429 -- body: Provider capacity is temporarily unavailable."
-    slept = []
-    on_gone = lambda m: (True, False, "%s blocked by %s (serving)" % (BIG, GEM))
-    on_resident = lambda m: (True, True, None)
-    off = lambda m: (False, True, None)
-    nof = lambda m: None
-    st = {}
-    n = 0
-    raised = None
-    try:
-        while wk._slot_busy_retry(host, detail, st, sleep=slept.append, model=BIG, infeasible=nof, noswitch=on_gone):
-            n += 1
-            if n > 500:
-                break
-    except wk.DarkbloomCapacityWait as e:
-        raised = e
-    check("no-switch + model not resident: short inline grace, then DarkbloomCapacityWait",
-          raised is not None and sum(slept) <= wk.NOSWITCH_INLINE_WAIT_S + 60, (n, sum(slept)))
-    check("the pause cause carries the prefix and the named blocker",
-          bool(raised) and str(raised).startswith(wk.CAPACITY_WAIT_CAUSE) and GEM in str(raised), raised)
-    check("lane cause recorded for pause_meta", wk._LANE_LAST_CAUSE[0] == str(raised), wk._LANE_LAST_CAUSE)
-    check("it is a RuntimeError subclass (handled by the resumable-pause path, like cold-infeasible)",
-          isinstance(raised, wk.DarkbloomColdLoadInfeasible) and isinstance(raised, RuntimeError))
-    # resident model, genuine busy slot: still waits the full cap, then PAUSES uncharged (was: charged)
-    slept.clear()
-    st = {}
-    raised = None
-    try:
-        while wk._slot_busy_retry(host, "model slot(s) are active; cannot load 'x'", st, sleep=slept.append,
-                                  model=SMALL, infeasible=nof, noswitch=on_resident, max_wait=300):
-            pass
-    except wk.DarkbloomCapacityWait as e:
-        raised = e
-    check("resident model busy: waits to the cap, then an uncharged capacity pause (not 'return False')",
-          raised is not None and sum(slept) >= 295, (sum(slept), raised))
-    # legacy / kill switch: unchanged (returns False after the cap; no exception)
-    slept.clear()
-    st = {}
-    res = True
-    while res:
-        res = wk._slot_busy_retry(host, detail, st, sleep=slept.append, model=BIG, infeasible=nof, noswitch=off, max_wait=300)
-    check("BLOOM_NOSWITCH=0 / legacy: bounded wait then False (today's behaviour), no exception",
-          sum(slept) >= 295 and "slots busy" in str(wk._LANE_LAST_CAUSE[0]), (sum(slept), wk._LANE_LAST_CAUSE))
-    # the cold-infeasible fast path is untouched and still wins
-    st = {}
-    try:
-        wk._slot_busy_retry(host, detail, st, sleep=slept.append, model=BIG, infeasible=lambda m: "needs 30.3 GB",
-                            noswitch=on_gone)
-        got = None
-    except wk.DarkbloomColdLoadInfeasible as e:
-        got = e
-    check("memgate fast path still first (cold infeasible)", got is not None and not isinstance(got, wk.DarkbloomCapacityWait)
-          and str(got).startswith(wk.COLD_INFEASIBLE_CAUSE), got)
-    # through _lane_restart_retry (the call sites' entry point), seams threaded
-    st = {}
-    try:
-        wk._lane_restart_retry(host, 429, detail, st, sleep=slept.append, model=BIG, infeasible=nof, noswitch=on_gone)
-        for _ in range(100):
-            wk._lane_restart_retry(host, 429, detail, st, sleep=slept.append, model=BIG, infeasible=nof, noswitch=on_gone)
-        got = None
-    except wk.DarkbloomCapacityWait as e:
-        got = e
-    check("_lane_restart_retry threads the capacity wait", got is not None, got)
-    check("a non-capacity 4xx is not a capacity wait", wk._lane_restart_retry(
-        host, 400, "bad request", {}, sleep=slept.append, model=BIG, noswitch=on_gone) is False)
-    # _noswitch_info is fail-safe: any doubt = old behaviour
-    check("_noswitch_info never raises and degrades to the old behaviour",
-          wk._noswitch_info(None)[0] in (True, False))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--queue", default=str(HERE / "ollama-queue.py"))
@@ -674,7 +455,6 @@ def main():
     os.environ["DISPATCH_VERIFY_SANDBOX"] = "1"
     bc = load(a.bc, "bloom_control_ns")
     q = load(a.queue, "oq_ns")
-    q._BLOOM_CTL_MOD[:] = [bc]
     wk = load(a.worker, "ow_ns")
     tc = load(a.tc, "tbc_ns")
     # the worker loads bloom_control.py from ITS dir for _noswitch_info; tests inject seams instead

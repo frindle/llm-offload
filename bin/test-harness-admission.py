@@ -9,9 +9,9 @@
   E. tiers: strict refuses at once; authoring tier repairs ONCE (advisory) then refuses a recurrence
   F. FREEZE: an admitted harness is snapshotted; a job that edits it is restored
   G. reslice-required: note_stop => further identical rounds refused (repair label exempt, fp change clears)
-  H. wiring: ollama-dispatch-auto._dispatch_model_inner never enqueues a refused job; record_stop of a
-     runaway stop records reslice; queue cmd_enqueue backstop refuses; slice + auto_continue_go call admit
-HA_SRC / AUTO_SRC / QUEUE_SRC / SLICE_SRC override the files under test (revert proofs)."""
+  H. wiring: queue cmd_enqueue backstop refuses a harness marked reslice-required (the auto and slice
+     drivers, its other callers, were removed)
+HA_SRC / QUEUE_SRC override the files under test (revert proofs)."""
 import importlib.util, json, os, re, subprocess, sys, tempfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -19,9 +19,7 @@ from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 HA = Path(os.environ.get("HA_SRC") or HERE / "harness_admission.py")
-AUTO = Path(os.environ.get("AUTO_SRC") or HERE / "ollama-dispatch-auto")
 QUEUE = Path(os.environ.get("QUEUE_SRC") or HERE / "ollama-queue.py")
-SLICE = Path(os.environ.get("SLICE_SRC") or HERE / "ollama-dispatch-slice")
 FAILS = []
 TMP = Path(tempfile.mkdtemp(prefix="ha-test-"))
 os.environ["HARNESS_ADMISSION_DIR"] = str(TMP / "adm")
@@ -195,45 +193,17 @@ guard("core", run_all)
 
 # ---- H. wiring ----------------------------------------------------------------------------
 def wiring():
-    m = load(AUTO, "auto_under_test")
-    m.AUTO_RUNS_DIR = TMP / "runs"
-    decisions = []
-    m.log_decision = lambda kind, a, decision, detail="", persist=True, **x: decisions.append((kind, decision, x))
-    m.salvage_round = lambda *a, **k: None
-    enq = []
-    m.capture = lambda cmd, **k: (enq.append(cmd), (1, "", "must not be called"))[1]
-    m._stop_for_hand = lambda *a, **k: None
-    a = SimpleNamespace(label="w", bundle=None, lang="python", drafter_cmd=None, author_max_iters=3, model="m",
-                        host="h", num_ctx=1, max_tokens=0, timeout=5, target="lib/x.py", require=[],
-                        _author_rounds_run=0, _chain_last_job=None, budget_policy=None)
-    wt = mk("py", "lib/x.py", "def f(a):\n    return a + 1\n", refimpl=BAD_REF.replace("lib/x.ts", "lib/x.py"))
-    ok, why = m._dispatch_model_inner(wt, "p", "auto-refine-w-r1", "true", a)
-    chk("auto: refine job against a defective harness NOT enqueued", (ok, enq, why.startswith(m.ADMISSION_ROUTE_PREFIX), "SPEC_DEFECT: " in why), (False, [], True, False))
-    chk("auto: stop_reason admission_refused recorded", any(x.get("stop_reason") == "admission_refused" for _, _, x in decisions), True)
-    # a runaway stop (record_stop) marks the harness reslice-required for the queue backstop
     wt2 = mk("py", "lib/x.py", "def f(a):\n    return a + 1\n")
-    a2 = SimpleNamespace(**dict(vars(a), _admission_wt=wt2))
-    m.record_stop(a2, "repeated_signature", "identical", kind="spec-defect")
-    chk("auto: record_stop(repeated_signature) => admission reslice state", bool(ha.backstop_refusal(wt2, "auto-author-w-c1")), True)
-    wt3 = mk("py", "lib/x.py", "def f(a):\n    return a + 1\n")
-    a3 = SimpleNamespace(**dict(vars(a), _admission_wt=wt3))
-    m.record_stop(a3, "external_kill", "driver exited 143", kind="round-stop")
-    chk("auto: an external kill does NOT mark the harness for re-slice", ha.backstop_refusal(wt3, "auto-author-w-c1"), None)
-    # queue backstop (refusal path only: nothing is enqueued)
+    ha.note_stop(wt2, "repeated_signature", "identical")
+    # queue backstop (refusal path only: nothing is enqueued). A served model name, or the model check refuses first.
     env = dict(os.environ, HARNESS_ADMISSION_DIR=str(TMP / "adm"), HOME=str(TMP))
     tf = TMP / "t.md"
     tf.write_text("x")
-    p = subprocess.run([sys.executable, str(QUEUE), "enqueue", "--model", "m", "--host", "studio", "--cwd", str(wt2),
+    p = subprocess.run([sys.executable, str(QUEUE), "enqueue", "--model", "Qwen3.5-9B", "--host", "studio", "--cwd", str(wt2),
                         "--task-file", str(tf), "--verify", "true", "--label", "auto-author-w-c1"],
                        capture_output=True, text=True, env=env)
     chk("queue cmd_enqueue backstop refuses (rc!=0, named cause, no 'enqueued')",
         (p.returncode != 0, "reslice-required" in (p.stdout + p.stderr), "enqueued " in p.stdout), (True, True, False))
-    # call sites
-    src = AUTO.read_text()
-    chk("auto_continue_go calls admit before the coding enqueue",
-        bool(re.search(r"_ha\(\)\.admit\(wt, a\.label.*?\n.*?\n.*?\n.*?\n.*?\n\s+cmd = \[sys\.executable, str\(QUEUE\), \"enqueue\"", src, re.S)), True)
-    chk("slice confirm_and_enqueue calls admit before the coding enqueue",
-        bool(re.search(r"_ha\.admit\(wt, f\"\{st\['label'\]\}-\{sid\}\".*?\[\"python3\", QUEUE, \"enqueue\"", SLICE.read_text(), re.S)), True)
 
 
 guard("wiring", wiring)
@@ -423,12 +393,6 @@ def interactions():
     (wt / "refimpl.py").write_text("# TODO -- the exact text to replace\n")
     chk("L1 same-path RE-SCAFFOLD (stub refimpl again): freeze does not restore, state cleared",
         (ha.enforce_freeze(wt, "auto-author-x-c1"), ha.state_path(wt).exists(), (wt / "refimpl.py").read_text().startswith("# TODO")), ([], False, True))
-    # worktree removal clears state + snapshot (slice remove_worktree)
-    wt = admitted()
-    sl = load(SLICE, "slice_ha_inter")
-    chk("L1 precondition: state + snapshot exist", (ha.state_path(wt).exists(), ha._snap_dir(wt).exists()), (True, True))
-    sl.remove_worktree(str(TMP), str(wt))
-    chk("L1 slice remove_worktree clears admission state AND the .snap dir", (ha.state_path(wt).exists(), ha._snap_dir(wt).exists()), (False, False))
     # --- round 0 (unstaged legacy label) against the untouched scaffold: nothing to admit, no dynamic cost
     wt = mk("ts", tgt, base, refimpl="# TODO -- the exact text to replace\n")
     (wt / "TASK.md").write_text("# t\nTODO -- fill in the intent\n\n## Must contain\n- `TODO -- literal`\n")
@@ -464,51 +428,10 @@ def interactions():
     (wt / "verify.sh").write_text((wt / "verify.sh").read_text() + "# unrelated\n")
     r2 = ha.admit(wt, "auto-author-x-s3-r1", target=tgt, dynamic=False)
     chk("L4 defect history keyed by signature survives a fingerprint change", (r1["ok"], r2["ok"], r2["cause"]), (True, False, "repeated-defect"))
-    # --- refusal x respec: ONE owner of the re-spec budget
-    au = load(AUTO, "auto_inter")
+    # --- the refusal carries its OWN marker (auto + slice, its other users, were removed)
     wt = mk("ts", tgt, base, refimpl=BAD_REF)
-    r = ha.admit(wt, "rt-x-s1", target=tgt, dynamic=False)
-    msg = r["message"]
+    msg = ha.admit(wt, "rt-x-s1", target=tgt, dynamic=False)["message"]
     chk("L2 refusal carries its OWN marker (not SPEC_DEFECT)", (msg.startswith(ha.ADMISSION_ROUTE_PREFIX), "SPEC_DEFECT" in msg), (True, False))
-    chk("L2 marker constant is identical in harness_admission / auto / slice", (ha.ADMISSION_ROUTE_PREFIX, au.ADMISSION_ROUTE_PREFIX, sl.ADMISSION_MARK), (ha.ADMISSION_ROUTE_PREFIX,) * 3)
-    chk("L2 slicer: is_spec_defect False, is_admission_refusal True", (sl.is_spec_defect(msg), sl.is_admission_refusal(msg)), (False, True))
-    chk("L2 respec_class names it 'admission'", sl.respec_class({}, msg), "admission")
-    chk("L2 auto: no-more-rounds + 'die' route (never auto-sliced)", (au._failure_route(msg), msg.startswith(au.NO_MORE_ROUNDS_PREFIXES)), ("die", True))
-    chk("L2 auto: the continuation ladder / escalation stop on it", au.ADMISSION_ROUTE_PREFIX in au.NO_MORE_ROUNDS_PREFIXES, True)
-    # drive the slicer's real failure handler
-    sl.save_state = lambda st, **k: None
-    sl.slice_job_awaiting_gate = lambda st, sid: None
-    removed = []
-    sl.remove_worktree = lambda cwt, w: removed.append(w)
-    sl.read_state = lambda label: None
-    sl.retry_guard = lambda *a, **k: (True, None, [])
-    SID = "s3-x"
-    def attempt(sig, s):
-        s["status"] = "failed"; s["last_auto_error"] = sig
-        return sl.bound_stale_worktree_retry({"label": "run", "slices": {SID: s}}, SID, s, "/nonexistent-wt", "/nonexistent-cwt", "test")
-    s = {"status": "failed"}
-    rr = attempt("ERROR: " + msg, s)
-    chk("L2 1st admission refusal => ONE bounded re-spec (retry allowed, worktree removed)", (rr, s.get("respec_count"), removed != []), (True, 1, True))
-    chk("L5 refusal is a NON-ATTEMPT: attempt + launch counters handed back", (s.get("author_attempts"), s.get("author_launches_total")), (0, 0))
-    rr = attempt("ERROR: " + msg, s)
-    chk("L5 ...and the ESCALATED path leaves attempts/launches at 0 too", (s.get("author_attempts"), s.get("author_launches_total")), (0, 0))
-    chk("L2 2nd refusal => budget spent => ESCALATED with a repair hint (no 2nd re-spec)", (rr, s["status"], s.get("respec_count"), "re-spec budget already spent" in s.get("escalation_reason", "")), (False, "escalated", 1, True))
-    # K identical refusals never trip the generic K-of-K / attempt / launch caps on their own
-    s = {"status": "failed", "respec_count": 0}
-    outs = []
-    for _ in range(sl.MAX_IDENTICAL_AUTHOR_FAILURES + 2):
-        s["status"] = "failed"
-        outs.append(attempt("ERROR: " + msg, s))
-        if s["status"] == "escalated": break
-        s["respec_count"] = 0               # re-arm the budget: only the NON-ATTEMPT accounting is under test
-    chk("L5 K-of-K identical admission (contract-broken class) refusals do not consume author attempts/launches",
-        (s.get("author_attempts"), s.get("author_launches_total"), outs.count(True) == len(outs)), (0, 0, True))
-    # a REAL (non-refusal) identical failure still counts and still trips the cap
-    s = {"status": "failed", "respec_count": sl.RESPEC_CAP}
-    o = []
-    for _ in range(sl.MAX_IDENTICAL_AUTHOR_FAILURES):
-        o.append(attempt("ERROR: authoring did not converge: job aaaaaaaaaaaa failed (exit 1) | FAIL: same", s))
-    chk("L5 control: real identical failures still count and park", (o[-1], s["status"]), (False, "escalated"))
     # REAUTHOR / -rsN labels are gated like any author round, and a recorded reslice stops a re-author run
     for lab in ("auto-author-w-rs1", "auto-author-w-c2", "auto-author-w-esc", "auto-author-w-fresh"):
         chk(f"L2 tier of {lab} is gated (authoring)", ha.tier_for_label(lab), "authoring")
@@ -518,9 +441,6 @@ def interactions():
         (ha.admit(wt, "auto-author-w-s3", target=tgt, dynamic=False)["cause"], bool(ha.backstop_refusal(wt, "auto-author-w-s3"))), ("reslice-required", True))
     lg = load(HERE / "land_go.py", "land_go_inter")
     chk("L2 REAUTHOR has its own bounded daily cap", lg.REAUTHOR_CAP_PER_DAY >= 1, True)
-    # re-scaffold at the same path clears admission state (SOURCE-TEXT check: the scaffold CLI is not unit-callable)
-    chk("L1 scaffold clears admission state after a successful worktree add (source check)",
-        "_ha_mod.clear_state(dest)" in (HERE / "ollama-dispatch-scaffold").read_text(), True)
     # --- repair acceptance x admit
     rv = load(HERE / "harness-repair-verify.py", "repair_verify_inter")
     rv.hr.survey = lambda wtp, reqs: {"clean": True}
@@ -682,11 +602,6 @@ def exploration_exhausted():
     chk("O ...grep-only run_bash counts as exploration", oq.classify_failure("nonconvergence", rd + '[worker] tool run_bash({"command": "grep -n def x.py"}) -> ok\n' + todo, authoring=True)[0], "exploration-exhausted")
     chk("O ...a redirecting run_bash is a write", oq.classify_failure("nonconvergence", rd + '[worker] tool run_bash({"command": "echo x > TASK.md"}) -> ok\n' + todo, authoring=True)[0], "model")
     chk("O exploration-exhausted is not an nsample (model-side) class", "exploration-exhausted" in oq.NSAMPLE_CLASSES, False)
-    chk("O the auto driver passes the prompt to admit() so an anchor window in the intent lifts the refusal",
-        "lang=getattr(a, \"lang\", None), text=prompt)" in (HERE / "ollama-dispatch-auto").read_text(), True)
-    chk("O the auto driver's attempt class for it is its own (never iteration-cap)",
-        "return \"exploration-exhausted\"" in (HERE / "ollama-dispatch-auto").read_text(), True)
-
 
 guard("exploration_exhausted", exploration_exhausted)
 

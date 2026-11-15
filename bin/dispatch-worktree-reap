@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""dispatch-worktree-reap -- reap dispatch worktrees that are provably integrated.
+
+Dispatch worktrees (~/.ollama-dispatch/worktrees, ~/dispatch-worktrees) were never
+reaped. A naive "clean + not ahead" classifier keeps almost all of them, because the
+pipeline (a) leaves deliverables UNCOMMITTED in the worktree and (b) integrates slice
+chains by COPYING the target file onto main rather than merging. So "dirty" and
+"ahead of main" say nothing about whether the work is already on main.
+
+This tool decides by CONTENT:
+
+  REAP  a worktree only when every file it changed vs its merge-base with origin's
+        default branch -- committed (merge-base..HEAD) AND uncommitted/untracked --
+        is byte-identical to origin/main's version (pipeline scaffold files ignored),
+        or it changed nothing real, or its directory is gone (prunable).
+  KEEP  anything referenced by a live consumer:
+          * a non-terminal queue job      (~/bin/ollama-queue-state.json cwd/worktree)
+          * a live slice plan/run         (~/.ollama-dispatch/slice-plans + slice-runs,
+                                           not archived, any slice not done/skipped)
+          * an open run-status row        (http://127.0.0.1:7684/api/runs, plus the
+                                           uncleared sidecars it is derived from)
+          * the handoff panel             (~/bin/handoff-emit.py --json)
+        and anything with real unintegrated content, locked worktrees, the primary
+        checkout, main/master. When in doubt: KEEP.
+
+Dry-run by default. --apply removes the worktree (`git worktree remove --force`),
+deletes its branch only for pipeline prefixes (dispatch/ slice/ fix/ wt- ...), then
+runs `git worktree prune`. Every removal is logged to
+~/.ollama-dispatch/worktree-reap.log.jsonl.
+
+  dispatch-worktree-reap                    # dry-run, 5 default repos
+  dispatch-worktree-reap --repo broker-guard --json
+  dispatch-worktree-reap --apply            # act
+  dispatch-worktree-reap --self-test        # temp repos; proves each keep-rule bites
+
+The scaffold-file list mirrors what ~/bin/ollama-dispatch-scaffold authors (TASK.md,
+verify.sh, check_literals.py, refimpl.py, the per-language fixture, REPO_MAP.md,
+.dispatch-harness.json + its `authored` manifest, .preflight-state.json,
+AUTO-TASK.md, auto-harness-check.py) plus the draft/plan/scope scratch files and
+toolchain artefacts (.venv, node_modules, __pycache__, tsbuildinfo). A scaffold
+path is only ignored when origin/main does NOT have it -- a real repo file that
+happens to share a scaffold name is compared like any other.
+"""
+import argparse
+import datetime as _dt
+import difflib
+import fnmatch
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, "Desktop", "GitHub Projects")
+# dispatch worktrees also live on the NVMe volume (symlink-free, outside $HOME)
+NVME_ROOT = "/Volumes/NVMe-Models/dispatch-worktrees"
+DEFAULT_REPOS = ["broker-guard", "resell-tracker", "award-search",
+                 "plex-automation", "machine-config"]
+
+PIPELINE_BRANCH_PREFIXES = ("dispatch/", "slice/", "fix/", "wt-", "draft/",
+                            "refine/", "auto/")
+PROTECTED_BRANCHES = ("main", "master")
+
+LIVE_QUEUE_STATUSES = {"pending", "queued", "scheduled", "planned", "running",
+                       "paused", "held"}
+SLICE_TERMINAL = {"done", "skipped", "dropped"}
+
+# --- scaffold (derived from ollama-dispatch-scaffold / -draft / -slice / preflight) --
+SCAFFOLD_BASENAMES = {
+    # ollama-dispatch-scaffold authored set + per-language fixtures
+    "TASK.md", "verify.sh", "check_literals.py", "refimpl.py", "test_fixture.py",
+    "verify_cases.sh", "verify_impl.mts", "verify_impl.mjs", "verify_impl.js",
+    "verify.test.ts", "verify_impl_test.go", "verify_impl.rs", "VerifyImpl.java",
+    "VerifyImpl.kt", "REPO_MAP.md", ".dispatch-harness.json",
+    # seal_baseline info/exclude set
+    ".preflight-state.json", "AUTO-TASK.md", "auto-harness-check.py",
+    # draft / plan / scope scratch
+    "DRAFT-TASK.md", "draft-check.py", "PLAN-TASK.md", "SCOPE-TASK.md",
+}
+SCAFFOLD_GLOBS = ("fixture*", "refimpl*", "test_fixture*", "Sources/*Tests/main.swift")
+# toolchain artefacts -- never content, whatever repo
+ARTEFACT_PARTS = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+                  ".mypy_cache", ".build", ".DS_Store"}
+ARTEFACT_GLOBS = ("*.pyc", "*.tsbuildinfo")
+# deliverables that are read, not merged (grouping only -- still KEPT)
+REPORT_ONLY_BASENAMES = {"DIAGNOSIS.md", "ANSWER.md"}
+
+
+def is_artefact(path):
+    parts = path.split("/")
+    if any(p in ARTEFACT_PARTS for p in parts):
+        return True
+    return any(fnmatch.fnmatch(parts[-1], g) for g in ARTEFACT_GLOBS)
+
+
+def is_scaffold_name(path, manifest=()):
+    base = path.rsplit("/", 1)[-1]
+    if base in SCAFFOLD_BASENAMES or path in manifest:
+        return True
+    return any(fnmatch.fnmatch(base, g) or fnmatch.fnmatch(path, g)
+               for g in SCAFFOLD_GLOBS)
+
+
+# --- git helpers ---------------------------------------------------------------
+
+def git(args, cwd, check=False, binary=False):
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
+                       text=not binary)
+    if check and r.returncode != 0:
+        err = r.stderr if not binary else r.stderr.decode(errors="replace")
+        raise RuntimeError(f"git {' '.join(args)} (in {cwd}): {err.strip()}")
+    return r
+
+
+def blob(repo, rev, path):
+    """Bytes of rev:path, or None if absent."""
+    r = git(["cat-file", "blob", f"{rev}:{path}"], repo, binary=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def wt_bytes(wt, path):
+    p = os.path.join(wt, path)
+    if os.path.islink(p):
+        return os.readlink(p).encode()
+    if os.path.isfile(p):
+        with open(p, "rb") as fh:
+            return fh.read()
+    return None
+
+
+def list_worktrees(repo):
+    out = git(["worktree", "list", "--porcelain"], repo, check=True).stdout
+    wts, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur:
+                wts.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        cur[k] = v if v else True
+    for w in wts:
+        w["branch_name"] = (w.get("branch") or "").replace("refs/heads/", "") \
+            if isinstance(w.get("branch"), str) else ""
+    return wts
+
+
+def default_base(repo):
+    r = git(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    for b in ("origin/main", "origin/master"):
+        if git(["rev-parse", "-q", "--verify", b], repo).returncode == 0:
+            return b
+    return None
+
+
+def real(p):
+    return os.path.realpath(os.path.expanduser(p))
+
+
+def under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+# --- live-reference sources ----------------------------------------------------
+
+class Sources:
+    """Where the keep-rules read from. Overridable for --self-test."""
+
+    def __init__(self, home=HOME):
+        self.queue_state = os.path.join(home, "bin", "ollama-queue-state.json")
+        self.queue_logs = os.path.join(home, "bin", "ollama-queue-logs")
+        self.slice_plans = os.path.join(home, ".ollama-dispatch", "slice-plans")
+        self.slice_runs = os.path.join(home, ".ollama-dispatch", "slice-runs")
+        self.runs_api = "http://127.0.0.1:7684/api/runs"
+        self.handoff_cmd = [sys.executable, os.path.join(home, "bin", "handoff-emit.py"),
+                            "--json"]
+        self.roots = [os.path.join(home, ".ollama-dispatch", "worktrees"),
+                      os.path.join(home, "dispatch-worktrees"),
+                      os.environ.get("OLLAMA_DISPATCH_NVME_ROOT", NVME_ROOT)]
+        env_root = os.environ.get("OLLAMA_DISPATCH_WORKTREES")
+        if env_root:
+            self.roots.append(env_root)
+        self.log_path = os.path.join(home, ".ollama-dispatch", "worktree-reap.log.jsonl")
+
+
+class LiveRefs:
+    """Collected references. paths: list of (realpath, rule, detail).
+    tokens: list of (label-token, rule, detail) for rows whose path is unknown --
+    matched against worktree basenames (over-keeping is the safe direction)."""
+
+    RULES = ("queue", "slice", "run-status", "handoff")
+
+    def __init__(self):
+        self.paths, self.tokens, self.errors = [], [], []
+
+    def add(self, path, rule, detail):
+        if path:
+            self.paths.append((real(path), rule, detail))
+
+    def add_token(self, tok, rule, detail):
+        tok = (tok or "").strip()
+        if len(tok) >= 6:
+            self.tokens.append((tok, rule, detail))
+
+    def match(self, wt_path, disabled=()):
+        w = real(wt_path)
+        base = os.path.basename(w)
+        hits = []
+        for p, rule, detail in self.paths:
+            if rule not in disabled and under(p, w):
+                hits.append((rule, detail))
+        for tok, rule, detail in self.tokens:
+            if rule not in disabled and re.search(
+                    r"(^|[-_/])" + re.escape(tok) + r"($|[-_/])", base):
+                hits.append((rule, detail))
+        return hits
+
+
+def _strip_stage(label):
+    lab = re.sub(r"^(auto-(author|refine|fix|review)|gate|regate)-", "", label or "")
+    return re.sub(r"-r\d+$", "", lab)
+
+
+def collect_live(src, runs_fetch=None, handoff_fetch=None):
+    L = LiveRefs()
+    # 1. queue
+    qjobs = {}
+    try:
+        with open(src.queue_state) as fh:
+            st = json.load(fh)
+        for j in st.get("jobs", []):
+            qjobs[j.get("id")] = j
+            if str(j.get("status")) in LIVE_QUEUE_STATUSES:
+                for k in ("cwd", "worktree"):
+                    L.add(j.get(k), "queue", f"{j.get('status')} job {j.get('id')} {j.get('label')}")
+    except FileNotFoundError:
+        L.errors.append(f"queue state missing: {src.queue_state}")
+    except Exception as e:  # noqa: BLE001
+        L.errors.append(f"queue state unreadable: {e}")
+
+    # 2. slice plans / runs
+    try:
+        live_plans = {}
+        for f in sorted(os.listdir(src.slice_plans)) if os.path.isdir(src.slice_plans) else []:
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(src.slice_plans, f)) as fh:
+                    plan = json.load(fh)
+            except Exception as e:  # noqa: BLE001
+                L.errors.append(f"slice plan unreadable {f}: {e}")
+                continue
+            label = plan.get("label") or f.split(".slices.json")[0].split(".json")[0]
+            live_plans[label] = plan
+        run_files = sorted(os.listdir(src.slice_runs)) if os.path.isdir(src.slice_runs) else []
+        runs = {}
+        for f in run_files:
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(src.slice_runs, f)) as fh:
+                    runs[f[:-5]] = json.load(fh)
+            except Exception as e:  # noqa: BLE001
+                L.errors.append(f"slice run unreadable {f}: {e}")
+        archived_dirs = [os.path.join(src.slice_plans, d) for d in ("archive", "_abandoned")]
+        for label, run in runs.items():
+            label = run.get("label") or label
+            slices = run.get("slices") or {}
+            items = list(slices.values()) if isinstance(slices, dict) else list(slices)
+            if not items:
+                continue
+            sts = [str((s or {}).get("status") or "pending").lower()
+                   if isinstance(s, dict) else str(s).lower() for s in items]
+            pp = run.get("plan_path") or ""
+            if pp and any(under(real(pp), real(d)) for d in archived_dirs):
+                continue
+            if pp and not os.path.exists(pp) and label not in live_plans:
+                # plan gone but not archived: unknown -> treat as live if unfinished
+                pass
+            if all(s in SLICE_TERMINAL for s in sts):
+                continue
+            why = f"slice run {label}: " + ",".join(sorted(set(sts)))
+            L.add(run.get("chain_worktree"), "slice", why)
+            for s in items:
+                if isinstance(s, dict):
+                    L.add(s.get("worktree"), "slice", why)
+            L.add_token(label, "slice", why)
+        for label, plan in live_plans.items():
+            if label in runs or any((r.get("label") == label) for r in runs.values()):
+                continue
+            why = f"slice plan {label} not started (no run state)"
+            L.add(plan.get("shared_worktree") if isinstance(plan.get("shared_worktree"), str) else None,
+                  "slice", why)
+            L.add_token(label, "slice", why)
+    except Exception as e:  # noqa: BLE001
+        L.errors.append(f"slice state unreadable: {e}")
+
+    # 3. run-status rows: the API (what the dashboard shows, capped at 100) PLUS the
+    # uncleared sidecars it is derived from (non-recursive *.done.json/*.gate.json in
+    # the queue log dir -- clearing archives them to archive/).
+    ids = {}
+    try:
+        rows = runs_fetch() if runs_fetch else _fetch_json(src.runs_api)
+        rows = rows if isinstance(rows, list) else (rows or {}).get("runs") or []
+        for r in rows:
+            ids[r.get("id")] = r.get("label")
+    except Exception as e:  # noqa: BLE001
+        L.errors.append(f"run-status API unreachable ({e}); using sidecars only")
+    if os.path.isdir(src.queue_logs):
+        for f in os.listdir(src.queue_logs):
+            m = re.match(r"(.+)\.(done|gate)\.json$", f)
+            if m and m.group(1) not in ids:
+                ids[m.group(1)] = None
+    for jid, label in ids.items():
+        if not jid or str(jid).startswith(("gate-", "regate-")):
+            continue
+        cwd = None
+        for ext, key in ((".done.json", "cwd"), (".gate.json", "job_cwd")):
+            p = os.path.join(src.queue_logs, f"{jid}{ext}")
+            if os.path.isfile(p):
+                try:
+                    with open(p) as fh:
+                        d = json.load(fh)
+                    cwd = cwd or d.get(key)
+                    label = label or d.get("label") or d.get("job_label")
+                except Exception:  # noqa: BLE001
+                    pass
+        j = qjobs.get(jid) or {}
+        cwd = cwd or j.get("cwd") or j.get("worktree")
+        label = label or j.get("label")
+        why = f"open run-status row {jid} {label or ''}".strip()
+        if cwd:
+            L.add(cwd, "run-status", why)
+        else:
+            L.add_token(_strip_stage(label), "run-status", why + " (no cwd; label match)")
+
+    # 4. handoff panel
+    try:
+        ho = handoff_fetch() if handoff_fetch else _handoff(src)
+        for sect, rows in (ho or {}).items():
+            if sect in ("acted", "hidden_eval_counts") or not isinstance(rows, list):
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                why = f"handoff {sect}: {r.get('id')} {r.get('label')}"
+                got = False
+                for k in ("cwd", "worktree"):
+                    if r.get(k):
+                        L.add(r[k], "handoff", why)
+                        got = True
+                if not got:
+                    L.add_token(_strip_stage(r.get("label")), "handoff", why + " (label match)")
+    except Exception as e:  # noqa: BLE001
+        L.errors.append(f"handoff panel unavailable: {e}")
+    return L
+
+
+def _fetch_json(url):
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _handoff(src):
+    r = subprocess.run(src.handoff_cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"exit {r.returncode}: {r.stderr.strip()[:200]}")
+    return json.loads(r.stdout)
+
+
+# --- content classification -------------------------------------------------------
+
+def untracked_files(wt):
+    """Untracked, non-ignored files -- without descending into artefact dirs."""
+    out = git(["ls-files", "--others", "--exclude-standard", "--directory", "-z"], wt).stdout
+    files = []
+    for e in filter(None, out.split("\0")):
+        if e.endswith("/"):
+            if is_artefact(e.rstrip("/")):
+                continue
+            sub = git(["ls-files", "--others", "--exclude-standard", "-z", "--", e], wt).stdout
+            files += [s for s in sub.split("\0") if s and not is_artefact(s)]
+        elif not is_artefact(e):
+            files.append(e)
+    return files
+
+
+# Creation-task stubs seeded by ollama-dispatch-scaffold (creation_stub(), the TS
+# symbol seed, the per-language "TODO --" seeds). A file whose whole content is one
+# of these is scaffold, not a deliverable: the model never replaced it.
+_STUB_MARK = re.compile(r"(Stub for \S+ -- implement per TASK\.md|Stub -- implement per TASK\.md"
+                        r"|TODO -- (the target under test|implement per TASK\.md|define \S+ here"
+                        r"|implement the fix for .*))")
+_STUB_FILLER = re.compile(r"^(export \{\};|exit 1|#!.*|package \w+|public class \w+ \{|\}|"
+                          r"import Foundation|export function \w+\(\) \{ /\* TODO \*/ \})$")
+
+
+def is_creation_stub(b):
+    if b is None or len(b) > 400:
+        return False
+    try:
+        lines = [l.strip() for l in b.decode().splitlines() if l.strip()]
+    except UnicodeDecodeError:
+        return False
+    if not any(_STUB_MARK.search(l) for l in lines):
+        return False
+    return all(_STUB_MARK.search(l) or _STUB_FILLER.match(l) for l in lines)
+
+
+def added_line_coverage(mb_b, lost_b, main_b):
+    """Advisory, for grouping KEPT worktrees only: (added non-blank lines of
+    mb -> lost, how many of them appear verbatim (stripped) anywhere in main)."""
+    try:
+        a = (mb_b or b"").decode().splitlines()
+        b = (lost_b or b"").decode().splitlines()
+        mset = {x.strip() for x in (main_b or b"").decode().splitlines()}
+    except UnicodeDecodeError:
+        return 1, 0
+    tot = hit = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag in ("replace", "insert"):
+            for x in b[j1:j2]:
+                if x.strip():
+                    tot += 1
+                    hit += x.strip() in mset
+    return tot, hit
+
+
+def classify_content(repo, wt, base, head=None, missing=False):
+    """-> (verdict, detail, unintegrated_files, info)
+    verdict: 'clean' | 'scaffold-only' | 'integrated' | 'unintegrated' | 'error'."""
+    head = head or "HEAD"
+    cwd = repo if missing else wt
+    mb = git(["merge-base", head, base], cwd)
+    if mb.returncode != 0:
+        return "error", f"no merge-base between {head} and {base}", [], {}
+    mb = mb.stdout.strip()
+    committed = set(filter(None, git(["diff", "--name-only", "--no-renames", "-z", mb, head],
+                                     cwd).stdout.split("\0")))
+    dirty, untracked = set(), set()
+    if not missing:
+        dirty = set(filter(None, git(["diff", "--name-only", "--no-renames", "-z", "HEAD"],
+                                     wt).stdout.split("\0")))
+        untracked = set(untracked_files(wt))
+    manifest = set()
+    if not missing:
+        mf = os.path.join(wt, ".dispatch-harness.json")
+        try:
+            with open(mf) as fh:
+                m = json.load(fh)
+            tgt = m.get("target")
+            manifest = {a for a in (m.get("authored") or []) if a and a != tgt}
+        except Exception:  # noqa: BLE001
+            pass
+    touched = committed | dirty | untracked
+    scaffold, integrated, bad = [], [], []
+    cov_tot = cov_hit = 0
+    for path in sorted(touched):
+        main_b = blob(cwd, base, path)
+        if main_b is None and (is_artefact(path) or is_scaffold_name(path, manifest)):
+            scaffold.append(path)
+            continue
+        mb_b = blob(cwd, mb, path)
+        lost = []
+        if path in committed:
+            lost.append(("committed", blob(cwd, head, path)))
+        if path in dirty or path in untracked:
+            lost.append(("worktree", wt_bytes(wt, path)))
+        ok, stub = True, False
+        for kind, v in lost:
+            if v == main_b:
+                continue
+            if kind == "worktree" and v == mb_b:
+                continue  # worktree reverted to base: no change of its own
+            if is_creation_stub(v):
+                stub = True
+                continue  # the scaffold's seed stub, never filled in
+            ok = False
+            t, h = added_line_coverage(mb_b, v, main_b)
+            cov_tot += t
+            cov_hit += h
+        if not ok:
+            bad.append(path)
+        elif stub:
+            scaffold.append(path)
+        else:
+            integrated.append(path)
+    info = {"merge_base": mb[:10], "committed": len(committed), "dirty": len(dirty),
+            "untracked": len(untracked), "scaffold": scaffold, "integrated": integrated}
+    if bad:
+        cov = (cov_hit / cov_tot) if cov_tot else 1.0
+        info["main_coverage"] = round(cov, 2)
+        if all(p.rsplit("/", 1)[-1] in REPORT_ONLY_BASENAMES for p in bad):
+            info["group"] = "C report-only (DIAGNOSIS.md/ANSWER.md: read, never merged)"
+        elif cov >= 0.9:
+            info["group"] = "B mostly-on-main (>=90% of added lines exist on main; main moved on)"
+        else:
+            info["group"] = "A not-on-main (<90% of added lines on main)"
+        return "unintegrated", f"{len(bad)} file(s) differ from {base}", bad, info
+    if integrated:
+        return "integrated", f"{len(integrated)} changed file(s) all equal {base}", [], info
+    if scaffold:
+        return "scaffold-only", f"only scaffold/artefacts/seed stubs ({len(scaffold)})", [], info
+    return "clean", "no changes vs merge-base", [], info
+
+
+# --- planning & applying ------------------------------------------------------------
+
+def resolve_repos(names):
+    out = []
+    for n in names:
+        p = n if os.path.isabs(os.path.expanduser(n)) else os.path.join(PROJECTS, n)
+        p = os.path.expanduser(p)
+        if not os.path.isdir(p):
+            raise SystemExit(f"repo not found: {p}")
+        out.append(p)
+    return out
+
+
+def plan_repo(repo, src, live, disabled=(), fetch=True):
+    if fetch:
+        git(["fetch", "-q", "origin"], repo)
+    base = default_base(repo)
+    wts = list_worktrees(repo)
+    primary = real(wts[0]["worktree"]) if wts else None
+    roots = [real(r) for r in src.roots]
+    recs = []
+    for w in wts[1:]:
+        path = w["worktree"]
+        rp = real(path)
+        missing = not os.path.isdir(path)
+        in_root = any(under(rp, r) or under(path, r) for r in roots)
+        if not in_root:
+            continue  # not a dispatch worktree (primary, bakeoff, .claude agents, /tmp ...)
+        br = w.get("branch_name") or ""
+        rec = {"repo": os.path.basename(repo), "repo_path": repo, "path": path,
+               "branch": br or None, "head": (w.get("HEAD") or "")[:10],
+               "missing": missing, "files": [], "info": {}}
+        recs.append(rec)
+        if rp == primary or "bare" in w:
+            rec.update(action="keep", category="primary", reason="primary checkout")
+            continue
+        if br in PROTECTED_BRANCHES:
+            rec.update(action="keep", category="protected-branch", reason=f"branch {br}")
+            continue
+        if "locked" in w and "locked" not in disabled:
+            rec.update(action="keep", category="locked", reason="worktree is locked")
+            continue
+        hits = live.match(path, disabled)
+        if hits:
+            rules = sorted({h[0] for h in hits})
+            rec.update(action="keep", category="live:" + "+".join(rules),
+                       reason="; ".join(sorted({h[1] for h in hits}))[:400])
+            continue
+        if not base:
+            rec.update(action="keep", category="error", reason="no origin default branch")
+            continue
+        if missing:
+            # directory gone: prune metadata. Branch deleted only if its commits are
+            # integrated by content (checked below against the branch ref).
+            rec.update(action="reap", category="missing-dir", reason="worktree dir missing (prunable)",
+                       delete_branch=False)
+            if br and br.startswith(PIPELINE_BRANCH_PREFIXES):
+                v, d, bad, info = classify_content(repo, None, base, head=f"refs/heads/{br}",
+                                                   missing=True)
+                rec["delete_branch"] = v in ("clean", "scaffold-only", "integrated")
+                rec["branch_verdict"] = f"{v}: {d}"
+                if bad:
+                    rec["files"] = bad
+            continue
+        try:
+            v, d, bad, info = classify_content(repo, path, base)
+        except Exception as e:  # noqa: BLE001
+            v, d, bad, info = "error", str(e)[:300], [], {}
+        rec["info"] = info
+        if v == "unintegrated" and "content" in disabled:
+            v = "integrated"  # revert-test hook only
+        if v in ("clean", "scaffold-only", "integrated"):
+            rec.update(action="reap", category=v, reason=d,
+                       delete_branch=bool(br) and br.startswith(PIPELINE_BRANCH_PREFIXES))
+        elif v == "unintegrated":
+            rec.update(action="keep", category="unintegrated", reason=d, files=bad)
+        else:
+            rec.update(action="keep", category="error", reason=d)
+    return recs
+
+
+def prune_candidates(repo):
+    """Worktree paths `git worktree prune` would drop (from its --dry-run)."""
+    common = git(["rev-parse", "--git-common-dir"], repo).stdout.strip()
+    common = common if os.path.isabs(common) else os.path.join(repo, common)
+    out = git(["worktree", "prune", "--dry-run", "-v"], repo)
+    paths = []
+    for line in (out.stdout + out.stderr).splitlines():
+        m = re.match(r"Removing worktrees/([^:]+):", line)
+        if not m:
+            continue
+        gd = os.path.join(common, "worktrees", m.group(1), "gitdir")
+        try:
+            with open(gd) as fh:
+                p = fh.read().strip()
+            paths.append(p[:-5] if p.endswith("/.git") else p)
+        except OSError:
+            paths.append(f"<{m.group(1)}>")
+    return paths
+
+
+def apply_recs(recs, src, out=sys.stdout):
+    by_repo = {}
+    for r in recs:
+        by_repo.setdefault(r["repo_path"], []).append(r)
+    logf = open(src.log_path, "a") if src.log_path else None
+    try:
+        for repo, rs in by_repo.items():
+            for r in rs:
+                if r["action"] != "reap":
+                    continue
+                if r["branch"] in PROTECTED_BRANCHES:
+                    continue  # belt and braces
+                entry = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+                         "repo": r["repo"], "path": r["path"], "branch": r["branch"],
+                         "reason": f"{r['category']}: {r['reason']}"}
+                # `worktree remove --force` also drops the admin entry of a worktree
+                # whose directory is already gone, so missing dirs need no prune.
+                res = git(["worktree", "remove", "--force", r["path"]], repo)
+                if res.returncode != 0:
+                    entry["error"] = res.stderr.strip()[:300]
+                    print(f"FAILED remove {r['path']}: {entry['error']}", file=out)
+                    if logf:
+                        logf.write(json.dumps(entry) + "\n")
+                    continue
+                entry["worktree_removed"] = True
+                if r.get("delete_branch") and r["branch"]:
+                    res = git(["branch", "-D", r["branch"]], repo)
+                    entry["branch_deleted"] = res.returncode == 0
+                    if res.returncode != 0:
+                        entry["branch_error"] = res.stderr.strip()[:200]
+                print(f"reaped {r['repo']}: {r['path']} [{r['branch'] or 'detached'}] "
+                      f"-- {entry['reason']}"
+                      + (" (branch deleted)" if entry.get("branch_deleted") else ""), file=out)
+                if logf:
+                    logf.write(json.dumps(entry) + "\n")
+            # `git worktree prune` is all-or-nothing: run it only when every entry it
+            # would prune is one this run reaped (never a kept or out-of-scope worktree).
+            reaped = {real(r["path"]) for r in rs if r["action"] == "reap"}
+            would = prune_candidates(repo)
+            foreign = [w for w in would if real(w) not in reaped]
+            if foreign:
+                print(f"{os.path.basename(repo)}: skipped `git worktree prune` -- it would also "
+                      f"prune {len(foreign)} entr(ies) not reaped here: {', '.join(foreign)[:300]}",
+                      file=out)
+            else:
+                git(["worktree", "prune"], repo)
+    finally:
+        if logf:
+            logf.close()
+
+
+def summarize(recs):
+    summ = {}
+    for r in recs:
+        s = summ.setdefault(r["repo"], {"total": 0, "would_reap": 0, "kept_live": 0,
+                                         "kept_unintegrated": 0, "kept_other": 0})
+        s["total"] += 1
+        if r["action"] == "reap":
+            s["would_reap"] += 1
+        elif r["category"].startswith("live:"):
+            s["kept_live"] += 1
+        elif r["category"] == "unintegrated":
+            s["kept_unintegrated"] += 1
+        else:
+            s["kept_other"] += 1
+    return summ
+
+
+def print_report(recs, errors, applied, out=sys.stdout):
+    summ = summarize(recs)
+    verb = "reaped" if applied else "would-reap"
+    print(f"{'repo':18} {'total':>5} {verb:>10} {'kept-live':>9} {'kept-unint':>10} {'kept-other':>10}",
+          file=out)
+    for repo, s in summ.items():
+        print(f"{repo:18} {s['total']:5} {s['would_reap']:10} {s['kept_live']:9} "
+              f"{s['kept_unintegrated']:10} {s['kept_other']:10}", file=out)
+    for e in errors:
+        print(f"WARNING: {e}", file=out)
+    cats = {}
+    for r in recs:
+        cats[(r["action"], r["category"])] = cats.get((r["action"], r["category"]), 0) + 1
+    print("\nby category: " + ", ".join(f"{a}/{c}={n}" for (a, c), n in sorted(cats.items())),
+          file=out)
+    groups = {}
+    for r in recs:
+        if r["category"] == "unintegrated":
+            groups.setdefault(r["info"].get("group", "?"), []).append(r)
+    for g, rs in sorted(groups.items()):
+        print(f"\n== KEPT unintegrated -- {g} ({len(rs)})", file=out)
+        for r in sorted(rs, key=lambda x: (x["repo"], x["path"])):
+            files = ", ".join(r["files"][:6]) + (f" (+{len(r['files']) - 6})" if len(r["files"]) > 6 else "")
+            cov = r["info"].get("main_coverage")
+            print(f"  {r['repo']:15} {r['path']}  [{r['branch'] or 'detached'}]"
+                  f"{f'  cov={cov:.2f}' if cov is not None else ''}  {files}", file=out)
+    other = [r for r in recs if r["action"] == "keep" and r["category"] in ("error", "locked")]
+    if other:
+        print(f"\n== KEPT other ({len(other)})", file=out)
+        for r in other:
+            print(f"  {r['repo']:15} {r['path']}  {r['category']}: {r['reason']}", file=out)
+
+
+# --- self-test ------------------------------------------------------------------------
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _st_git(args, cwd):
+    env = dict(os.environ, **GIT_ENV)
+    r = subprocess.run(["git", "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"]
+                       + args, cwd=cwd, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {args}: {r.stderr}")
+    return r.stdout
+
+
+def _w(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def _build_fixture(tmp):
+    """Temp origin + primary + one worktree per scenario. Returns (repo, src, expect)."""
+    os.environ.update(GIT_ENV)
+    origin = os.path.join(tmp, "origin.git")
+    repo = os.path.join(tmp, "proj")
+    root = os.path.join(tmp, "worktrees")
+    os.makedirs(root)
+    _st_git(["init", "-q", "--bare", origin], tmp)
+    _st_git(["clone", "-q", origin, repo], tmp)
+    _w(f"{repo}/app.py", "def a():\n    return 1\n")
+    _w(f"{repo}/lib.py", "X = 1\n")
+    _w(f"{repo}/verify.sh", "echo real repo verify\n")  # a REAL file sharing a scaffold name
+    _st_git(["add", "-A"], repo)
+    _st_git(["commit", "-qm", "base"], repo)
+    _st_git(["push", "-q", "origin", "HEAD:main"], repo)
+    _st_git(["remote", "set-head", "origin", "main"], repo)
+
+    def wt(name, branch=True):
+        p = os.path.join(root, name)
+        if branch:
+            _st_git(["worktree", "add", "-q", "-b", f"dispatch/{name}", p, "main"], repo)
+        else:
+            _st_git(["worktree", "add", "-q", "--detach", p, "main"], repo)
+        return p
+
+    expect = {}
+    # REAP: clean
+    wt("clean"); expect["clean"] = ("reap", "clean")
+    # REAP: scaffold-only (sealed commit + untracked fixture + artefacts)
+    p = wt("scaffold")
+    _w(f"{p}/TASK.md", "task\n"); _w(f"{p}/refimpl.py", "r\n"); _w(f"{p}/test_fixture.py", "t\n")
+    _st_git(["add", "-A"], p); _st_git(["commit", "-qm", "seal dispatch harness"], p)
+    _w(f"{p}/fixture_lib.py", "f\n"); _w(f"{p}/.venv/bin/python", "x"); _w(f"{p}/__pycache__/a.pyc", "x")
+    os.symlink(repo, f"{p}/node_modules")
+    _w(f"{p}/.dispatch-harness.json", json.dumps({"authored": ["tests/extra_case.py"], "target": "app.py"}))
+    _w(f"{p}/tests/extra_case.py", "manifest-authored test\n")
+    expect["scaffold"] = ("reap", "scaffold-only")
+    # REAP: content-integrated, deliverable left UNCOMMITTED (copied onto main)
+    p = wt("dirty-integrated")
+    _w(f"{p}/TASK.md", "task\n"); _st_git(["add", "-A"], p); _st_git(["commit", "-qm", "seal"], p)
+    _w(f"{p}/app.py", "def a():\n    return 2\n")
+    _w(f"{p}/newmod.py", "NEW = True\n")
+    expect["dirty-integrated"] = ("reap", "integrated")
+    # REAP: content-integrated, AHEAD with committed slices (chain copied onto main)
+    p = wt("ahead-integrated")
+    _w(f"{p}/lib.py", "X = 2\n"); _st_git(["commit", "-qam", "slice s1"], p)
+    _w(f"{p}/lib.py", "X = 2\nY = 3\n"); _st_git(["commit", "-qam", "slice s2"], p)
+    expect["ahead-integrated"] = ("reap", "integrated")
+    # REAP: creation task whose seeded stub was committed by seal but never filled in
+    p = wt("stub-only")
+    _w(f"{p}/pkg/newfeat.py", '"""Stub for pkg/newfeat.py -- implement per TASK.md."""\n')
+    _w(f"{p}/TASK.md", "task\n"); _st_git(["add", "-A"], p); _st_git(["commit", "-qm", "seal"], p)
+    expect["stub-only"] = ("reap", "scaffold-only")
+    # KEEP: the stub WAS filled in (stub marker line left behind + real code)
+    p = wt("stub-filled")
+    _w(f"{p}/pkg/newfeat.py", '"""Stub for pkg/newfeat.py -- implement per TASK.md."""\n'
+                              'def feat():\n    return 42\n')
+    expect["stub-filled"] = ("keep", "unintegrated")
+    # KEEP: real unintegrated change
+    p = wt("unintegrated")
+    _w(f"{p}/app.py", "def a():\n    return 999\n")
+    expect["unintegrated"] = ("keep", "unintegrated")
+    # KEEP: unintegrated change to a REAL file that shares a scaffold name
+    p = wt("realname")
+    _w(f"{p}/verify.sh", "echo changed real verify\n")
+    expect["realname"] = ("keep", "unintegrated")
+    # KEEP: committed-but-reverted-in-worktree (the branch commit would be lost)
+    p = wt("committed-lost")
+    _w(f"{p}/lib.py", "X = 777\n"); _st_git(["commit", "-qam", "unlanded"], p)
+    _w(f"{p}/lib.py", "X = 1\n")
+    expect["committed-lost"] = ("keep", "unintegrated")
+    # KEEP by live-reference rules -- each worktree is otherwise CLEAN (would reap)
+    for name in ("live-queue", "live-slice", "live-runstatus", "live-handoff"):
+        wt(name)
+    expect["live-queue"] = ("keep", "live:queue")
+    expect["live-slice"] = ("keep", "live:slice")
+    expect["live-runstatus"] = ("keep", "live:run-status")
+    expect["live-handoff"] = ("keep", "live:handoff")
+    # KEEP: locked
+    p = wt("locked"); _st_git(["worktree", "lock", p], repo)
+    expect["locked"] = ("keep", "locked")
+    # REAP: missing dir (prunable), detached
+    p = wt("gone", branch=False); shutil.rmtree(p)
+    expect["gone"] = ("reap", "missing-dir")
+    # KEEP: missing dir but a live job still points at it -> not pruned either
+    p = wt("gone-live"); shutil.rmtree(p)
+    expect["gone-live"] = ("keep", "live:queue")
+    # OUT OF SCOPE: a non-dispatch worktree git considers prunable (dir exists, .git
+    # file gone). Never classified, and apply's prune must not drop its admin entry.
+    outside = os.path.join(tmp, "elsewhere")
+    _st_git(["worktree", "add", "-q", "-b", "fix/human", outside, "main"], repo)
+    os.remove(os.path.join(outside, ".git"))
+
+    # main integrates dirty-integrated + ahead-integrated by COPYING files (never merged)
+    _w(f"{repo}/app.py", "def a():\n    return 2\n")
+    _w(f"{repo}/newmod.py", "NEW = True\n")
+    _w(f"{repo}/lib.py", "X = 2\nY = 3\n")
+    _st_git(["add", "-A"], repo); _st_git(["commit", "-qm", "integrate: copy"], repo)
+    _st_git(["push", "-q", "origin", "HEAD:main"], repo)
+    _st_git(["fetch", "-q", "origin"], repo)
+
+    home = os.path.join(tmp, "home")
+    src = Sources(home=home)
+    src.roots = [root]
+    src.log_path = os.path.join(tmp, "reap.log.jsonl")
+    os.makedirs(src.queue_logs); os.makedirs(os.path.join(src.slice_plans, "archive"))
+    os.makedirs(src.slice_runs)
+    with open(src.queue_state, "w") as fh:
+        json.dump({"jobs": [
+            {"id": "q1", "status": "pending", "label": "x", "cwd": os.path.join(root, "live-queue")},
+            {"id": "q2", "status": "done", "label": "y", "cwd": os.path.join(root, "clean")},
+            {"id": "q3", "status": "held", "label": "w", "cwd": os.path.join(root, "gone-live")},
+        ]}, fh)
+    with open(os.path.join(src.slice_plans, "feat.slices.json"), "w") as fh:
+        json.dump({"label": "feat", "slices": []}, fh)
+    with open(os.path.join(src.slice_runs, "feat.json"), "w") as fh:
+        json.dump({"label": "feat", "plan_path": os.path.join(src.slice_plans, "feat.slices.json"),
+                   "slices": {"s1": {"status": "done", "worktree": None},
+                              "s2": {"status": "pending", "worktree": os.path.join(root, "live-slice")}}}, fh)
+    # an ARCHIVED plan whose run is unfinished must NOT keep anything
+    with open(os.path.join(src.slice_runs, "old.json"), "w") as fh:
+        json.dump({"label": "old", "plan_path": os.path.join(src.slice_plans, "archive", "old.slices.json"),
+                   "slices": {"s1": {"status": "pending", "worktree": os.path.join(root, "clean")}}}, fh)
+    # open run-status row known only through its uncleared sidecar (beyond the API cap)
+    with open(os.path.join(src.queue_logs, "r1.done.json"), "w") as fh:
+        json.dump({"id": "r1", "label": "z", "cwd": os.path.join(root, "live-runstatus")}, fh)
+    # a CLEARED row (archived sidecar) must not keep anything
+    os.makedirs(os.path.join(src.queue_logs, "archive"))
+    with open(os.path.join(src.queue_logs, "archive", "r0.done.json"), "w") as fh:
+        json.dump({"id": "r0", "cwd": os.path.join(root, "clean")}, fh)
+    handoff = {"pending": [{"id": "h1", "label": "h", "cwd": os.path.join(root, "live-handoff")}],
+               "acted": {"zz": {"label": "clean"}}}
+    runs_api = [{"id": "r1", "label": "z"}]
+    return repo, src, expect, (lambda: runs_api), (lambda: handoff)
+
+
+def _run_case(tmp, disabled=()):
+    repo, src, expect, rf, hf = _build_fixture(tmp)
+    live = collect_live(src, runs_fetch=rf, handoff_fetch=hf)
+    recs = plan_repo(repo, src, live, disabled=disabled, fetch=False)
+    got = {os.path.basename(r["path"]): (r["action"], r["category"]) for r in recs}
+    fails = [f"{k}: expected {v}, got {got.get(k)}" for k, v in expect.items() if got.get(k) != v]
+    extra = sorted(set(got) - set(expect))
+    if extra:
+        fails.append(f"unexpected worktrees classified: {extra}")
+    if live.errors:
+        fails.append(f"source errors: {live.errors}")
+    return repo, src, recs, fails
+
+
+def self_test():
+    ok = True
+    with tempfile.TemporaryDirectory(prefix="wt-reap-selftest-") as tmp:
+        repo, src, recs, fails = _run_case(os.path.join(tmp, "base"))
+        print(f"[classify] {'PASS' if not fails else 'FAIL'} ({len(recs)} worktrees)")
+        for f in fails:
+            print("   " + f)
+        ok &= not fails
+        # --apply against the temp repo: reaped gone + branch deleted, kept intact
+        buf = io.StringIO()
+        apply_recs(recs, src, out=buf)
+        afails = []
+        branches = _st_git(["branch", "--format=%(refname:short)"], repo).split()
+        listed = {real(l[9:]) for l in _st_git(["worktree", "list", "--porcelain"], repo).splitlines()
+                  if l.startswith("worktree ")}
+        for r in recs:
+            name = os.path.basename(r["path"])
+            if r["action"] == "reap":
+                if os.path.exists(r["path"]) or real(r["path"]) in listed:
+                    afails.append(f"{name}: still present after apply")
+                if r["branch"] and r["branch"] in branches:
+                    afails.append(f"{name}: branch {r['branch']} not deleted")
+            else:
+                if real(r["path"]) not in listed or (not r["missing"] and not os.path.isdir(r["path"])):
+                    afails.append(f"{name}: KEPT worktree was removed")
+                if r["branch"] and r["branch"] not in branches:
+                    afails.append(f"{name}: KEPT branch {r['branch']} deleted")
+        if real(os.path.join(os.path.dirname(repo), "elsewhere")) not in listed \
+                or "fix/human" not in branches:
+            afails.append("out-of-scope prunable worktree was pruned / its branch deleted")
+        if "main" not in branches:
+            afails.append("main branch deleted")
+        with open(src.log_path) as fh:
+            logged = [json.loads(l) for l in fh]
+        if len(logged) != sum(r["action"] == "reap" for r in recs):
+            afails.append(f"log has {len(logged)} entries, expected one per reap")
+        print(f"[apply]    {'PASS' if not afails else 'FAIL'}")
+        for f in afails:
+            print("   " + f)
+        ok &= not afails
+        # revert-tests: disabling each keep-rule MUST make the self-test fail
+        for rule in ("queue", "slice", "run-status", "handoff", "content", "locked"):
+            _, _, _, rf = _run_case(os.path.join(tmp, "no-" + rule), disabled=(rule,))
+            bites = bool(rf)
+            print(f"[revert]   rule {rule!r:13} disabled -> self-test "
+                  f"{'FAILS (rule bites)' if bites else 'still PASSES -- rule is INERT'}")
+            ok &= bites
+        # revert-test for the prune guard: an unguarded prune must drop the kept
+        # missing-dir worktree and the out-of-scope one (i.e. the guard is load-bearing)
+        global prune_candidates
+        saved = prune_candidates
+        prune_candidates = lambda repo: []  # noqa: E731
+        try:
+            repo2, src2, recs2, _ = _run_case(os.path.join(tmp, "no-prune-guard"))
+            apply_recs(recs2, src2, out=io.StringIO())
+            left = _st_git(["worktree", "list", "--porcelain"], repo2)
+            bites = "gone-live" not in left and "elsewhere" not in left
+        finally:
+            prune_candidates = saved
+        print(f"[revert]   rule 'prune-guard' disabled -> self-test "
+              f"{'FAILS (rule bites)' if bites else 'still PASSES -- rule is INERT'}")
+        ok &= bites
+    print("SELF-TEST " + ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+# --- main --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="actually remove (default: dry-run)")
+    ap.add_argument("--repo", action="append", help="repo name under ~/Desktop/GitHub Projects "
+                    "or a path; repeatable (default: the 5 dispatch repos)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--no-fetch", action="store_true", help="skip `git fetch origin`")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+    repos = resolve_repos(a.repo or DEFAULT_REPOS)
+    src = Sources()
+    live = collect_live(src)
+    hard = [e for e in live.errors if "API unreachable" not in e]
+    if a.apply and hard:
+        for e in hard:
+            print(f"REFUSING --apply: {e}", file=sys.stderr)
+        return 3
+    recs = []
+    for repo in repos:
+        recs += plan_repo(repo, src, live, fetch=not a.no_fetch)
+    if a.apply:
+        apply_recs(recs, src)
+    if a.json:
+        print(json.dumps({"applied": a.apply, "errors": live.errors,
+                          "summary": summarize(recs), "worktrees": recs}, indent=1))
+    else:
+        print_report(recs, live.errors, a.apply)
+        if not a.apply:
+            print("\n(dry-run; nothing changed. Re-run with --apply to act.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

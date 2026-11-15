@@ -18,6 +18,12 @@ Everything but /health needs `Authorization: Bearer <token>`. Config: TOML at $Q
 ~/.config/ollama-queue/config.toml, table [queue_agent]: bind, port, mirror_url, mirror_interval_s,
 mirror_token_file, notify_per_hour. Token: ~/.config/ollama-queue/agent-token (0600).
 
+Darkbloom relay (off unless darkbloom_relay = true): BloomGauge turns its Manager on (and pre-warms) only while
+Darkbloom's [local] bind is loopback, so Darkbloom stays on 127.0.0.1 and this service relays plain TCP from
+<bind>:darkbloom_relay_port (default 8000) to darkbloom_relay_target (default 127.0.0.1:8000). Only peers listed in
+darkbloom_relay_allow (exact IPs, required) get through; Darkbloom still checks its own token. /health shows whether
+it listens and its counts.
+
 Never run as a test server on the Mac. Tests: test_queue_agent.py (claude-sandbox).
 """
 import hashlib
@@ -26,6 +32,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -50,6 +57,12 @@ MIRROR_DEFAULT_INTERVAL_S = 15.0
 MIRROR_EVENT_BATCH = 200
 EVENTS_MAX_BYTES = 1_000_000      # same rotation size as queue-event-log.py:30 (QEL_MAX_BYTES)
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
+RELAY_DEFAULT_PORT = 8000
+RELAY_DEFAULT_TARGET = "127.0.0.1:8000"
+RELAY_MAX_CONNS = 32
+RELAY_CONNECT_TIMEOUT_S = 5.0
+RELAY_RETRY_S = 10.0
+RELAY_BUF = 65536
 
 
 def _now():
@@ -733,6 +746,175 @@ def _http_json(url, token, timeout=10):
         return json.loads(r.read(4_000_000))
 
 
+def _host_port(s, default_port):
+    """'host:port' or 'host' -> (host, port). Brackets allowed for IPv6 ('[::1]:8000')."""
+    s = str(s).strip()
+    if s.startswith("["):
+        host, _, rest = s[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") else default_port
+    if s.count(":") == 1:
+        host, port = s.split(":")
+        return host, int(port)
+    return s, default_port
+
+
+def relay_config(cfg):
+    """-> (settings dict, None) when the relay should run, (None, None) when it is off, (None, error) when it is
+    on but misconfigured. It never listens on loopback (Darkbloom itself is there) and needs an allow list."""
+    if cfg.get("darkbloom_relay") is not True:
+        return None, None
+    bind = str(cfg.get("bind") or DEFAULT_BIND)
+    if is_loopback(bind) or bind in ("0.0.0.0", "::", ""):
+        return None, f"darkbloom_relay needs bind set to this Mac's LAN address, not {bind!r}"
+    try:
+        port = int(cfg.get("darkbloom_relay_port") or RELAY_DEFAULT_PORT)
+        thost, tport = _host_port(cfg.get("darkbloom_relay_target") or RELAY_DEFAULT_TARGET, RELAY_DEFAULT_PORT)
+    except (TypeError, ValueError):
+        return None, "darkbloom_relay_port / darkbloom_relay_target are not valid"
+    if not is_loopback(thost):
+        return None, f"darkbloom_relay_target must be a loopback address, not {thost!r}"
+    allow = cfg.get("darkbloom_relay_allow")
+    if isinstance(allow, str):
+        allow = [allow]
+    allow = [str(a).strip() for a in (allow or []) if str(a).strip()]
+    if not allow:
+        return None, "darkbloom_relay_allow is empty: list the IPs that may reach Darkbloom"
+    return {"listen": (bind, port), "target": (thost, tport), "allow": frozenset(allow),
+            "max_conns": int(cfg.get("darkbloom_relay_max_conns") or RELAY_MAX_CONNS)}, None
+
+
+class DarkbloomRelay:
+    """Plain TCP relay <bind>:port -> loopback Darkbloom, allow-listed peers only. run() keeps retrying the
+    listen (Darkbloom may still hold the port on 0.0.0.0 until it restarts with the loopback bind)."""
+
+    def __init__(self, settings, retry_s=RELAY_RETRY_S, log=None):
+        self.listen = settings["listen"]
+        self.target = settings["target"]
+        self.allow = settings["allow"]
+        self.slots = threading.BoundedSemaphore(settings["max_conns"])
+        self.retry_s = retry_s
+        self.log = log or (lambda m: print(f"[queue-agent] relay: {m}", file=sys.stderr, flush=True))
+        self.sock = None
+        self.stopping = threading.Event()
+        self.ready = threading.Event()
+        self.lock = threading.Lock()
+        self.counts = {"active": 0, "relayed": 0, "refused_peer": 0, "busy": 0, "target_down": 0}
+        self.last_error = None
+
+    @property
+    def status(self):
+        with self.lock:
+            return {"listening": self.ready.is_set(), "port": self.listen[1], **self.counts,
+                    "last_error": self.last_error}
+
+    def _count(self, key, n=1):
+        with self.lock:
+            self.counts[key] += n
+
+    def _open(self):
+        fam = socket.AF_INET6 if ":" in self.listen[0] else socket.AF_INET
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(self.listen)
+            s.listen(64)
+        except OSError:
+            s.close()
+            raise
+        return s
+
+    def run(self):
+        logged = None
+        while not self.stopping.is_set():
+            try:
+                self.sock = self._open()
+            except OSError as e:
+                msg = f"cannot listen on {self.listen[0]}:{self.listen[1]} ({e.strerror or e}); retrying"
+                with self.lock:
+                    self.last_error = msg
+                if msg != logged:
+                    self.log(msg)
+                    logged = msg
+                self.stopping.wait(self.retry_s)
+                continue
+            with self.lock:
+                self.last_error = None
+            self.ready.set()
+            self.log(f"listening on {self.listen[0]}:{self.listen[1]} -> {self.target[0]}:{self.target[1]}")
+            self._accept_loop()
+            return
+
+    def _accept_loop(self):
+        while not self.stopping.is_set():
+            try:
+                client, peer = self.sock.accept()
+            except OSError:
+                if self.stopping.is_set():
+                    return
+                time.sleep(0.2)
+                continue
+            if peer[0] not in self.allow:
+                self._count("refused_peer")
+                _close(client)
+                continue
+            if not self.slots.acquire(blocking=False):
+                self._count("busy")
+                _close(client)
+                continue
+            threading.Thread(target=self._serve, args=(client,), name="relay-conn", daemon=True).start()
+
+    def _serve(self, client):
+        self._count("active")
+        upstream = None
+        try:
+            try:
+                upstream = socket.create_connection(self.target, timeout=RELAY_CONNECT_TIMEOUT_S)
+            except OSError:
+                self._count("target_down")
+                return
+            upstream.settimeout(None)
+            client.settimeout(None)
+            self._count("relayed")
+            back = threading.Thread(target=_pump, args=(upstream, client), name="relay-back", daemon=True)
+            back.start()
+            _pump(client, upstream)
+            back.join()
+        finally:
+            _close(client)
+            if upstream is not None:
+                _close(upstream)
+            self._count("active", -1)
+            self.slots.release()
+
+    def stop(self):
+        self.stopping.set()
+        if self.sock is not None:
+            _close(self.sock)
+
+
+def _pump(src, dst):
+    """Copy src -> dst until src ends, then end dst's write side so the far end sees EOF too."""
+    try:
+        while True:
+            b = src.recv(RELAY_BUF)
+            if not b:
+                break
+            dst.sendall(b)
+    except OSError:
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+def _close(s):
+    try:
+        s.close()
+    except OSError:
+        pass
+
+
 class Mirror:
     """Pull loop. Routes it calls on the container API are defined in queue-agent.md (section Mirror routes)."""
 
@@ -775,8 +957,9 @@ class Ctx:
     """What the handler needs. Tests build their own."""
 
     def __init__(self, token=None, notify_limiter=None, notify=None, mirror=None, hold=None, mac=None, lane=None,
-                 dbstatus=None, ledger=None, bgtick=None, dbconfigs=None):
+                 dbstatus=None, ledger=None, bgtick=None, dbconfigs=None, relay=None):
         self.token = token
+        self.relay = relay
         self.limiter = notify_limiter or RateLimiter()
         self.notify = notify
         self.mirror = mirror
@@ -821,7 +1004,8 @@ def make_handler(ctx):
             try:
                 if u.path == "/health":
                     return self._send(200, {"ok": True, "service": "queue-agent", "generated_at": _now(),
-                                            "mirror": (ctx.mirror.status if ctx.mirror else None)})
+                                            "mirror": (ctx.mirror.status if ctx.mirror else None),
+                                            "darkbloom_relay": (ctx.relay.status if ctx.relay else None)})
                 if not self._authed():
                     return
                 if u.path == "/v1/hold":
@@ -904,9 +1088,17 @@ def main():
         mt = read_token(cfg.get("mirror_token_file") or Path.home() / ".config" / "ollama-queue" / "queue-api-token")
         mirror = Mirror(cfg["mirror_url"], mt, float(cfg.get("mirror_interval_s") or MIRROR_DEFAULT_INTERVAL_S))
         threading.Thread(target=mirror.run, name="mirror", daemon=True).start()
-    srv, _ = build_server(cfg, token, mirror=mirror)
+    relay = None
+    rset, rbad = relay_config(cfg)
+    if rbad:
+        print(f"[queue-agent] darkbloom relay off: {rbad}", file=sys.stderr, flush=True)
+    elif rset:
+        relay = DarkbloomRelay(rset)
+        threading.Thread(target=relay.run, name="darkbloom-relay", daemon=True).start()
+    srv, _ = build_server(cfg, token, mirror=mirror, relay=relay)
     print(f"[queue-agent] listening on {srv.server_address[0]}:{srv.server_address[1]}"
-          f" (mirror {'on' if mirror else 'off'})", file=sys.stderr, flush=True)
+          f" (mirror {'on' if mirror else 'off'}, darkbloom relay {'on' if relay else 'off'})",
+          file=sys.stderr, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

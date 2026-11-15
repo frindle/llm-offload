@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """test-dispatch-langs.py -- the up-front language refusal (dispatch_langs.py).
 
-Pure checks, no worktree, no queue. The end-to-end proof that every entry point
-honours these answers is test-pipeline-e2e.py (csharp / swift-exe cases); this
-pins the decision table itself so a regression names the rule it broke.
+Pure checks, no worktree, no queue. This pins the decision table itself so a
+regression names the rule it broke.
 """
 import json
 import sys

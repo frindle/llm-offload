@@ -35,6 +35,10 @@
 !queue-backtest
 !repo-toolchain-check
 !logq
+!queue-abort
+!dispatch-worktree-reap
+!ha_tscheck.js
+!tw-class-check.mjs
 # never
 *.bak*
 *.orig

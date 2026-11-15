@@ -200,7 +200,7 @@ out, ln = passrun(es)
 check("empty runway launches exactly max_prep (2) entries", (len(ln), [o[1] for o in out]), (2, ["launched", "launched", "wait"]))
 out, ln = passrun(es, jobs=[row("1", "a", "running", "A"), row("2", "b", "pending", "B"), row("3", "c", "pending", "C")])
 check("full GPU runway launches nothing (no needless prep)", (len(ln), out[0][1]), (0, "wait"))
-out, ln = passrun(es, load=14.0)
+out, ln = passrun(es, load=2.0 * (os.cpu_count() or 1))   # relative: a fixed 14.0 is not "high" on a big box
 check("high Mac load launches nothing", (len(ln), out[0][1]), (0, "wait"))
 out, ln = passrun(es, lane=5)
 check("saturated CPU lane launches nothing", (len(ln), out[0][1]), (0, "wait"))

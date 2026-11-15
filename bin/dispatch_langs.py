@@ -12,7 +12,7 @@ mid-chain, after a worktree, an authoring job, or a GPU slot had been spent:
 Every entry point (scaffold, ollama-dispatch-auto, ollama-queue.py enqueue)
 asks this module first and refuses with the reason, before anything is created.
 
-Proven end to end by bin/test-pipeline-e2e.py (one case per language).
+Was proven end to end by test-pipeline-e2e.py, retired 2026-11-15 with the old dispatch chain it drove.
 """
 from __future__ import annotations
 
