@@ -6778,8 +6778,8 @@ def capacity_resume_backoff_s(n):
 # WARNING ONLY: nothing is failed, cancelled, rerouted, parked or written to the queue state (the
 # probe reads the state file, never locks or saves it), and it is evaluated by the API process on
 # the banner poll -- the daemon loop does not call it. "Unsatisfiable" is deliberately narrow and
-# reuses the existing signals: bloom-control's fresh 'infeasible' record / the provider's own
-# cold-load gate (Darkbloom lane), and the fit router's own 'no host fits model footprint' HOLD.
+# reuses the existing signals: the provider's own cold-load gate (Darkbloom lane), and the fit
+# router's own 'no host fits model footprint' HOLD.
 # A BUSY, LOADING/WARMING or briefly OFFLINE backend produces no such signal, so it can never warn.
 UNSAT_WARN_S = 600.0
 UNSAT_MAX_GAP_S = 300.0       # observation gap that breaks continuity (nobody was polling)
@@ -6801,8 +6801,8 @@ def _unsat_env(name, default):
 
 def unsat_reason(job, now=None, cold_gate=None, db_url=None, to_dbm=None):
     """The reason (str) this job is UNSATISFIABLE right now, else None. Never raises.
-    pending + the Darkbloom lane (auto/studio/darkbloom prefs resolve to it alone) + a fresh
-    bloom-control 'infeasible' record or a provider cold-gate verdict for its model; or a HELD
+    pending + the Darkbloom lane (auto/studio/darkbloom prefs resolve to it alone) + a provider
+    cold-gate verdict for its model; or a HELD
     row the fit router parked as 'no host fits model footprint'. Everything else (running,
     human-held, gpu-exclusive, esc-review, Unraid/Bonsai/URL lanes, no signal) -> None."""
     try:

@@ -308,11 +308,12 @@ cat <<'EOF'
     ---- ONLY AFTER CI IS GREEN (above): run these in the UNRAID SHELL (the Mac API key cannot updateContainer; do not use update.sh / the Docker tab) ----
         cd /mnt/user/appdata/dispatch-cpu-runner && docker compose pull && docker compose up -d
 
-    ---- then verify, back on the Mac ----
+    ---- then verify, back on the Mac (the queue runs in the ollama-queue container on Unraid; this asks its API) ----
       # (there is no /api/cpu/runners route; the runner list with its advertised caps is in /api/cpu-lane)
-      curl -s localhost:7684/api/cpu-lane | python3 -c 'import sys,json; [print(r) for r in json.load(sys.stdin)["runners"]]'
+      python3 -c 'import sys,os,json,urllib.request as u; sys.path.insert(0,os.path.expanduser("~/bin")); import queue_config as q; r=u.Request(q.queue_api()[0]+"/api/cpu-lane",headers=q.queue_api_headers()); [print(x) for x in json.load(u.urlopen(r,timeout=20))["runners"]]'
           -> expect a runner entry with "caps" showing node 26 and python 3.14 (caps are only present while fresh; wait ~1 min after up -d)
-      tail -n 20 ~/.ollama-dispatch/cpu-lane.log | grep -c '"path": "runner"'
+    ---- and in the UNRAID SHELL ----
+      docker exec ollama-queue tail -n 20 /home/queue/.ollama-dispatch/cpu-lane.log | grep -c '"path": "runner"'
           -> after the next CPU stage, lines read "path": "runner" instead of "path": "local" / "ineligible: ... node 22 ..."
 EOF
 fi

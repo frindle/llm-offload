@@ -31,34 +31,10 @@ _spec.loader.exec_module(_w)
 
 MARKER = _w.HARNESS_SELFCHECK_MARKER
 
-# The verify command an authoring dispatch ACTUALLY runs, read out of
-# ollama-dispatch-auto rather than retyped here. Independent review caught the
-# first version of this file hardcoding "python3 auto-harness-check.py --strict",
-# a string that exists nowhere in the pipeline. That is the dangerous kind of
-# test: if ollama-dispatch-auto ever renames the script or changes verify_cmd,
-# the worker silently stops exempting authoring self-checks -- reinstating the
-# exact 10-wrongly-failed-jobs regression Finding 3 fixed -- while this suite
-# stays green. Binding to the live string makes that rename fail HERE instead.
-_DISPATCH_AUTO = Path(__file__).resolve().parent / "ollama-dispatch-auto"
-
-
-def _live_harness_verify_cmd():
-    """The literal verify_cmd ollama-dispatch-auto assigns for the harness check."""
-    import re
-    src = _DISPATCH_AUTO.read_text()
-    m = re.search(r'verify_cmd\s*=\s*"([^"]*auto-harness-check\.py[^"]*)"', src)
-    if not m:
-        raise SystemExit(
-            "FATAL: could not find the harness verify_cmd in ollama-dispatch-auto.\n"
-            "Either the authoring dispatch no longer runs auto-harness-check.py, or it\n"
-            "builds the command differently. Do NOT relax this test to make it pass --\n"
-            "check that zero_diff_verdict still exempts the real authoring path first,\n"
-            "because if it does not, every auto-author/auto-refine job with a correct\n"
-            "zero diff is being failed again.")
-    return m.group(1)
-
-
-HARNESS_CMD = _live_harness_verify_cmd()
+# The verify command an authoring dispatch ran. It used to be read out of ollama-dispatch-auto so a rename
+# there would fail here; that tool (the only authoring path) was removed 2026-11-02 (commit 2637810), so the
+# string is pinned to its last value. The zero-diff guard for CODING dispatches below is still live.
+HARNESS_CMD = "python3 auto-harness-check.py"
 CODING_CMD = "bash verify.sh"
 
 _fails = []

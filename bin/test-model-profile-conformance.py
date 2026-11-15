@@ -40,7 +40,7 @@ NCHECK = [0]
 
 os.environ["MODEL_PROFILES_PATH"] = str(PROFILES)
 import pwd
-os.environ["MODEL_CARDS_ROOT"] = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Desktop/GitHub Projects/references")
+os.environ.setdefault("MODEL_CARDS_ROOT", os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Desktop/GitHub Projects/references"))   # the gate sets its shipped copy
 os.environ["HOME"] = tempfile.mkdtemp(prefix="mpconf-home-")   # no real Darkbloom key
 os.environ.pop("VAULT_TOKEN_FILE", None)
 # NOTHINK_RUN is DEFAULT ON for the author role (2026-10-15), which forces enable_thinking=false and so changes the

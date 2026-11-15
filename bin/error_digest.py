@@ -46,13 +46,18 @@ MODEL_DEFAULT = "qwen3:8b"
 MODEL_SIGS_PER_CONTAINER = 8
 
 # LogQL line filter (RE2): the words that make a line "error-ish". Python re below classifies them.
-LOGQL_ERR = r"(?i)\b(error|errors|exception|traceback|fatal|critical|panic|failed|failure|warn|warning)\b"
+# The second half catches an exception's own line, "ConnectionResetError: [Errno 104] Connection reset by peer", which
+# carries no error word on its own (the class name ends in Error/Exception).
+LOGQL_ERR = (r"(?i)\b(error|errors|exception|traceback|fatal|critical|panic|failed|failure|warn|warning)\b"
+             r"|(?-i:[a-z](?:Error|Exception)\b)")
 ERR_WORDS = re.compile(r"\b(error|errors|exception|traceback|fatal|critical|panic|failed|failure)\b", re.I)
+ERR_CLASS = re.compile(r"[a-z](?:Error|Exception)\b")
 WARN_WORDS = re.compile(r"\b(warn|warning)\b", re.I)
 # phrases that carry an error word but report that nothing went wrong
 BENIGN = re.compile(
     r"\b(?:0|no|zero|without)\s+(?:errors?|failures?|exceptions?)\b"
-    r"|\b(?:errors?|failures?|failed|exceptions?|warnings?)(?:_count|_total|_rate)?\s*[=:]\s*(?:0(?:\.0+)?|none|null|false|\[\]|\{\})(?![\w.])"
+    r"|\b(?:errors?|failures?|failed|exceptions?|warnings?)(?:_count|_total|_rate)?[\"']?\s*[=:]\s*[\"']?"
+    r"(?:0(?:\.0+)?|none|null|false|\[\]|\{\})(?![\w.])"
     r"|\berror_?(?:log|page|handler|reporting|level)\b"
     r"|\bon_?error\b|\bignore_?errors?\b|\bfail_?(?:fast|over|safe)\b|\bnon-?critical\b",
     re.I)
@@ -175,11 +180,49 @@ def level(line):
     if t != "untagged":
         return t
     s = BENIGN.sub(" ", s)
-    if ERR_WORDS.search(s):
+    if ERR_WORDS.search(s) or ERR_CLASS.search(s):
         return "error"
     if WARN_WORDS.search(s):
         return "warn"
     return None
+
+
+# ---------------------------------------------------------------------------------------------------- fragments
+# Lines that belong to a longer error but say nothing on their own: traceback headers, stack frames, a source line
+# echoed in a Python traceback, HTML error-page markup. They are counted as "fragments", never made into kinds: the
+# line that carries the message ("ConnectionResetError: ... reset by peer", "System.Net.WebException: ...") is the kind.
+_GLUE = re.compile(r"-{8,}")       # Python's socketserver prints 40 dashes around a traceback; threads glue them on
+_SOCKSERVER = re.compile(r"^Exception (?:occurred|happened) during processing of request from\s*(?:\([^)]*\))?\s*")
+_HTML = ("html|head|body|title|meta|link|script|style|div|span|p|a|br|hr|h[1-6]|ul|ol|li|table|tbody|thead|tr|td|th|"
+         "section|header|footer|nav|main|article|img|button|form|input|noscript|center|b|i|u|strong|em|small|pre|code|"
+         "svg|path|iframe|label|sup|sub|font")
+_FRAGMENT = re.compile(
+    r"^(?:C\+\+ )?Traceback \(most recent call last\):?$"
+    r"|^File \"[^\"]+\", line \d+(?:, in \S+)?$"
+    r"|^at (?:async |new )?\S*[./]\S*?(?:\s*\(.*\))?(?:\s+in\s+\S.*)?$"                  # .NET / Java / JS stack frame
+    r"|^-+ ?End of (?:inner exception )?stack trace(?: from previous location)?(?: where exception was thrown)? ?-+$"
+    r"|^\.\.\. \d+ (?:more|common frames omitted)$"
+    r"|^Error Message Summary:?$"
+    r"|^<(?:!doctype|!--|/?(?:" + _HTML + r")\b)",                             # HTML error-page markup
+    re.I)
+# a Python source line echoed under a traceback frame: a dotted call or an assignment from a call, and nothing after
+# it ("self._err(ShimError(500, 'internal error'))", "warnings.warn(msg)"); never "db.connect(): failed (timeout)"
+_CODE = re.compile(r"^(?!.*\)\s*:\s)(?:raise |return |await )?"
+                   r"(?:[a-z_]\w*(?:\.\w+)+|[\w.\[\]\"']+\s*=\s*[\w.]+)\(.*\)\s*(?:#.*)?$")
+
+
+def unglue(line):
+    """The cleaned line without socketserver's dash rules and its 'request from (addr)' header (the address of
+    whoever connected says nothing about the error; what follows the header, if anything, is the line)."""
+    s = _GLUE.sub(" ", line)
+    s = _SOCKSERVER.sub("", s.strip())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_fragment(line):
+    """True for a stack frame, traceback header, echoed source line or page markup (see above), or an empty line."""
+    s = line.strip()
+    return not s or bool(_FRAGMENT.match(s) or _CODE.match(s))
 
 
 # ---------------------------------------------------------------------------------------------------- noise rules
@@ -337,13 +380,16 @@ def history(ddir, day, days=LOOKBACK_DAYS):
 
 
 def summarize_lines(container, rows, rules):
-    """rows [(ns, line)] -> container record: kinds with counts, routine/skipped/benign counts."""
-    sigs, routine, skipped, benign = {}, {}, 0, 0
+    """rows [(ns, line)] -> container record: kinds with counts, routine/skipped/benign/fragment counts."""
+    sigs, routine, skipped, benign, frags = {}, {}, 0, 0, 0
     for ns, raw in rows:
-        line = clean(raw)
+        line = unglue(clean(raw))
         act = noise_action(rules, container, line)
         if act == "skip":
             skipped += 1
+            continue
+        if is_fragment(line):
+            frags += 1
             continue
         lv = level(line)
         if lv is None:
@@ -367,7 +413,7 @@ def summarize_lines(container, rows, rules):
     for r in sigs.values():
         r["variants"] = len(r.pop("_v"))
     return {"lines": len(rows), "routine": sum(routine.values()), "routine_kinds": len(routine), "skipped": skipped,
-            "benign": benign, "sigs": sorted(sigs.values(), key=lambda r: (-r["count"], r["id"]))}
+            "benign": benign, "fragments": frags, "sigs": sorted(sigs.values(), key=lambda r: (-r["count"], r["id"]))}
 
 
 # Docker's own name generator (adjective_surname) names a container started without --name: a one-off run such as a
@@ -413,7 +459,7 @@ def build_day(loki, day, ddir, rules, say=print):
         prior = seen.get(c, set())
         for s in info["sigs"]:
             s["new"] = bool(hist_days) and s["id"] not in prior
-        if info["sigs"] or info["routine"] or info["skipped"]:
+        if info["sigs"] or info["routine"] or info["skipped"] or info["fragments"]:
             rec["containers"][c] = info
         say("[error-digest] %s %s: %d lines, %d kinds, %d new%s" % (day, c, info["lines"], len(info["sigs"]),
             sum(1 for s in info["sigs"] if s["new"]), " (capped)" if capped else ""))
@@ -489,7 +535,7 @@ def render(rec, top=5):
         out.append("| %s | %s%s | %d | %d | %d× `%s` |" % (
             c, f"{lines:,}", "+" if i.get("capped") else "", len(i["sigs"]), sum(1 for s in i["sigs"] if s.get("new")),
             t["count"], t["text"][:90].replace("|", "/").replace("`", "'")))
-    folded = [(c, i) for c, i in cs.items() if i.get("routine") or i.get("skipped")]
+    folded = [(c, i) for c, i in cs.items() if i.get("routine") or i.get("skipped") or i.get("fragments")]
     if folded:
         out += ["", "## Known noise (folded)", ""]
         for c, i in folded:
@@ -499,6 +545,9 @@ def render(rec, top=5):
                                                                  i["routine_kinds"], "" if i["routine_kinds"] == 1 else "s"))
             if i.get("skipped"):
                 bits.append("%s left out (alerted elsewhere)" % f"{i['skipped']:,}")
+            if i.get("fragments"):
+                bits.append("%s stack-trace or page-markup line%s (the error lines they belong to are listed)" % (
+                    f"{i['fragments']:,}", "" if i["fragments"] == 1 else "s"))
             out.append("- %s: %s" % (c, ", ".join(bits)))
     return "\n".join(out).rstrip() + "\n"
 

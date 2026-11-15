@@ -121,7 +121,7 @@ def run(src):
 
 def main():
     if "--mutants" in sys.argv:
-        src = Path(sys.argv[sys.argv.index("--src") + 1]) if "--src" in sys.argv else HERE.parent / "src" / "ollama-queue-api.py"
+        src = Path(sys.argv[sys.argv.index("--src") + 1]) if "--src" in sys.argv else (HERE / "ollama-queue-api.py").resolve()
         text = src.read_text()
         bad = 0
         for name, old, new in MUTANTS:
@@ -137,7 +137,7 @@ def main():
             print(("ok  " if red else "FAIL") + f": mutant goes red -- {name}")
             bad += 0 if red else 1
         return 1 if bad else 0
-    src = Path(sys.argv[sys.argv.index("--src") + 1]) if "--src" in sys.argv else HERE.parent / "src" / "ollama-queue-api.py"
+    src = Path(sys.argv[sys.argv.index("--src") + 1]) if "--src" in sys.argv else (HERE / "ollama-queue-api.py").resolve()
     try:
         run(src)
     except Exception as e:

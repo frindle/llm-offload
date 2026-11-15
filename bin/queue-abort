@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""queue-abort -- stop / cancel jobs on the ollama queue with one command.
+
+Standalone wrapper around the existing `ollama-queue.py` verbs (status, cancel,
+cancel --force, resolve). Does not touch the daemon or edit ollama-queue.py.
+
+USAGE
+  queue-abort <job-id | label-substring> [--bundle NAME] [--children]
+              [--dry-run] [--yes] [--wait SECS]
+
+  <job-id>      exact 12-hex job id (acts with no prompt)
+  <label>       substring of the job label (e.g. a bundle/slice prefix)
+  --bundle NAME additionally require NAME to appear in the job's label/line
+                (status lines carry no separate bundle field)
+  --children    also match auto-fix / auto-refine / gate / regate / esc-review
+                jobs whose label contains a matched label
+  --dry-run     print the resolved targets and the action for each; do nothing
+  --yes         required to act on >1 target (and mandatory for >10)
+  --wait SECS   how long to wait for a running job to die (default 90)
+
+ACTIONS (per status)
+  running                     cancel --force (SIGTERM; daemon force-kills after
+                              ~45s), then WAIT until the pid is gone and status
+                              leaves running. Prints STOPPED or STILL RUNNING.
+  pending/held/planned/paused/blocked   cancel
+  needs_opus                  resolve
+  done/failed (terminal)      reported 'already terminal' (the existing CLI has
+                              no --force-record, so nothing is offered). Skipped
+                              silently-with-count when matched by pattern.
+
+EXIT  0 = everything done/stopped;  1 = something still running, an action
+      failed, or nothing matched;  2 = refused (needs --yes / bad usage).
+
+ENV   QUEUE_ABORT_QUEUE_PY  path to ollama-queue.py (tests point this at a stub)
+      QUEUE_ABORT_POLL      poll interval seconds while waiting (default 2)
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+QUEUE_PY = os.environ.get("QUEUE_ABORT_QUEUE_PY") or os.path.expanduser("~/bin/ollama-queue.py")
+LINE_RE = re.compile(r"^\[\s*([A-Za-z_]+)\s*\]\s+([0-9a-f]{12})\s+(\S+)(.*)$")
+ID_RE = re.compile(r"^[0-9a-f]{12}$")
+TERMINAL = {"done", "failed"}
+CANCELLABLE = {"pending", "held", "planned", "paused", "blocked"}
+CHILD_PREFIXES = ("auto-fix", "auto-refine", "gate", "regate", "esc-review")
+MAX_NOPROMPT = 10
+
+
+def q(*args, timeout=120):
+    return subprocess.run([sys.executable, QUEUE_PY, *args], capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def parse_status(text):
+    jobs = []
+    for ln in text.splitlines():
+        m = LINE_RE.match(ln.strip())
+        if not m:
+            continue
+        rest = m.group(4)
+        pm = re.search(r"\bpid=(\d+)", rest)
+        jobs.append({"status": m.group(1).lower(), "id": m.group(2), "label": m.group(3),
+                     "pid": int(pm.group(1)) if pm else None, "line": ln.strip()})
+    return jobs
+
+
+def get_jobs():
+    r = q("status")
+    if r.returncode != 0:
+        sys.exit(f"queue-abort: `status` failed (rc={r.returncode}): {r.stderr.strip()[:200]}")
+    return parse_status(r.stdout)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def action_for(job):
+    s = job["status"]
+    if s == "running":
+        return "stop"
+    if s == "needs_opus":
+        return "resolve"
+    if s in TERMINAL:
+        return "terminal"
+    return "cancel"
+
+
+def resolve_targets(jobs, pattern, bundle, children):
+    if ID_RE.match(pattern):
+        return [j for j in jobs if j["id"] == pattern], True
+    base = [j for j in jobs if pattern in j["label"] and (not bundle or bundle in j["line"])]
+    out = {j["id"]: j for j in base}
+    if children:
+        labels = {j["label"] for j in base}
+        for j in jobs:
+            if j["id"] in out:
+                continue
+            if j["label"].startswith(CHILD_PREFIXES) and any(l in j["label"] for l in labels):
+                out[j["id"]] = j
+    return list(out.values()), False
+
+
+def wait_gone(job_id, pid, secs):
+    poll = float(os.environ.get("QUEUE_ABORT_POLL", "2"))
+    deadline = time.time() + secs
+    while True:
+        cur = next((j for j in get_jobs() if j["id"] == job_id), None)
+        still = cur is not None and cur["status"] == "running"
+        cur_pid = cur["pid"] if cur is not None else pid
+        if not still and not pid_alive(cur_pid):
+            return True, cur
+        if time.time() >= deadline:
+            return False, cur
+        sys.stdout.write("."); sys.stdout.flush()
+        time.sleep(poll)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target")
+    ap.add_argument("--bundle")
+    ap.add_argument("--children", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--wait", type=float, default=90.0)
+    a = ap.parse_args()
+
+    jobs = get_jobs()
+    targets, by_id = resolve_targets(jobs, a.target, a.bundle, a.children)
+    if not targets:
+        print(f"queue-abort: no job matches {a.target!r}")
+        return 1
+    skipped_terminal = 0
+    if not by_id:
+        live = [t for t in targets if t["status"] not in TERMINAL]
+        skipped_terminal = len(targets) - len(live)
+        targets = live
+        if not targets:
+            print(f"queue-abort: {skipped_terminal} match(es) for {a.target!r}, all already terminal")
+            return 0
+    print(f"targets ({len(targets)}):")
+    for t in targets:
+        print(f"  [{t['status']:<10}] {t['id']} {t['label']}  -> {action_for(t)}")
+    if skipped_terminal:
+        print(f"  ({skipped_terminal} terminal match(es) skipped)")
+    if a.dry_run:
+        return 0
+    if len(targets) > 1 and not a.yes:
+        if len(targets) > MAX_NOPROMPT or not sys.stdin.isatty():
+            print(f"queue-abort: {len(targets)} targets -- refusing without --yes")
+            return 2
+        if input("proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("aborted"); return 2
+
+    rc = 0
+    for t in targets:
+        act = action_for(t)
+        jid = t["id"]
+        if act == "terminal":
+            print(f"{jid} already terminal ({t['status']}) -- nothing to do")
+            continue
+        argv = {"stop": ["cancel", "--force", jid], "cancel": ["cancel", jid],
+                "resolve": ["resolve", jid]}[act]
+        r = q(*argv)
+        if r.returncode != 0:
+            print(f"FAILED {jid}: `{' '.join(argv)}` rc={r.returncode}: {(r.stderr or r.stdout).strip()[:200]}")
+            rc = 1
+            continue
+        if act != "stop":
+            print(f"{act.upper() if act == 'resolve' else 'CANCELLED'} {jid} {t['label']}")
+            continue
+        print(f"stopping {jid} (pid {t['pid']}) ", end=""); sys.stdout.flush()
+        ok, cur = wait_gone(jid, t["pid"], a.wait)
+        print()
+        if ok:
+            print(f"STOPPED {jid} {t['label']}")
+        else:
+            pid = (cur["pid"] if cur and cur["pid"] else t["pid"])
+            print(f"STILL RUNNING {jid} pid={pid} after {a.wait:g}s -- daemon force-kills ~45s after "
+                  f"SIGTERM; re-run `queue-abort {jid}` or check `kill -0 {pid}` / "
+                  f"`python3 ~/bin/ollama-queue.py status | grep {jid}`")
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

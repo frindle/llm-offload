@@ -354,13 +354,13 @@ if G("reasons"):
 if G("retire"):
     sys.argv = [A.api]
     (T / "bin").mkdir(exist_ok=True)
-    rb = Path("/Users/user/bin")
+    rb = HERE
     for f in rb.iterdir():
         if f.is_file() and not (T / "bin" / f.name).exists():
             (T / "bin" / f.name).symlink_to(f)
     (T / "bin" / "ollama-queue.py").unlink(missing_ok=True)
     (T / "bin" / "ollama-queue.py").symlink_to(Path(A.queue).resolve())
-    sys.path.insert(0, str(Path(os.environ.get("REAL_HOME", "/Users/user")) / "bin"))
+    sys.path.insert(0, str(HERE))
     (T / "bin" / "ollama-queue-api.py").unlink(missing_ok=True)
     (T / "bin" / "ollama-queue-api.py").write_text(Path(A.api).read_text())
     spec = importlib.util.spec_from_file_location("api_ttc", str(T / "bin" / "ollama-queue-api.py"))
@@ -381,8 +381,9 @@ if G("retire"):
 
 # ------------------------------------------------------------------ profile
 if G("profile"):
-    if not (T / "Desktop").exists():
-        (T / "Desktop").symlink_to("/Users/user/Desktop")
+    _rd = Path(__import__("pwd").getpwuid(os.getuid()).pw_dir) / "Desktop"   # real home (model cards), when there is one
+    if not (T / "Desktop").exists() and _rd.is_dir():
+        (T / "Desktop").symlink_to(_rd)
     os.environ["MODEL_PROFILES_PATH"] = A.profiles_yaml
     sys.path.insert(0, str(Path(A.profile_src).parent))
     lp = SourceFileLoader("mp_ttc", A.profile_src)

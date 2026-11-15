@@ -53,6 +53,8 @@ elif cmd.startswith("python3"):
     sys.stdin.read(); sys.stdout.write(open(os.environ["FAKE_RESULT"]).read())
 elif "tar -x" in cmd:
     sys.stdin.buffer.read()
+if os.environ.get("FAKE_FAIL_MATCH") and os.environ["FAKE_FAIL_MATCH"] in cmd:
+    sys.exit(1)
 sys.exit(int(os.environ.get("FAKE_RC_" + cmd.split()[0], "0")))
 '''
 with tempfile.TemporaryDirectory() as t:
@@ -61,7 +63,8 @@ with tempfile.TemporaryDirectory() as t:
     bin_, dash = gitrepo(t / "bin", {"a.py": "1\n"}), gitrepo(t / "dash", {"b.py": "2\n"})
     env = {**os.environ, "PATH": "%s:%s" % (t / "pb", os.environ["PATH"]), "FAKE_LOG": str(t / "ssh.log"),
            "FAKE_RESULT": str(t / "res.txt"), "OFFLOAD_GATE_BIN": str(bin_), "OFFLOAD_GATE_DASH": str(dash),
-           "OFFLOAD_GATE_BASELINE": str(t / "base.json")}
+           "OFFLOAD_GATE_BASELINE": str(t / "base.json"), "OFFLOAD_GATE_CARDS": str(t / "cards"),
+           "OFFLOAD_GATE_SHIM": str(t / "shim")}
     def gate(*args, **ev):
         r = subprocess.run([sys.executable, str(HERE / "offload-test-gate"), *args], env={**env, **ev}, capture_output=True, text=True)
         return r.returncode, r.stdout, r.stderr
@@ -91,6 +94,31 @@ with tempfile.TemporaryDirectory() as t:
     ok("tar" not in (t / "ssh.log").read_text() and "python3" not in (t / "ssh.log").read_text(), "nothing shipped or run when hidden")
     rc, out, err = gate(FAKE_RC_ls="255")
     ok(rc == 4, "ssh failure on the hidden check -> exit 4")
+    # untracked fixture dirs ship as a third tar (data the tests read; git ignores them)
+    (t / "ssh.log").write_text(""); gate()
+    ok("tar -x -C" not in (t / "ssh.log").read_text(), "no fixture dirs -> no fixture tar")
+    (bin_ / "test-fixtures-x").mkdir(); (bin_ / "test-fixtures-x" / "case.json").write_text("{}\n")
+    (t / "ssh.log").write_text(""); rc, out, err = gate()
+    ok(rc == 0 and (t / "ssh.log").read_text().count("tar -x -C") == 1, "fixture dir shipped once: %s" % err)
+    ok(G.ship_fixtures.__doc__ and "fixtures-" in G.FIXTURE_PREFIXES, "fixture prefixes")
+    rc, out, err = gate(FAKE_RC_tar="1")
+    ok(rc == 4 and "shipping fixtures failed" in err, "fixture ship failure -> exit 4 (%s)" % err)
+    import shutil; shutil.rmtree(bin_ / "test-fixtures-x")
+    # vendored model cards ship to <WORK>/references when present (MODEL_CARDS_ROOT for the profile tests)
+    (t / "ssh.log").write_text("")
+    rc, out, err = gate()
+    ok("references" not in (t / "ssh.log").read_text(), "no cards dir -> no cards tar")
+    (t / "cards" / "models").mkdir(parents=True); (t / "cards" / "models" / "m.md").write_text("card\n")
+    (t / "ssh.log").write_text("")
+    rc, out, err = gate()
+    ok(rc == 0 and (t / "ssh.log").read_text().count("mkdir -p work/test-gate/references") == 1, "cards shipped once: %s" % err)
+    rc, out, err = gate(FAKE_FAIL_MATCH="references")
+    ok(rc == 4 and "shipping models failed" in err, "cards ship failure -> exit 4 (%s)" % err)
+    shutil.rmtree(t / "cards")
+    (t / "shim").mkdir(); (t / "shim" / "vault_shim.py").write_text("pass\n"); (t / "ssh.log").write_text("")
+    rc, out, err = gate()
+    ok(rc == 0 and (t / "ssh.log").read_text().count("mkdir -p work/test-gate/vault-shim") == 1, "shim shipped: %s" % err)
+    shutil.rmtree(t / "shim")
     # cleanup unless --keep
     (t / "ssh.log").write_text(""); gate()
     ok(((t / "ssh.log").read_text().count("rm -rf")) >= 2, "sandbox dir removed")
@@ -200,6 +228,22 @@ with tempfile.TemporaryDirectory() as t:
     bincommit({"x.py": "print(4)\n"})
     rc, out = sync()
     ok("push FAILED" in out and rhead(bare) == rhead(other), "a diverged remote is never overwritten (%s)" % out)
+
+# --- the sandbox runner itself (G.RUNNER, run locally on a fake sandbox HOME): child `python3` is the gate's python
+with tempfile.TemporaryDirectory() as td:
+    rh = Path(td); vb = rh / "venv314" / "bin"; vb.mkdir(parents=True)
+    for n in ("python", "python3"):
+        os.symlink(sys.executable, vb / n)
+    tb = rh / G.WORK / "bin"; tb.mkdir(parents=True)
+    (tb / "test-which-python.py").write_text(
+        "import os, shutil, sys\n"
+        "w = shutil.which('python3')\n"
+        "sys.exit(0 if w and os.path.dirname(w).endswith('venv314/bin') else 3)\n")
+    rr = subprocess.run([sys.executable, "-"], input=G.RUNNER.encode(), capture_output=True, timeout=120,
+                        env=dict(os.environ, HOME=str(rh), PATH="/usr/bin:/bin"))
+    got = G.parse_results(rr.stdout.decode()) if b"GATE-RESULT" in rr.stdout else {}
+    ok(got.get("test-which-python.py", (None,))[0] == 0,
+       "runner: a test's child python3 resolves to the gate's venv python (%r %r)" % (got, rr.stderr[-300:]))
 
 # --- offload-repo-sync units
 cfg = {"rules": [(re.compile("(?i)zorblax"), "owner")], "patterns": [re.compile("zorblax|quillon", re.I)],

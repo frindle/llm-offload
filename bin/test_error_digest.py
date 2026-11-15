@@ -171,6 +171,52 @@ def test_signature_and_level():
     chk("levels: the logger's tag wins, then the words; '0 errors' is not an error", not bad, bad)
 
 
+def test_fragments():
+    """Stack frames, traceback headers, echoed source lines and HTML page markup are counted, not made into kinds;
+    the line carrying the message is the kind (11-15 back-fill: the model explained such fragments and made things up)."""
+    rows = [
+        "----------------------------------------",
+        "Exception occurred during processing of request from ('192.0.2.7', 52848)",
+        "Exception occurred during processing of request from----------------------------------------",
+        "Traceback (most recent call last):",
+        "ConnectionResetError: [Errno 104] Connection reset by peer",
+        '----------------------------------------  File "/usr/local/lib/python3.12/socketserver.py", line 362, in finish_request',
+        "Exception occurred during processing of request frominternal error: BrokenPipeError: [Errno 32] Broken pipe",
+        "internal error: BrokenPipeError: [Errno 32] Broken pipe",
+        '    self._err(ShimError(500, "internal error"))',
+        "    warnings.warn(warning_message)",
+        "   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.ThrowException(SocketError error, CancellationToken t)",
+        "   at Object.<anonymous> (/app/server.js:10:5)",
+        "--- End of inner exception stack trace ---",
+        "C++ Traceback (most recent call last):",
+        '<span class="cf-error-code">502</span>',
+        "<P>https&#58;&#47;&#47;errors",
+        '<error code="100" description="Jackett.Common.IndexerException: Exception (torrentleech): Login failed">',
+        "db.connect(): failed (timeout)",
+        "at 10:00 the backup failed",
+        "ERROR(5): disk failed (sda)",
+        '{"job": "ab12", "http": 200, "exit_code": 0, "timings": {"llm": {"calls": 3, "errors": 0}}, "event": "result_posted"}',
+    ]
+    info = ED.summarize_lines("app", [(i, r) for i, r in enumerate(rows)], [])
+    texts = [x["text"] for x in info["sigs"]]
+    chk("fragments are counted, not made into kinds", info["fragments"] == 13, (info["fragments"], texts))
+    want = ["ConnectionResetError: [Errno N] Connection reset by peer", "internal error: BrokenPipeError: [Errno N] Broken pipe",
+            '<error code="N" description="Jackett.Common.IndexerException: Exception (torrentleech): Login failed">',
+            "db.connect(): failed (timeout)", "at N the backup failed", "ERROR(N): disk failed (sda)"]
+    chk("the lines that carry the message are the kinds", sorted(texts) == sorted(want), texts)
+    chk("socketserver's header and dash rules don't split one error into two kinds",
+        [x["count"] for x in info["sigs"] if "BrokenPipeError" in x["text"]] == [2], info["sigs"])
+    chk("'\"errors\": 0' in a JSON line is not an error", info["benign"] == 1, info["benign"])
+    chk("an exception class line is fetched from Loki and is an error",
+        _errish("ConnectionResetError: [Errno 104] Connection reset by peer") and
+        ED.level("ConnectionResetError: [Errno 104] Connection reset by peer") == "error")
+    chk("plain words are still not fetched", not _errish("Connection reset by peer, retrying"))
+    md = ED.render({"day": "2026-11-14", "containers": {"app": dict(info, sigs=[])}, "model": {}})
+    chk("the digest says how many fragment lines it left out", "13 stack-trace or page-markup lines" in md, md[-600:])
+    chk("the model prompt names the placeholders and allows 'unclear'",
+        "<ip> is just whichever address" in RUN.SYSTEM and "answer exactly: unclear" in RUN.SYSTEM)
+
+
 def test_render_caps():
     mk = lambda i, lvl, n: {"id": "%s%02d" % (lvl[0], i), "level": lvl, "count": n, "text": "%s kind %d" % (lvl, i),
                             "first_ns": 0, "last_ns": 0, "new": True}
@@ -384,6 +430,7 @@ def main():
     osrv, obase = serve(FakeOllama)
     try:
         test_signature_and_level()
+        test_fragments()
         test_noise()
         test_render_caps()
         r2 = test_build_and_new(lbase, tmp)

@@ -12,7 +12,7 @@ Tests the REAL decision function and its wiring in ollama-worker.py (WORKER env 
 points it at a backup to prove the suite goes RED there)."""
 import importlib.util, os, re, sys
 
-WORKER = os.environ.get("WORKER", "/Users/user/bin/ollama-worker.py")
+WORKER = os.environ.get("WORKER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ollama-worker.py"))
 FAILS = []
 
 

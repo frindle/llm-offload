@@ -417,7 +417,8 @@ def _self_test_containment():
     live = socket.socket()
     live.bind(("127.0.0.1", 0))
     live.listen(1)  # stands in for a live service: it is listening before the profile is built
-    udir = Path(tempfile.mkdtemp(prefix="mm-ct-", dir="/private/tmp"))
+    # macOS: a socket dir outside the run's own temp dirs; elsewhere (no /private/tmp) the system temp dir
+    udir = Path(tempfile.mkdtemp(prefix="mm-ct-", dir="/private/tmp" if os.path.isdir("/private/tmp") else None))
     usrv = socket.socket(socket.AF_UNIX)
     usrv.bind(str(udir / "s.sock"))
     usrv.listen(1)  # stands in for a session socket in /tmp/cc-socks

@@ -19,7 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REAL_HOME = os.environ["HOME"]
 FAILS = []
-DEFAULT_SRC = HERE.parent / "src" / "ollama-queue-api.py"
+DEFAULT_SRC = (HERE / "ollama-queue-api.py").resolve()   # ~/bin's link into the dashboard repo
 
 MUTANTS = [
     ("slice wait ignores pending rows", "if (c.status === 'pending' && !pend) pend = c;", "if (false) pend = c;"),

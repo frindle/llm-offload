@@ -19,17 +19,14 @@ Pinned here, each against the REAL function in the real tool:
   C. verify-relevance.measure_applied: LOW with source_text_harness BEFORE any
      mutant runs (the verify command is `exit 99`, so if the core ran the
      verdict would be `unproven`); the behavioural worktree reaches the core.
-  D. ollama-dispatch-auto's self-check (auto-harness-check.py): fails with
-     SOURCE-TEXT on the slice fixture; the behavioural one gets past it.
-     Author/refine prompts carry the rules; a SOURCE-TEXT blocker overrides
-     "do not delete existing cases".
+  D. (retired: ollama-dispatch-auto and its self-check were removed.)
   E. gate-on-complete: autofix_classify -> grader-suspect-source-text ->
      undecidable-relevance; measure_relevance keeps the block; the re-gate and
      second-opinion task contexts carry REVIEW_FIXTURE_RULE.
 
 Red-on-revert: point the *_SRC env vars at the pre-change backups
-(`*.bak-20261005T181605Z-srctext`) and B-E fail.
-Env overrides: STH_SRC VQ_SRC VR_SRC AUTO_SRC GATE_SRC. Hermetic: temp dirs only,
+(`*.bak-20261005T181605Z-srctext`) and B, C, E fail.
+Env overrides: STH_SRC VQ_SRC VR_SRC GATE_SRC. Hermetic: temp dirs only,
 GATE_TEST_MODE=1, DISPATCH_VERIFY_SANDBOX=1; never touches a worktree or queue.
 """
 import importlib.util
@@ -50,7 +47,6 @@ FX = HERE / "test-fixtures-source-text-harness"
 STH = Path(os.environ.get("STH_SRC") or HERE / "source_text_harness.py")
 VQ = Path(os.environ.get("VQ_SRC") or HERE / "verify-quality.py")
 VR = Path(os.environ.get("VR_SRC") or HERE / "verify-relevance.py")
-AUTO = Path(os.environ.get("AUTO_SRC") or HERE / "ollama-dispatch-auto")
 GATE = Path(os.environ.get("GATE_SRC") or HERE / "gate-on-complete.py")
 SLICE_FX = FX / "rt-bfmr-link-sync-feedback.verify.test.ts"
 GOOD_FX = FX / "behavioural.verify.test.ts"
@@ -188,47 +184,6 @@ def part_c():
             shutil.rmtree(wt, ignore_errors=True)
 
 
-def part_d():
-    auto = load(AUTO, "auto_sth")
-    for name, fx in (("slice", SLICE_FX), ("behavioural", GOOD_FX)):
-        wt = make_wt(fx)
-        try:
-            auto.write_harness_check(wt, "typescript")
-            p = subprocess.run([sys.executable, "auto-harness-check.py"], cwd=str(wt),
-                               capture_output=True, text=True, timeout=300)
-            out = p.stdout + p.stderr
-            if name == "slice":
-                chk("D self-check: slice fixture FAILS as SOURCE-TEXT",
-                    p.returncode == 1 and "SOURCE-TEXT HARNESS" in out, True)
-                chk("D self-check failure tells the model what to do instead",
-                    "exported pure function" in out and "## Must contain" in out, True)
-            else:
-                chk("D self-check: behavioural fixture is NOT rejected as source-text",
-                    "SOURCE-TEXT" in out, False)
-        finally:
-            shutil.rmtree(wt, ignore_errors=True)
-    auto.load_attempts = lambda a: []
-    tmp = Path(tempfile.mkdtemp(prefix="sth-ap-"))
-    a = SimpleNamespace(intent="sync() must show webError", interface="", lang="typescript",
-                        label="x", repo=str(tmp), new_project=None, dest=None, target=TARGET)
-    ap = auto.author_prompt(a, TARGET)
-    chk("D author prompt forbids reading the target's source as text",
-        "NEVER read the target file's source as text" in ap, True)
-    chk("D author prompt says to extract an exported pure function",
-        "EXTRACT it into an exported" in ap, True)
-    surv = [{"file": TARGET, "line": 3, "mutation": "> -> >=", "snippet": "x >= 0",
-             "original": "x > 0", "class": "cmp"}]
-    rp = auto.refine_prompt(TARGET, surv, [], "typescript")
-    chk("D refine prompt: kill survivors with INPUTS, never a regex of the line",
-        "NEVER kill a survivor by reading the target's source" in rp, True)
-    rb = auto.refine_prompt(TARGET, [], [{"check": "verify-relevance",
-                                          "message": "SOURCE-TEXT HARNESS: the fixture reads ...",
-                                          "fix": "x"}], "typescript")
-    chk("D refine prompt: a SOURCE-TEXT blocker overrides 'do not delete existing cases'",
-        "DELETE them (this overrides" in rb, True)
-    shutil.rmtree(tmp, ignore_errors=True)
-
-
 def part_e():
     g = load(GATE, "gate_sth")
     g.TEST_MODE = True
@@ -284,7 +239,6 @@ def main():
         part_a(sth)
     part_b()
     part_c()
-    part_d()
     part_e()
     print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED'}")
     return 1 if FAILS else 0

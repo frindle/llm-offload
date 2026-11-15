@@ -74,11 +74,7 @@ def main():
         (wt / "TASK.md").write_text(TASK_NO + "## Must contain\n- `a.py`: `def poll`\n")
         check("harness_lint.run_lint(quick) reports it",
               any(f["code"] == hg.SPEC_TEST_PARITY for f in hlm.run_lint(wt, quick=True, target="a.py")))
-    au = (HERE / "ollama-dispatch-auto").read_text()
-    check("authoring prompt carries the contract rule (TASK.md section)", "Leave no TODO behind.\n{EXACT_CONTRACT_RULE}" in au)
-    check("repair (survivor-kill) prompt carries the matching-contract-line rule",
-          "unobservable or the fake is too loose (see below), not a reason to regex it. \"\n    + EXACT_CONTRACT_RULE)" in au
-          and "add the matching contract line" in au)
+    # (the authoring-prompt checks read ollama-dispatch-auto, removed 2026-11-02 in commit 2637810)
     print("SPEC_TEST_PARITY_OK" if not FAILS else f"FAILED: {FAILS}")
     return 1 if FAILS else 0
 
