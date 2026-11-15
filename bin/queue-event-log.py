@@ -19,13 +19,18 @@ can target the launching session (queue-events-deliver.py).
 Env overrides (tests): QEL_DIR, QEL_STATUS_CMD (shell command printing status text),
 QEL_INTERVAL, QEL_MAX_BYTES, QEL_LOG_DIR, QEL_STATE_PATH.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import json, os, re, subprocess, sys, time
 
 DIR = os.environ.get("QEL_DIR") or os.path.expanduser("~/.ollama-dispatch")
 STATUS_CMD = os.environ.get("QEL_STATUS_CMD") or "python3 ~/bin/ollama-queue.py status"
 MAX_BYTES = int(os.environ.get("QEL_MAX_BYTES") or 1_000_000)
-LOG_DIR = os.environ.get("QEL_LOG_DIR") or os.path.expanduser("~/bin/ollama-queue-logs")
-STATE_PATH = os.environ.get("QEL_STATE_PATH") or os.path.expanduser("~/bin/ollama-queue-state.json")
+LOG_DIR = os.environ.get("QEL_LOG_DIR") or str(queue_config.state_dir() / "ollama-queue-logs")
+STATE_PATH = os.environ.get("QEL_STATE_PATH") or str(queue_config.state_dir() / "ollama-queue-state.json")
 TERMINAL = {"failed", "blocked", "done", "passed", "pass", "needs_opus", "needs-review", "needs_review",
             "cancelled", "done_unconverged", "error"}
 OVERLAP_S = 120        # sidecar re-scan window below the watermark (late or coarse mtimes)

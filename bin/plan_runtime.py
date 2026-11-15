@@ -354,12 +354,12 @@ def reap_check(job, now=None, plans_dir=None, directory=None, env=None):
 
 
 def alert_cmd(job, verdict):
-    """argv for notify-owner.py, or None (CONFORMANCE_ALERT=0 default, or nothing drifted)."""
+    """argv for notify-operator.py, or None (CONFORMANCE_ALERT=0 default, or nothing drifted)."""
     try:
         if not verdict or verdict.get("ok") is not False or not _flag("CONFORMANCE_ALERT", "0"):
             return None
         classes = ",".join(sorted({d["class"] for d in verdict["drift"]}))
-        return [sys.executable, os.path.join(_HERE, "notify-owner.py"),
+        return [sys.executable, os.path.join(_HERE, "notify-operator.py"),
                 f"Lane conformance drift: {classes}", f"job {job.get('id')} ({job.get('label')}) lane {job.get('lane')}",
                 "--dedupe-key", f"conformance-{(job.get('plan') or {}).get('lane')}-{classes}", "--dedupe-s", "3600"]
     except Exception:        # noqa: BLE001

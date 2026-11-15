@@ -26,6 +26,11 @@ NEVER acks a coding job that is NOT merged: a 0-file coding job is a FAILED
 dispatch and must stay visible. Unknown/unreadable worktree -> skip (stays for
 a human). Safe no-op when nothing qualifies.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import json
 import os
 import subprocess
@@ -34,10 +39,10 @@ import time
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
-STATE = BIN / "ollama-queue-state.json"
+STATE = queue_config.state_dir() / "ollama-queue-state.json"
 HANDOFF = BIN / "handoff-emit.py"
 SIGNOFF = BIN / "signoff.py"
-LOGS = BIN / "ollama-queue-logs"
+LOGS = queue_config.state_dir() / "ollama-queue-logs"
 
 
 RC_TIMEOUT, RC_NOT_RUN = 124, 127   # never a git exit code (git uses 0, 1 and 128)

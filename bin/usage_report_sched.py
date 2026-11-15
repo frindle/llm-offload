@@ -7,12 +7,17 @@ this scheduler only decides WHEN and runs `usage_report.py run` as a child.
 
   due      >= DUE_AGE_S (7 d) since the last ok run AND (local hour in [WINDOW_START, WINDOW_END) OR age >= FORCE_AGE_S)
   skip     QUEUE_USAGE_REPORT=0 | child running | last attempt < RETRY_S ago
-  failure  non-zero exit or timeout -> notify-owner.py (deduped). A down runner just retries hourly: the
+  failure  non-zero exit or timeout -> notify-operator.py (deduped). A down runner just retries hourly: the
            report never falls back to computing on the Mac.
 State: ~/.ollama-dispatch/usage-report/sched.json   Log: ~/bin/ollama-queue-logs/usage-report.log
 """
 from __future__ import annotations
 
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import json
 import os
 import signal
@@ -24,7 +29,7 @@ from pathlib import Path
 HOME = Path.home()
 BIN = Path(__file__).resolve().parent
 STATE_PATH = HOME / ".ollama-dispatch" / "usage-report" / "sched.json"
-LOG_PATH = BIN / "ollama-queue-logs" / "usage-report.log"
+LOG_PATH = queue_config.state_dir() / "ollama-queue-logs" / "usage-report.log"
 DUE_AGE_S = 7 * 86400
 FORCE_AGE_S = 8 * 86400
 RETRY_S = 3600
@@ -57,7 +62,7 @@ class Run:
             pass
 
     def notify(self, title, msg, key):
-        subprocess.Popen([sys.executable, str(BIN / "notify-owner.py"), title, msg[:900],
+        subprocess.Popen([sys.executable, str(BIN / "notify-operator.py"), title, msg[:900],
                           "--dedupe-key", key, "--dedupe-s", "21600"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

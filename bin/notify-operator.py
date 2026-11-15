@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""notify-owner -- one alert to the owner, without Claude in the loop.
+"""notify-operator -- one alert to the operator, without Claude in the loop.
 
 Pushover when Keychain has `pushover-token` + `pushover-user-key` (generic
 passwords; never printed), else a macOS desktop notification. Every alert is also
-appended to ~/bin/ollama-queue-logs/notify-owner.jsonl so it is never lost.
+appended to ~/bin/ollama-queue-logs/notify-operator.jsonl so it is never lost.
 
-  notify-owner.py "title" "message" [--url URL] [--dedupe-key K --dedupe-s 3600]
+  notify-operator.py "title" "message" [--url URL] [--dedupe-key K --dedupe-s 3600]
 
 --dedupe-key suppresses a repeat of the same key within --dedupe-s seconds (the
 stall detector / reaper must send ONE alert, not one per tick). Exit 0 always.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import json
 import subprocess
@@ -19,7 +24,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-LOG = Path.home() / "bin" / "ollama-queue-logs" / "notify-owner.jsonl"
+LOG = queue_config.state_dir() / "ollama-queue-logs" / "notify-operator.jsonl"
 DEDUPE = Path.home() / ".ollama-dispatch" / "notify-dedupe.json"
 
 
@@ -58,7 +63,9 @@ def notify(title, message, url=None, dedupe_key=None, dedupe_s=3600, now=None,
     if _deduped(dedupe_key, dedupe_s, now):
         return "deduped"
     channel = "none"
-    if sender is not None:
+    if queue_config.standby():
+        channel = "standby"           # the standby container never alerts; the log line below still records it
+    elif sender is not None:
         channel = sender(title, message, url)
     else:
         tok, usr = _keychain("pushover-token"), _keychain("pushover-user-key")

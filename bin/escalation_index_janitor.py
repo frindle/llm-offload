@@ -57,6 +57,11 @@ CLI:  escalation_index_janitor.py [--apply] [--index F] [--ready F]
 """
 from __future__ import annotations
 
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import calendar
 import json
 import math
@@ -72,7 +77,7 @@ INDEX_MD = ESC_DIR / "ESCALATIONS.md"
 READY_MD = ESC_DIR / "READY-TO-LAND.md"
 RUNS_DIR = HOME / ".ollama-dispatch" / "slice-runs"
 PLANS_DIR = HOME / ".ollama-dispatch" / "slice-plans"
-QUEUE_STATE = HOME / "bin" / "ollama-queue-state.json"
+QUEUE_STATE = queue_config.state_dir() / "ollama-queue-state.json"
 LOG_NAME = "ESCALATIONS-AUTOCLOSE.jsonl"
 
 ROW_RE = re.compile(r"^- \[ \] `(?P<plan>[^`]*)` \*\*(?P<who>[^*]+)\*\* (?P<src>[A-Z]) - "
@@ -134,6 +139,7 @@ class Facts:
         self._runs = {}
         self._cancelled = cancelled
         self._bg_config = bg_config        # dict (tests) or None = bloomgauge_control.config()
+        self._agent_doc = None             # container: the status service's ledger answer (see _agent_ledger)
         self._bg = None
 
     # -- plans -------------------------------------------------------------
@@ -232,7 +238,21 @@ class Facts:
                 self._bg = False
         return self._bg or None
 
+    def _agent_ledger(self):
+        """Container (QUEUE_AGENT_URL set): the Mac status service's /v1/bloomgauge-ledger, fetched once per Facts
+        (one janitor run). The ledger and the control mode live on the Mac. False = agent unset, None = no answer
+        (every rule then reads 'unreadable' and does not close), else the answer dict."""
+        if not queue_config.agent_url():
+            return False
+        if self._agent_doc is None:
+            doc = queue_config.agent_get("/v1/bloomgauge-ledger", timeout=5)
+            self._agent_doc = doc if isinstance(doc, dict) and isinstance(doc.get("rows"), list) else {}
+        return self._agent_doc or None
+
     def bg_control_mode(self):
+        doc = self._agent_ledger()
+        if doc is not False:
+            return str(doc.get("mode") or "off") if doc else None
         cfg = self._bg_cfg()
         return str(cfg.get("mode") or "off") if cfg else None
 
@@ -258,15 +278,21 @@ class Facts:
         return self._bg_newest(same)
 
     def _bg_newest(self, keep):
-        cfg = self._bg_cfg()
-        if not cfg or not cfg.get("ledger_path"):
-            return None
-        try:
-            text = Path(cfg["ledger_path"]).read_text()
-        except FileNotFoundError:
-            return {}
-        except OSError:
-            return None
+        doc = self._agent_ledger()
+        if doc is not False:
+            if not doc or doc.get("ledger") == "unreadable":
+                return None
+            text = "\n".join(str(r) for r in doc["rows"])
+        else:
+            cfg = self._bg_cfg()
+            if not cfg or not cfg.get("ledger_path"):
+                return None
+            try:
+                text = Path(cfg["ledger_path"]).read_text()
+            except FileNotFoundError:
+                return {}
+            except OSError:
+                return None
         best, best_ts = {}, None
         for line in text.splitlines():
             try:

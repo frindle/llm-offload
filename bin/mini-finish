@@ -39,8 +39,19 @@ Env: MINI_FINISH_HOME (~/.ollama-dispatch), MINI_FINISH_LOGS (~/bin/ollama-queue
 MINI_FINISH_SUBMIT, MINI_FINISH_VALIDATE (commands; default the ~/bin tools), MINI_FINISH_API (http://127.0.0.1:7684),
 MINI_FINISH_DELIVER (queue-events-deliver.py, for this session's identity).
 
+Remote queue (queue_config.queue_is_remote(); see mini_finish_remote.py): the job's run dir is fetched from the queue into
+<home>/mini-finish-remote/<job>/ (hooks removed, git config replaced, nothing from it executed), the claim and the edits live
+there, --check sends the gates to the queue as a check job (never runs them here) and waits for it, --list reads /api/state;
+a PASS resolves and clears through `ollama-queue.py resolve` / `clear-card`. A test-draft job is finished the same way: its
+acceptance check (draft_accept_cmd, rewritten by queue_remote to the queue host's mini-testdraft) runs as part of the check job.
+
 Exit: 0 ok, 1 refused / usage / check FAIL, 2 an action after a PASS failed (continuation, resolve or clear).
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import ast
 import collections
@@ -76,6 +87,16 @@ GATE_ROW = re.compile(r"^\[mini-runner\]   (\w+): (ok|FAIL) ?(.*)$")
 _MODS = {}
 
 
+def remote():
+    """True when the queue is on another machine (queue_config.queue_is_remote()): see mini_finish_remote.py."""
+    return queue_config.queue_is_remote()
+
+
+def RM():
+    import mini_finish_remote
+    return mini_finish_remote
+
+
 class Refuse(Exception):
     pass
 
@@ -89,15 +110,15 @@ def HOME():
 
 
 def LOGS():
-    return envp("MINI_FINISH_LOGS", "~/bin/ollama-queue-logs")
+    return envp("MINI_FINISH_LOGS", str(queue_config.state_dir() / "ollama-queue-logs"))
 
 
 def LIVELOGS():
-    return envp("MINI_FINISH_LIVELOGS", "~/bin/ollama-queue-livelogs")
+    return envp("MINI_FINISH_LIVELOGS", str(queue_config.state_dir() / "ollama-queue-livelogs"))
 
 
 def STATE():
-    return envp("MINI_FINISH_STATE", "~/bin/ollama-queue-state.json")
+    return envp("MINI_FINISH_STATE", str(queue_config.state_dir() / "ollama-queue-state.json"))
 
 
 def RUNNER():
@@ -165,6 +186,8 @@ def say(msg=""):
 # ---- job lookup ---------------------------------------------------------------------------------
 
 def load_jobs():
+    if remote():
+        return RM().queue_jobs()
     try:
         d = json.loads(STATE().read_text())
         return [j for j in d.get("jobs", []) if isinstance(j, dict) and j.get("id")]
@@ -175,6 +198,8 @@ def load_jobs():
 def sidecar_paths(prefix):
     """{job id: sidecar path} for ids starting with prefix; the live dir wins over its archive."""
     out = {}
+    if remote():   # the sidecars are on the queue host; the mirror carries done.json
+        return out
     for d in (LOGS() / "archive", LOGS()):
         for p in glob.glob(str(d / (glob.escape(prefix) + "*.done.json"))):
             jid = Path(p).name[:-len(".done.json")]
@@ -235,6 +260,8 @@ def cheap_refusal(rec, jobs):
     if cont:
         return f"job {jid} already has a continuation ({cont})"
     cwd = rec.get("cwd")
+    if rec.get("_need_fetch"):   # remote: the work dir comes with the mirror, fetched after this look
+        return None
     if not cwd or not Path(os.path.expanduser(str(cwd))).is_dir():
         return f"job {jid}: its work dir {cwd} is gone, so there is nothing to finish in place"
     return None
@@ -246,7 +273,9 @@ class Ctx:
     pass
 
 
-def newest_livelog(jid):
+def newest_livelog(jid, rec=None):
+    if remote():
+        return RM().livelog(rec or {})
     fs = [Path(p) for p in glob.glob(str(LIVELOGS() / (glob.escape(jid) + "-*.livelog")))]
     return max(fs, key=lambda p: p.stat().st_mtime) if fs else None
 
@@ -302,6 +331,8 @@ def build_ctx(rec):
         assert isinstance(c.raw, dict)
     except (OSError, ValueError, AssertionError):
         raise Refuse(f"cannot read the job's spec {c.spec_path}")
+    if rec.get("_remote"):
+        c.raw = RM().xlate(c.raw, rec)   # the queue's run-dir paths -> the mirror
     raw = c.raw
     if raw.get("remote"):  # its tests and gates are third-party code that runs only on a CPU runner, never on this Mac
         raise Refuse(f"job {c.jid} ran on the remote lane: its project code runs only on a CPU runner, so mini-finish (which runs "
@@ -319,6 +350,8 @@ def build_ctx(rec):
         try:
             fs = json.loads(fsp.read_text())
             assert isinstance(fs, dict) and fs.get("mode") == "two-phase"
+            if rec.get("_remote"):
+                fs = RM().xlate(fs, rec)
         except (OSError, ValueError, AssertionError):
             raise Refuse(f"cannot read the auto job's derived two-phase spec {fsp}")
         c.auto_task, c.spec_path, c.raw = raw.get("task"), fsp, fs
@@ -331,7 +364,7 @@ def build_ctx(rec):
         c.mode = "draft" if raw.get("phase_a_only") else "single"
     else:
         raise Refuse(f"spec mode {raw.get('mode')!r} (verify mode) is not supported by mini-finish: ~/bin/mini-triage {c.jid}")
-    lp = newest_livelog(c.jid)
+    lp = newest_livelog(c.jid, rec)
     c.log_path, c.log = lp, (rd(lp) if lp else "")
     c.k, c.n, c.sp = 1, 1, raw
     if c.mode == "chain":
@@ -389,7 +422,7 @@ def step_base(c, f):
                 return None
             if (sd / f).is_file():
                 return (sd / f).read_bytes()
-    p = subprocess.run(["git", "-C", str(c.work), "show", f"HEAD:{f}"], capture_output=True)
+    p = subprocess.run([*(RM().git_prefix() if remote() else ["git"]), "-C", str(c.work), "show", f"HEAD:{f}"], capture_output=True)
     if p.returncode == 0:
         return p.stdout
     bp = c.baseline / f
@@ -691,7 +724,12 @@ def textwrap_indent(text, first, rest):
 
 # ---- --check ----------------------------------------------------------------------------------------
 
+RUNNER_HOOK = None   # remote: the check runs on the queue (mini_finish_remote.remote_runner), never on this machine
+
+
 def run_runner(chk, spec_path, extra):
+    if RUNNER_HOOK is not None:
+        return RUNNER_HOOK(chk, spec_path, extra)
     work2 = chk / "work"
     work2.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(RUNNER()), "--check-only", "--cwd", str(work2), "--task-file", str(spec_path), *extra]
@@ -777,7 +815,10 @@ def take_lock(c):
 
 
 def check(c, dry, lockf=None):
+    global RUNNER_HOOK
     R_ = R()
+    if remote():
+        RUNNER_HOOK = lambda chk_, sp_, extra_: RM().remote_runner(c, chk_, sp_, extra_, say=say, timeout=CHECK_TIMEOUT)  # noqa: E731
     lockf = lockf or take_lock(c)  # noqa: F841 (held for the whole check)
     for old in c.fdir.glob("check-*"):
         shutil.rmtree(old, ignore_errors=True)
@@ -969,12 +1010,20 @@ def continuation(c, chk):
             f"- This spec replays steps 1..{c.k} from {cont / 'replay'} with the real gates and no model call; "
             f"the local model does steps {c.k + 1}..{c.n}.\n"
             f"- Not a spec or infra failure: the earlier failure was the model's (or its budget), so the task family is unchanged.\n")
-        say(f"mini-finish: continuation spec {sp}: validating (mini-validate, minutes)")
-        v = subprocess.run([*tool("MINI_FINISH_VALIDATE", "mini-validate"), str(sp)], capture_output=True, text=True, cwd=str(cont),
-                           timeout=CHECK_TIMEOUT)
-        (cont / "validate.log").write_text(v.stdout + v.stderr)
-        if v.returncode != 0:
-            raise RuntimeError(f"mini-validate rc={v.returncode}: {(v.stdout + v.stderr).strip()[-600:]}")
+        if remote():   # the spec's tests must not run here: V1-V8 + C5/C6 are one validate job on the queue
+            say(f"mini-finish: continuation spec {sp}: validating on the queue (a validate job, minutes)")
+            import mini_validate_remote as MVR
+            vok, vjid, vout = MVR.remote_validate(sp, c.rec.get("model") or DEFAULT_MODEL, c.label, say=say)
+            (cont / "validate.log").write_text(vout + "\n")
+            if not vok:
+                raise RuntimeError(f"remote validate: {vout.strip()[-600:]}")
+        else:
+            say(f"mini-finish: continuation spec {sp}: validating (mini-validate, minutes)")
+            v = subprocess.run([*tool("MINI_FINISH_VALIDATE", "mini-validate"), str(sp)], capture_output=True, text=True, cwd=str(cont),
+                               timeout=CHECK_TIMEOUT)
+            (cont / "validate.log").write_text(v.stdout + v.stderr)
+            if v.returncode != 0:
+                raise RuntimeError(f"mini-validate rc={v.returncode}: {(v.stdout + v.stderr).strip()[-600:]}")
         model = c.rec.get("model") or DEFAULT_MODEL
         bundle = c.rec.get("bundle") or re.sub(r"-c\d+$", "", c.label)
         cmd = [*tool("MINI_FINISH_SUBMIT", "mini-submit"), str(sp), "--label", label, "--model", str(model),
@@ -1020,6 +1069,18 @@ def queued_continuation(jid):
 def resolve_and_clear(jid):
     """queue resolve + POST /api/runs/<id>/clear (never with override). Returns a list of problems (empty = done)."""
     probs = []
+    if remote():   # both go through the queue CLI, which forwards them to the queue API with the bearer token
+        for verb in ("resolve", "clear-card"):
+            try:
+                p = subprocess.run([*tool("MINI_FINISH_QUEUE", "ollama-queue.py"), verb, jid], capture_output=True, text=True, timeout=120)
+                out = (p.stdout + p.stderr).strip()
+                if p.returncode != 0 and "not found" not in out and "404" not in out:
+                    probs.append(f"queue {verb} rc={p.returncode}: {out[-300:]}")
+                else:
+                    say(f"mini-finish: {verb} {jid}" + ("" if p.returncode == 0 else " (nothing to do)"))
+            except (OSError, subprocess.SubprocessError) as e:
+                probs.append(f"queue {verb}: {type(e).__name__}: {e}")
+        return probs
     try:
         p = subprocess.run([*tool("MINI_FINISH_QUEUE", "ollama-queue.py"), "resolve", jid], capture_output=True, text=True, timeout=120)
         out = (p.stdout + p.stderr).strip()
@@ -1167,7 +1228,7 @@ def retry_finished(c):
 
 def list_jobs():
     jobs = load_jobs()
-    ids = {Path(p).name[:-len(".done.json")] for p in glob.glob(str(LOGS() / "*.done.json"))}
+    ids = set() if remote() else {Path(p).name[:-len(".done.json")] for p in glob.glob(str(LOGS() / "*.done.json"))}
     ids |= {str(j["id"]) for j in jobs if j.get("status") == "failed"}
     me, bridge = me_bridge()
     rows, skipped = [], 0
@@ -1180,9 +1241,14 @@ def list_jobs():
             continue
         if rec.get("status") != "failed" or Path(str(rec.get("runner") or "")).name != "mini-swe-runner.py":
             continue
+        if remote():   # no download for a listing: a job without a mirror yet is listed from its queue row
+            rec = RM().localize(rec, HOME(), fetch=False)
         why = cheap_refusal(rec, jobs)
         if why is None and (finished_ctx(rec).fdir / "FINISHED.json").exists():
             why = "finished"
+        if why is None and rec.get("_need_fetch"):
+            rows.append(f"  {jid}  {rec.get('label') or jid}  class={str(rec.get('failure_class') or '').lower()}  (not fetched yet)")
+            continue
         if why is None:
             try:
                 c = build_ctx(rec)
@@ -1220,8 +1286,12 @@ def main(argv=None):
         say("mini-finish: --dry-run goes with --check")
         return 1
     try:
+        if remote():
+            RM().git_env()
         jobs = load_jobs()
         rec = find_job(a.job, jobs)
+        if remote():
+            rec = RM().localize(rec, HOME(), fetch=False)
         if rec.get("cwd") and (finished_ctx(rec).fdir / "FINISHED.json").is_file():
             c = finished_ctx(rec)  # not build_ctx: the spec or baseline may be gone by now; the retry needs neither
             claim = read_claim(c)
@@ -1235,6 +1305,12 @@ def main(argv=None):
         why = cheap_refusal(rec, jobs)
         if why:
             raise Refuse(why)
+        if rec.get("_need_fetch"):
+            try:
+                rec = RM().localize(rec, HOME(), fetch=True)
+            except (RM().QR.RemoteError, OSError) as e:
+                raise Refuse(f"cannot fetch job {rec['id']} from the queue: {e}")
+            say(f"mini-finish: fetched the run of {rec['id']} into {rec['_mirror']} (edit the files in its work/ dir)")
         c = build_ctx(rec)
         claim = read_claim(c)
         why = ownership_refusal(c, claim, a.take)

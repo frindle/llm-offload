@@ -16,6 +16,11 @@ transcript).
 import argparse, glob, json, os, re, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config  # noqa: E402  (the queue state wherever the queue runs: load_queue_state)
 
 LOGS = Path.home() / "bin" / "ollama-worker-logs"
 STATE = Path.home() / "bin" / "ollama-queue-state.json"
@@ -48,11 +53,11 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--converged-only", action="store_true", help="only jobs that converged originally")
     a = ap.parse_args()
-    try:
-        jobs = json.load(open(STATE)).get("jobs") or []
-    except Exception as e:
-        print(f"cannot read queue state: {e}", file=sys.stderr)
+    d = queue_config.load_queue_state(STATE)
+    if d is None:
+        print("cannot read queue state", file=sys.stderr)
         return 2
+    jobs = d.get("jobs") or []
     rows = [j for j in jobs if str(j.get("label", "")).startswith("auto-author-") and j.get("verify")]
     why = {}
     ok = []

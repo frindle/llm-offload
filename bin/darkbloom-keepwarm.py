@@ -36,6 +36,11 @@ Env overrides (tests): KEEPWARM_HOME, KEEPWARM_ENABLED, KEEPWARM_STATE, KEEPWARM
 KEEPWARM_QUEUE_STATE, KEEPWARM_LOCAL_JSON, KEEPWARM_LOADED_JSON, KEEPWARM_NOW,
 KEEPWARM_NO_NOTIFY.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import datetime
 import fcntl
 import json
@@ -64,7 +69,7 @@ def load_cfg():
         "log": Path(_env("KEEPWARM_LOG", str(home / "darkbloom-keepwarm.log"))),
         "lock": Path(_env("KEEPWARM_LOCK", str(home / "darkbloom-keepwarm.lock"))),
         "conf": Path(_env("KEEPWARM_CONF", str(Path(__file__).resolve().with_name("darkbloom-keepwarm.json")))),
-        "queue_state": Path(_env("KEEPWARM_QUEUE_STATE", str(Path.home() / "bin" / "ollama-queue-state.json"))),
+        "queue_state": Path(_env("KEEPWARM_QUEUE_STATE", str(queue_config.state_dir() / "ollama-queue-state.json"))),
         "local_json": Path(_env("KEEPWARM_LOCAL_JSON", str(Path.home() / ".darkbloom" / "local.json"))),
         "idle_state": Path(_env("KEEPWARM_BLOOM_IDLE_STATE", str(home / "bloom-idle-state.json"))),
         "loaded_json": Path(_env("KEEPWARM_LOADED_JSON", str(Path.home() / ".darkbloom" / "loaded-models.json"))),

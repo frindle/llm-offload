@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Auto-gate hook: run the Studio gate on a completed dispatch. ADVISORY ONLY.
 
-THE MODEL CALL GOES THROUGH THE QUEUE, NEVER DIRECTLY. The owner's constraint, and it
+THE MODEL CALL GOES THROUGH THE QUEUE, NEVER DIRECTLY. the operator's constraint, and it
 restores my own original design -- the first version called ollama at
 127.0.0.1:11434 via subprocess, which would have run CONCURRENTLY with real
 dispatches: contending for the GPU, bypassing the VRAM guard, and forcing model
@@ -38,6 +38,11 @@ TWO DESIGN RULES, both learned the hard way today:
    break a dispatch is worse than no gate: the dispatch is the real work, this is
    commentary on it.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
@@ -57,6 +62,8 @@ os.environ.setdefault("GIT_OPTIONAL_LOCKS", "0")
 # canary they differ, and the checkers under test must be the worktree's.
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("GATE_BIN") or (Path.home() / "bin")).expanduser()
+# queue state (state JSON, queue logs) lives in the state dir; GATE_BIN still wins, as it did when state sat next to the scripts
+STATE_DIR = Path(os.environ.get("GATE_BIN") or queue_config.state_dir()).expanduser()
 GATE = HERE / "gate.py"
 SIGNOFF = HERE / "signoff.py"
 RELEVANCE = HERE / "verify-relevance.py"
@@ -68,7 +75,7 @@ TEST_MODE = os.environ.get("GATE_TEST_MODE") == "1"
 
 # COMPLETED-CODE-DROP. When a dispatch reaches a TERMINAL gate verdict, drop its
 # finished deliverable (the .diff + the changed files' post-change contents + a
-# SUMMARY.md) into a browsable, verdict-keyed tree so the owner can eyeball what the
+# SUMMARY.md) into a browsable, verdict-keyed tree so the operator can eyeball what the
 # model produced without opening the queue logs or the worktree. Pass/ vs Failed/
 # keyed off the verdict. This lives UNDER the iCloud Desktop tree by request, so
 # drops are kept to the diff + changed files (never a whole worktree). Overridable
@@ -80,7 +87,7 @@ COMPLETED_ROOT = Path(os.environ.get("GATE_COMPLETED_ROOT")
 # still carries the full change); keeps iCloud-Desktop drops small.
 COMPLETED_MAX_FILE_BYTES = int(os.environ.get("GATE_COMPLETED_MAX_FILE_BYTES") or 1_000_000)
 
-# --- Two-tier gate routing (2026-09-04, the owner's design; wired after the 14b bake-off) ---
+# --- Two-tier gate routing (2026-09-04, the operator's design; wired after the 14b bake-off) ---
 # The cheap PRE-gate runs on Unraid (qwen3:14b, ~10.4G VRAM @ num-ctx 6144 -- fits
 # the 3080 with headroom, zero CPU spillover). Bake-off vs the Studio 27B over 16
 # real .gate.json diffs (2026-09-04): 88% agreement, 0 false-FAIL, 2 false-PASS;
@@ -106,7 +113,7 @@ REGATE_NUM_CTX  = int(os.environ.get("GATE_REGATE_NUM_CTX", "32768"))
 TWO_TIER        = os.environ.get("GATE_TWO_TIER", "1") != "0"
 
 # --- SECOND OPINION: cross-family independent review on Unraid (2026-10-01) ------
-# The owner: "a PASS must not be decided by one model family." Every tier that can
+# The operator: "a PASS must not be decided by one model family." Every tier that can
 # produce a PASS today is Qwen -- the Unraid pre-gate is qwen3:14b and the
 # authoritative Darkbloom re-gate is qwen3.6-35b-a3b. A shared-family blind spot
 # (same tokenizer, same instruction-tuning lineage, same failure modes) is
@@ -137,7 +144,7 @@ TWO_TIER        = os.environ.get("GATE_TWO_TIER", "1") != "0"
 # deliberately small num_ctx so the KV cache cannot close that ~2.7GB margin. It
 # has NO UNRAID_CONFIRMED_SAFE_CTX entry (that table means MEASURED, and this is
 # not measured yet) -- ollama-worker's live post-warmup spillover abort stays the
-# backstop, and a measurement request is filed for the owner.
+# backstop, and a measurement request is filed for the operator.
 SECOND_OPINION        = os.environ.get("GATE_SECOND_OPINION", "1") != "0"
 SECOND_OPINION_HOST   = os.environ.get("GATE_SECOND_OPINION_HOST", "unraid")
 SECOND_OPINION_MODEL  = os.environ.get("GATE_SECOND_OPINION_MODEL",
@@ -145,7 +152,7 @@ SECOND_OPINION_MODEL  = os.environ.get("GATE_SECOND_OPINION_MODEL",
 # 4096, not the pre-gate's 6144: a 12B's weights are smaller than qwen3:14b's but
 # unmeasured on this box, so buy margin with context rather than assume it.
 SECOND_OPINION_NUM_CTX = int(os.environ.get("GATE_SECOND_OPINION_NUM_CTX", "4096"))
-# Minimum changed code lines to bother. 0 = every code diff (the default: the owner's
+# Minimum changed code lines to bother. 0 = every code diff (the default: the operator's
 # ask is "every code diff the pre-gate passed", and a 3-line diff is cheap).
 SECOND_OPINION_MIN_LINES = int(os.environ.get("GATE_SECOND_OPINION_MIN_LINES", "0"))
 
@@ -160,7 +167,7 @@ SECOND_OPINION_MIN_LINES = int(os.environ.get("GATE_SECOND_OPINION_MIN_LINES", "
 # suspect-the-grader / high-bar-for-model-is-the-problem). "shadow" (DEFAULT)
 # computes and RECORDS the decision + the exact requeue command into .gate.json
 # and AUTO-FIX-QUEUE.md, and enqueues NOTHING. "live" actually requeues. It ships
-# shadow so the owner can read, over real jobs, whether the classifier fires correctly
+# shadow so the operator can read, over real jobs, whether the classifier fires correctly
 # and the requeue commands are right, at zero risk of a loop or a tampered verify.
 # Flip to live ONLY after the shadow log shows it agreeing with hand judgement.
 AUTOFIX_MODE       = os.environ.get("GATE_AUTOFIX_MODE", "shadow").lower()
@@ -174,11 +181,11 @@ AUTOFIX_MAX_ROUNDS = int(os.environ.get("GATE_AUTOFIX_MAX_ROUNDS", "2"))
 # burns GPU chasing a defect that is not there. Off => such a verdict ESCALATES.
 AUTOFIX_TRUST_REVIEWER = os.environ.get("GATE_AUTOFIX_TRUST_REVIEWER", "0") == "1"
 
-# --- ESCALATION TRIAGE (Task E; the owner 2026-09-18) ------------------------------
+# --- ESCALATION TRIAGE (Task E; operator 2026-09-18) ------------------------------
 # The drain side of the line above. AUTOFIX_TRUST_REVIEWER off is correct -- a
 # reviewer code-high with a green verify must NOT auto-requeue a second model onto
 # already-correct code -- but the consequence is that every such job PARKS in
-# needs_opus and sits there until the owner notices and asks a Claude session to look.
+# needs_opus and sits there until the operator notices and asks a Claude session to look.
 # Measured base rate (whole daemon log, 222 gate decisions to 2026-09-18): FIVE
 # reviewer-code-high escalations, and all five are the SAME pathology -- the
 # reviewer diffed old-vs-new and flagged the INTENDED REMOVAL of the old behaviour
@@ -238,8 +245,8 @@ ESCALATION_TRIAGE_MIN_CITE = int(os.environ.get("GATE_ESCALATION_TRIAGE_MIN_CITE
 # (no partial overlap can ever qualify); 16 chars merely excludes toys like `def f():`.
 ESCALATION_TRIAGE_MIN_SIG = int(os.environ.get("GATE_ESCALATION_TRIAGE_MIN_SIG", "16"))
 
-# --- END-TO-END AUTO-PIPELINE (Task C; the owner 2026-09-17) -----------------------
-# The SUCCESS path, the mirror of the auto-fix ladder's failure path. The owner's
+# --- END-TO-END AUTO-PIPELINE (Task C; operator 2026-09-17) -----------------------
+# The SUCCESS path, the mirror of the auto-fix ladder's failure path. the operator's
 # intent: "unless something fails the process should be automated all the way from
 # the auto author to the code fix." Two transitions the harness otherwise stops at
 # for a human:
@@ -274,7 +281,7 @@ AUTO_DEPLOY_REPOS = set(
     r.strip() for r in os.environ.get("GATE_AUTO_DEPLOY_REPOS", "").split(",") if r.strip()
 ) | {"resell-tracker"}
 
-# RUN-STATUS JANITOR (2026-09-17, the owner: "why are we not automating these being
+# RUN-STATUS JANITOR (2026-09-17, the operator: "why are we not automating these being
 # handled so I don't have to keep asking?"). The Run Status dashboard fills with
 # finished jobs a human then clears one-by-one, but most never needed eyes: eval/
 # bake-off/probe arms, dead/superseded slice fragments, and the intermediate
@@ -287,7 +294,12 @@ AUTO_DEPLOY_REPOS = set(
 # needs a daemon restart. NEVER passes the sign-off override -- the endpoint's own
 # refusal of awaiting-sign-off jobs is honoured as defense-in-depth.
 RUNSTATUS_JANITOR_MODE = os.environ.get("GATE_RUNSTATUS_JANITOR", "shadow").lower()
-QUEUE_API_URL = os.environ.get("GATE_QUEUE_API", "http://127.0.0.1:7684").rstrip("/")
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
+QUEUE_API_URL = (os.environ.get("GATE_QUEUE_API") or queue_config.queue_api()[0]).rstrip("/")
 _GH_PROJECTS_ROOT = str((Path.home() / "Desktop" / "GitHub Projects"))
 # 2026-11-09: the real folder became "GitHub Projects.nosync" ("GitHub Projects" is a symlink to it), and
 # job cwds are stored resolved, so both spellings name the projects tree.
@@ -302,7 +314,7 @@ _JANITOR_TERMINAL = {"done", "failed"}
 _SLICE_FRAG_RE = re.compile(r"^(?P<feat>.+)-s\d+-\S")
 # eval / bake-off / probe MEASUREMENT arms (in addition to handoff-emit's own
 # EVAL_LABEL_PREFIXES, reused as the single source of truth): explicit probe/eval
-# label shapes the owner named (clamp-*, *-trap-*, *-adequate, capability-*, *probe*).
+# label shapes the operator named (clamp-*, *-trap-*, *-adequate, capability-*, *probe*).
 _EVAL_LABEL_RE = re.compile(r"(^clamp-)|(-trap-)|(-adequate$)|(probe)|(^capability-)", re.I)
 
 
@@ -374,7 +386,7 @@ def _manifest_authored(cwd) -> set:
     except Exception:
         return set()
 
-# --- MODEL-FALLBACK LADDER (Tier 1; the owner 2026-09-17) --------------------------
+# --- MODEL-FALLBACK LADDER (Tier 1; operator 2026-09-17) --------------------------
 # When a job's OWN model has exhausted its self-fix budget on a CAPABILITY failure
 # (the classifier said `requeue` but the round cap or the anti-thrash guard blocked
 # it), we do NOT go straight to a human. First we retry the SAME sealed task+verify
@@ -429,7 +441,7 @@ def _normalize_ladder(raw) -> list:
 
 
 def load_model_ladder() -> list:
-    """The active fallback ladder, resolved at requeue time so the owner can edit it
+    """The active fallback ladder, resolved at requeue time so the operator can edit it
     WITHOUT a code change: env OLLAMA_DISPATCH_MODEL_LADDER (comma-separated) wins,
     else MODEL_LADDER_FILE (JSON list or {"ladder":[...]}), else DEFAULT_MODEL_LADDER.
     Fail-open: a missing/garbage file falls through to the default. Returns a list
@@ -558,7 +570,7 @@ def _sha256(p: Path) -> str | None:
 
 def out_dir_for(a) -> Path:
     return (Path(a.out_dir).expanduser() if a.out_dir
-            else BIN / "ollama-queue-logs")
+            else STATE_DIR / "ollama-queue-logs")
 
 
 _VERIFY_FILE_RE = re.compile(r"^verify[-_]?(impl)?\.(mjs|cjs|mts|cts|js|ts|py|sh)$")
@@ -1382,7 +1394,7 @@ def merge_review(a, out_dir: Path, prefix: str = "gate-",
             return 0
     elif (TWO_TIER and payload.get("verdict") == "pass" and not payload.get("regate")
           and _pass_needs_regate(out_dir / f"{parent}.diff")):
-        # PASS RE-CHECK (the owner 2026-10-01, Studio is the only local lane now): the Unraid
+        # PASS RE-CHECK (operator 2026-10-01, Studio is the only local lane now): the Unraid
         # qwen3:14b pre-gate at a 6144 ctx used to be the SOLE decider on a PASS -- the
         # 35B regate only ever saw FAILs, so it could turn a FAIL into a PASS but never the
         # reverse. A PASS on a substantial code diff is now re-reviewed by the 35B; its
@@ -1465,7 +1477,7 @@ def _finalize_review(parent: str, payload: dict, gate_json: Path, out_dir: Path)
     at a terminal verdict, the autofix/triage/pipeline/slice/janitor/drop block).
     Factored out VERBATIM (2026-10-04) so merge_finding_check can run it once the
     verifier lands; behaviour for every other path is unchanged."""
-    # CROSS-FAMILY SECOND OPINION on any PASS (the owner 2026-10-01: a PASS must not be
+    # CROSS-FAMILY SECOND OPINION on any PASS (operator 2026-10-01: a PASS must not be
     # decided by one model family). Fires at whichever tier produced the standing
     # PASS -- a pre-gate PASS that needs no re-gate, or an authoritative re-gate
     # PASS (including one that OVERTURNED a pre-gate non-pass: that PASS is
@@ -1941,7 +1953,7 @@ def resignoff(job_id: str, gate_json: Path, payload: dict, diff_path: Path) -> N
             pass
 
 
-QUEUE_STATE = BIN / "ollama-queue-state.json"
+QUEUE_STATE = STATE_DIR / "ollama-queue-state.json"
 
 
 def _completion_record(job_id: str) -> dict | None:
@@ -1956,7 +1968,7 @@ def _completion_record(job_id: str) -> dict | None:
     fall back to it and can certify those facts. Fail-open, exactly like the live
     readers: a torn or missing file abstains rather than throwing."""
     try:
-        p = BIN / "ollama-queue-logs" / f"{job_id}.done.json"
+        p = STATE_DIR / "ollama-queue-logs" / f"{job_id}.done.json"
         if p.exists():
             rec = json.loads(p.read_text())
             return rec if isinstance(rec, dict) else None
@@ -2220,7 +2232,7 @@ def job_is_ungateable(rec) -> bool:
         bake-off driver, a render) instead of ollama-worker.py on a sealed
         worktree, so nothing in the tree is an attributable dispatch diff.
 
-    The owner 2026-09-18: the bonsai ternary bake-off (task_kind=research, --runner
+    operator 2026-09-18: the bonsai ternary bake-off (task_kind=research, --runner
     bakeoff-runner.py) was scored verdict=fail purely from the runner's exit code,
     escalated to an authoritative re-gate, and that regate seized the exclusive
     Studio gate lane -- holding ~10 unrelated qwen auto-author jobs behind a gate
@@ -2380,7 +2392,7 @@ def autofix_chain_base(job_id: str, cwd, state_path=None) -> str:
     deliverable is cumulative, so judge it against the chain root's baseline --
     only when that commit is an ancestor of HEAD (else "" = old behaviour)."""
     try:
-        qs = json.loads(Path(state_path or (BIN / "ollama-queue-state.json")).read_text())
+        qs = json.loads(Path(state_path or (STATE_DIR / "ollama-queue-state.json")).read_text())
         jobs = qs.get("jobs") or []
         if isinstance(jobs, dict):
             jobs = list(jobs.values())
@@ -2394,7 +2406,7 @@ def autofix_chain_base(job_id: str, cwd, state_path=None) -> str:
         head = str(((rj or {}).get("launch_baseline") or {}).get("head") or "")
         if not head:
             try:
-                d = json.loads((BIN / "ollama-queue-logs" / f"{root}.gate.json").read_text())
+                d = json.loads((STATE_DIR / "ollama-queue-logs" / f"{root}.gate.json").read_text())
                 head = str((d.get("launch_baseline") or {}).get("head") or "")
             except Exception:
                 head = ""
@@ -3186,7 +3198,7 @@ def mechanical_evidence_gaps(payload: dict) -> list:
     return gaps
 
 
-# --- RISK-TIERED auto-confirm (the owner 2026-09-17) -------------------------------
+# --- RISK-TIERED auto-confirm (operator 2026-09-17) -------------------------------
 # advance_to_coding() runs `ollama-dispatch-draft --confirm` programmatically --
 # it seals a MODEL-AUTHORED fixture without a human ever reading it. That marker
 # (DRAFT_UNCONFIRMED) exists because the one thing no gate can decide is whether
@@ -3201,7 +3213,7 @@ def mechanical_evidence_gaps(payload: dict) -> list:
 # green evidence substitutes for it.
 #
 # Fail-CLOSED everywhere: an unreadable task, a missing lint, an unparsable
-# policy file all resolve to "human". The cost of a false "human" is that the owner
+# policy file all resolve to "human". The cost of a false "human" is that the operator
 # reads a fixture; the cost of a false "low" is an unreviewed money bug.
 AUTO_CONFIRM_HUMAN_PATTERNS = [
     # money / P&L
@@ -3379,7 +3391,7 @@ def autofix_history(root: str, models_tried=None) -> str:
     """PURE-ish (reads only the durable chain ledger). A compact, human-first
     summary of the WHOLE auto-fix chain -- every recorded round's finding count and
     the finding SOURCES, plus the models burned -- so an escalation record hands the
-    draining Opus/the owner the full repair JOURNEY, not just the final round (Task D:
+    draining Opus/operator the full repair JOURNEY, not just the final round (Task D:
     'escalate with full repair history'). Fail-open: an unreadable/empty ledger ->
     a models-only line ('(no prior rounds)')."""
     lines = []
@@ -3443,7 +3455,7 @@ def autofix_build_escalate(job_id: str, root: str, reason: str,
     (Tier 2). Does NOT run it; it is the exact shadow preview and the live command.
     Reuses the existing escalate machinery -- reason lists the ladder history, the
     category is derived from the failure class, and the gate JSON is snapshotted
-    onto the parked job for the draining Opus/the owner pass."""
+    onto the parked job for the draining Opus/operator pass."""
     return ["python3", str(BIN / "ollama-queue.py"), "escalate", str(job_id),
             "--reason", reason, "--category", category,
             "--coordinator-model", "auto-fix-ladder",
@@ -3472,7 +3484,7 @@ def autofix_fingerprint(payload: dict) -> tuple[int, list]:
 
 
 def _autofix_ledger_path(root: str) -> Path:
-    return BIN / "ollama-queue-logs" / "auto-fix" / f"{_safe_id(root)}.rounds.json"
+    return STATE_DIR / "ollama-queue-logs" / "auto-fix" / f"{_safe_id(root)}.rounds.json"
 
 
 def _safe_id(s: str) -> str:
@@ -4605,7 +4617,7 @@ def _apply_target_files(payload: dict, job_id: str) -> list:
     if not changed:
         # fall back to the durable diff sidecar's +++ paths
         try:
-            dp = BIN / "ollama-queue-logs" / f"{job_id}.diff"
+            dp = STATE_DIR / "ollama-queue-logs" / f"{job_id}.diff"
             if dp.is_file():
                 changed = [m.group(1).strip() for m in
                            re.finditer(r"^\+\+\+ b/(.+)$", dp.read_text(errors='replace'), re.M)
@@ -4676,7 +4688,7 @@ def apply_fix(job_id: str, payload: dict, gate_json: Path, policy: str) -> None:
                             reference_dispatch_deliverable_uncommitted_in_worktree).
     Idempotent (auto_pipeline_applied) and halt-on-error. Deliberately does NOT
     commit/push here -- landing to main is the automatable step; the repo's own CI/
-    deploy (and the owner's 'validate before commit on auto-push' rule) owns the commit."""
+    deploy (and the operator's 'validate before commit on auto-push' rule) owns the commit."""
     if payload.get("auto_pipeline_applied"):
         return
     cwd = _job_field(job_id, "cwd") or payload.get("cwd") or job_facts(job_id).get("job_cwd")
@@ -4767,7 +4779,7 @@ def apply_fix(job_id: str, payload: dict, gate_json: Path, policy: str) -> None:
 
 
 # ==============================================================================
-# AUTO-LAND (the owner 2026-10-09). A SEPARATE step from AUTO_PIPELINE_MODE: shadow mode
+# AUTO-LAND (operator 2026-10-09). A SEPARATE step from AUTO_PIPELINE_MODE: shadow mode
 # keeps recording 'ready-to-apply' and never lands anything; this lands a coding
 # job's code-only diff on the origin repo's default branch ONLY when every one of
 # these holds, else it does NOTHING and the job stays ready-to-apply (never partial):
@@ -4964,7 +4976,7 @@ def auto_land_consider(job_id: str, payload: dict, gate_json: Path) -> None:
 
 
 # ==============================================================================
-# SLICE AUTO-FEED (the owner 2026-09-18: "auto needs to auto ... one job creates the
+# SLICE AUTO-FEED (operator 2026-09-18: "auto needs to auto ... one job creates the
 # next"). A slice plan used to advance only when a human re-ran
 # `ollama-dispatch-slice <plan> --execute`: the converged coding job sat done, its
 # target never landed on the chain, and the NEXT slice never started. This is the
@@ -5335,7 +5347,7 @@ def _janitor_runs(fetch=None) -> list:
         return fetch() or []
     try:
         import urllib.request
-        with urllib.request.urlopen(QUEUE_API_URL + "/api/runs", timeout=5) as resp:
+        with urllib.request.urlopen(urllib.request.Request(QUEUE_API_URL + "/api/runs", headers=queue_config.queue_api_headers()), timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data if isinstance(data, list) else (data.get("runs") or [])
     except Exception:
@@ -5353,7 +5365,7 @@ def _janitor_clear(job_id, post=None) -> dict:
         import urllib.request
         req = urllib.request.Request(
             QUEUE_API_URL + f"/api/runs/{job_id}/clear", data=b"{}",
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers={"Content-Type": "application/json", **queue_config.queue_api_headers()}, method="POST")
         with urllib.request.urlopen(req, timeout=5) as resp:
             return {"ok": True, "status": resp.status,
                     "body": resp.read().decode("utf-8")[:200]}
@@ -5370,7 +5382,7 @@ def _janitor_log(job_id, dec, siblings) -> None:
         for s in siblings:
             line += (f"    - supersedes `{s.get('id')}` "
                      f"({s.get('label')}) -> archive\n")
-        with (BIN / "ollama-queue-logs" / "RUNSTATUS-JANITOR.md").open("a") as fh:
+        with (STATE_DIR / "ollama-queue-logs" / "RUNSTATUS-JANITOR.md").open("a") as fh:
             fh.write(line)
     except Exception:
         pass
@@ -5526,7 +5538,7 @@ def _changed_files_from_diff(diff_text: str) -> list[str]:
 
 
 def drop_completed_code(job_id: str, payload: dict, out_dir: Path) -> Path | None:
-    """Drop a finished dispatch's deliverable into COMPLETED_ROOT so the owner can
+    """Drop a finished dispatch's deliverable into COMPLETED_ROOT so the operator can
     eyeball what the model produced, keyed off the gate verdict:
 
         COMPLETED_ROOT/Pass/<label>-<shortid>/
@@ -5607,7 +5619,7 @@ def drop_completed_code(job_id: str, payload: dict, out_dir: Path) -> Path | Non
             file_notes.append(f"- worktree `{cwd}` is gone (reaped); the diff is "
                               f"the full record")
 
-        # 3. SUMMARY.md -- what the owner reads at a glance.
+        # 3. SUMMARY.md -- what the operator reads at a glance.
         ts = payload.get("ts") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         intent = payload.get("task_intent") or ""
         model = payload.get("job_model") or payload.get("model") or "?"
@@ -5731,7 +5743,7 @@ def main() -> int:
         return 0
 
     cwd = Path(a.cwd).expanduser()
-    out_dir = Path(a.out_dir).expanduser() if a.out_dir else (BIN / "ollama-queue-logs")
+    out_dir = Path(a.out_dir).expanduser() if a.out_dir else (STATE_DIR / "ollama-queue-logs")
     out_dir.mkdir(parents=True, exist_ok=True)
     gate_json = out_dir / f"{a.job_id}.gate.json"
     diff_path = None        # set once get_diff() succeeds; emit() checks for None
@@ -5876,7 +5888,7 @@ def main() -> int:
                 _notify_non_pass(a.job_id, payload, gate_json)
         except Exception:
             pass
-        # The owner's at-a-glance surface. Best-effort and last: it is a VIEW, so a
+        # the operator's at-a-glance surface. Best-effort and last: it is a VIEW, so a
         # failure here loses nothing (rebuild with --all), and it must never be
         # able to affect the gate's own exit code -- rule 2 again.
         try:
@@ -6080,7 +6092,7 @@ def _self_test() -> bool:
     when nothing terminal is available. No GPU, no network; writes only into a
     throwaway temp dir. Same PASS/FAIL convention as ollama-queue.py --self-test."""
     import tempfile as _tf, shutil as _sh
-    global QUEUE_STATE, BIN, COMPLETED_ROOT, AUTO_PIPELINE_MODE
+    global QUEUE_STATE, BIN, STATE_DIR, COMPLETED_ROOT, AUTO_PIPELINE_MODE
     global RUNSTATUS_JANITOR_MODE, _SLICE_RUNS_DIR, ESCALATION_TRIAGE_MODE
     ok = True
 
@@ -6092,11 +6104,12 @@ def _self_test() -> bool:
             ok = False
             print(f"FAIL {name}: got {got!r} want {want!r}")
 
-    _orig_qs, _orig_bin, _orig_cr = QUEUE_STATE, BIN, COMPLETED_ROOT
+    _orig_qs, _orig_bin, _orig_sd, _orig_cr = QUEUE_STATE, BIN, STATE_DIR, COMPLETED_ROOT
     _oldenv = os.environ.get("OLLAMA_DISPATCH_MODEL_LADDER")
     _td = Path(_tf.mkdtemp(prefix="gate-selftest-"))
     try:
         BIN = _td
+        STATE_DIR = _td
         QUEUE_STATE = _td / "ollama-queue-state.json"
         COMPLETED_ROOT = _td / "Completed"
         (_td / "ollama-queue-logs").mkdir(parents=True, exist_ok=True)
@@ -6108,12 +6121,12 @@ def _self_test() -> bool:
             (_td / "ollama-queue-logs" / f"{jid}.done.json").write_text(json.dumps(rec))
 
         # --- NO-DIFF GUARD: research/--runner jobs are never code-gated --------
-        # Regression guard for the bonsai bake-off incident (the owner 2026-09-18).
+        # Regression guard for the bonsai bake-off incident (operator 2026-09-18).
         check("ungateable: task_kind=research",
               job_is_ungateable({"id": "u1", "task_kind": "research"}), True)
         check("ungateable: --runner job",
               job_is_ungateable({"id": "u2", "task_kind": "coding",
-                                 "runner": "/Users/user/bin/bakeoff-runner.py"}), True)
+                                 "runner": "/Users/example/bin/bakeoff-runner.py"}), True)
         check("ungateable: plain coding dispatch is STILL gated",
               job_is_ungateable({"id": "u3", "task_kind": "coding", "runner": None}), False)
         check("ungateable: unset task_kind is STILL gated",
@@ -7264,7 +7277,7 @@ def _self_test() -> bool:
         check("janitor: eval/probe label -> auto-archive (eval-arm)",
               _jc(label="clamp-adequacy-3")["category"], "eval-arm")
         check("janitor: probe cwd -> auto-archive",
-              _jc(label="anything", cwd="/Users/user/r3probe-clamp")["action"],
+              _jc(label="anything", cwd="/Users/example/r3probe-clamp")["action"],
               "auto-archive")
         check("janitor: capability- label -> auto-archive",
               _jc(label="capability-probe-tools")["action"], "auto-archive")
@@ -7296,7 +7309,7 @@ def _self_test() -> bool:
               _jc(label="clamp-x", awaiting_signoff=True)["action"], "surface")
         # real-app-repo predicate
         check("janitor: worktree cwd is NOT a real app repo",
-              _is_real_app_repo("/Users/user/.ollama-dispatch/worktrees/wt-x"), False)
+              _is_real_app_repo("/Users/example/.ollama-dispatch/worktrees/wt-x"), False)
         check("janitor: GitHub Projects checkout IS a real app repo",
               _is_real_app_repo(_GH_PROJECTS_ROOT + "/resell-tracker"), True)
         check("janitor: resolved GitHub Projects.nosync checkout IS a real app repo",
@@ -8090,7 +8103,7 @@ def _self_test() -> bool:
                   r'def _is_gate_job\(job\):.*?startswith\(\("gate-", "regate-"\)\)',
                   _qsrc.read_text(errors="replace"), re.S)), True)
     finally:
-        QUEUE_STATE, BIN, COMPLETED_ROOT = _orig_qs, _orig_bin, _orig_cr
+        QUEUE_STATE, BIN, STATE_DIR, COMPLETED_ROOT = _orig_qs, _orig_bin, _orig_sd, _orig_cr
         # restore the model-ladder env the ladder tests overrode (fail-open).
         if _oldenv is None:
             os.environ.pop("OLLAMA_DISPATCH_MODEL_LADDER", None)
@@ -8138,7 +8151,7 @@ def crash_verdict(argv, exc, out_dir=None):
             return None
         _od_arg = _argv_opt(argv, "--out-dir")
         od = (Path(out_dir) if out_dir else
-              Path(str(_od_arg)).expanduser() if _od_arg else BIN / "ollama-queue-logs")
+              Path(str(_od_arg)).expanduser() if _od_arg else STATE_DIR / "ollama-queue-logs")
         gj = od / f"{job_id}.gate.json"
         if gj.exists():
             return None

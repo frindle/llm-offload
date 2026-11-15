@@ -82,6 +82,11 @@ import warnings
 from pathlib import Path
 import urllib.request
 from urllib.parse import unquote
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 
 HOME = Path.home()
 # launchd (queue daemon) PATH lacks Homebrew: node/npm/tsc gates and the agent's shell need it.
@@ -94,6 +99,20 @@ TEST_OVERLAY = HOME / "bin/configs/mini-testwrite.yaml"  # two-phase phase A onl
 POLISH_OVERLAY = HOME / "bin/configs/mini-diagnose-polish.yaml"  # the diagnose form-repair attempt: edit one section, investigate nothing
 MINI_EXT = Path(__file__).resolve().parent / "mini_ext"  # mini_ctx.CtxLitellmModel (overlay model_class)
 LOCAL_JSON = Path(os.environ.get("DARKBLOOM_LOCAL_JSON", HOME / ".darkbloom/local.json"))
+
+
+def _read_local():
+    """The Darkbloom record (base_url with /v1, api_key): local.json, with DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY laid over
+    it. A missing file is an error only when the environment names no endpoint (the Mac, as before)."""
+    try:
+        rec = json.loads(LOCAL_JSON.read_text())
+    except OSError:
+        if not (os.environ.get("DARKBLOOM_API_KEY") or os.environ.get("DARKBLOOM_BASE_URL")):
+            raise
+        rec = {}
+    return queue_config.darkbloom_apply_env(rec, v1=True)
+
+
 IGNORE_UNTRACKED = ("verify.test.ts", "test-data", "node_modules", ".venv", "TASK.md", "verify.sh", "test_fixture.py", "refimpl.py", "__pycache__", ".pytest_cache")
 RC_OK, RC_FAIL, RC_PAUSED = 0, 1, 3  # 3 = the queue's PAUSED exit: it parks the row and re-launches it when Darkbloom serves again
 WALL_GRACE = 60  # runner kill timer = WALL_BACKSTOP x mini's wall cap + this
@@ -8362,7 +8381,7 @@ def step_diff(cwd, spec, allowed, base_texts):
 
 
 # ---- baselines: the suite and typecheck runs a fix is judged against, run beside phase A ----------------------------------------
-# The owner 2026-11-06: "any way to speed up the gates so we're not waiting on them after a gpu run?" The baseline suite and typecheck ran
+# operator 2026-11-06: "any way to speed up the gates so we're not waiting on them after a gpu run?" The baseline suite and typecheck ran
 # in the foreground before phase A's first model call (conan1r2's and scrapyr1's whole suites timed out at 600 s each, optuna's took
 # 240 s), and every phase-B gate ran the whole suite again. Now the baselines run in a background thread on a copy of the work dir
 # made before anything is written, and phase B waits for them only at its first gate (Baselines; base_ready in _two_phase). A whole
@@ -10546,7 +10565,7 @@ REMOTE_HOLD_ALLOW_S, REMOTE_JOB_MAX_S = 5400, 10800
 REMOTE_FILE_MAX, REMOTE_TOTAL_MAX, REMOTE_MEMBERS_MAX, REMOTE_MANIFEST_MAX = 20 << 20, 160 << 20, 20000, 8 << 20
 REMOTE_JUNK = re.compile(r"(?:^|/)(?:\.coverage(?:\.[\w.-]+)?|coverage\.xml|htmlcov|\.mypy_cache|\.ruff_cache|\.hypothesis|\.tox|\.nox|"
                          r"\.eggs|[\w.-]+\.egg-info)(?:/|$)")
-REMOTE_API = "http://127.0.0.1:7684"
+REMOTE_API = queue_config.queue_api()[0]
 REMOTE_HOLD_TEXT = "darkbloom sandbox hold"
 REMOTE_LOG_PASS = ("Building agent config from specs:", "[mini-runner] ")  # the queue's progress views read these unprefixed
 REMOTE_LOG_PASS_RE = re.compile(r"mini-swe-agent \(step \d+,|Retrying \S+ in [\d.]+ seconds as it raised |\[provider-(?:outage|hold)\]")
@@ -11278,6 +11297,66 @@ def park_run(pf, reason, meta, msg):
 PAUSE_FILE = [None]
 
 
+def validate_spec_job(a):
+    """--validate-spec (a validate job on a remote queue): the checks mini-finish's continuation and mini-submit's C5/C6 run on the
+    submitting machine when the queue is local, run here instead -- mini-validate V1-V8 on a copy of the task file, then the
+    runner's own --check-only (C5) and, for a steps spec, --try-fix-chain <ref> (C6), each in a fresh scratch dir beside the run dir.
+    VALIDATION.md and the (possibly field-filled) spec copy are written into --cwd, so the default job result carries them. No model."""
+    me = Path(os.path.realpath(__file__))
+    cwd = Path(a.cwd).resolve()
+    run = cwd.parent
+    src = Path(a.task_file).resolve()
+    vdir = run / "validate"
+    shutil.rmtree(vdir, ignore_errors=True)
+    vdir.mkdir(parents=True)
+    sp = vdir / "spec.json"
+    shutil.copy2(src, sp)
+    try:
+        spec = json.loads(sp.read_text())
+        assert isinstance(spec, dict)
+    except (OSError, ValueError, AssertionError):
+        print("RESULT " + tag_result("FAIL bad-spec validate-spec: the task file is not a JSON object"), flush=True)
+        return RC_FAIL
+    cwd.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "MINI_RUNNER": str(me)}
+    steps = [("V1-V8 mini-validate", [sys.executable, str(me.parent / "mini-validate"), str(sp)], None)]
+    steps.append(("C5 runner --check-only", [sys.executable, str(me), "--check-only", "--task-file", str(sp)], "validate-c5"))
+    if spec.get("steps"):
+        refd = Path(os.path.expanduser(str(spec.get("ref") or "ref")))
+        refd = refd if refd.is_absolute() else src.parent / refd
+        steps.append(("C6 runner --try-fix-chain", [sys.executable, str(me), "--check-only", "--task-file", str(sp),
+                                                    "--try-fix-chain", str(refd)], "validate-c6"))
+    failed = None
+    for name, cmd, scratch in steps:
+        if scratch:
+            sd = run / scratch
+            shutil.rmtree(sd, ignore_errors=True)
+            sd.mkdir()
+            cmd = cmd[:3] + ["--cwd", str(sd)] + cmd[3:]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=str(vdir), env=env)
+            rc, out = p.returncode, p.stdout + p.stderr
+        except subprocess.TimeoutExpired:
+            rc, out = 124, "TIMEOUT"
+        if scratch:
+            shutil.rmtree(run / scratch, ignore_errors=True)
+        keep = [ln for ln in out.splitlines() if re.match(r"\s+s\d+ V\d|\[mini-validate\] (PASS|FAIL)", ln)] if rc == 0 else out.splitlines()[-40:]
+        print(f"[mini-runner] validate-spec {name}: {'ok' if rc == 0 else 'FAIL rc=%d' % rc}", flush=True)
+        for ln in keep[-40:]:
+            print("  | " + ln[:400], flush=True)
+        if rc != 0:
+            failed = name
+            break
+    for src_f, dst_n in ((vdir / "VALIDATION.md", "VALIDATION.md"), (sp, "validated-spec.json")):
+        if src_f.is_file():
+            shutil.copy2(src_f, cwd / dst_n)
+    if failed:
+        print("RESULT " + tag_result(f"FAIL validate-spec {failed}"), flush=True)
+        return RC_FAIL
+    print("RESULT PASS validate-spec V1-V8" + " C5" + (" C6" if spec.get("steps") else ""), flush=True)
+    return RC_OK
+
+
 def _main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model")
@@ -11304,6 +11383,9 @@ def _main(argv=None):
                          "replay (mini-finish's check, so a finish meets the same gates as the job)")
     ap.add_argument("--try-diagnosis", metavar="FILE",
                     help="with --check-only on a diagnose spec: gate FILE as DIAGNOSIS.md with diag_check.py, no model")
+    ap.add_argument("--validate-spec", action="store_true",
+                    help="a validate job (remote queue): mini-validate V1-V8 on a copy of --task-file, then --check-only and, for a steps "
+                         "spec, --try-fix-chain; VALIDATION.md and the filled spec go to --cwd. No model")
     a = ap.parse_args(argv)
     _RUN_CTX.update({k: v for k, v in (("cwd", a.cwd), ("task_file", a.task_file)) if v})
     if a.model and ":" in a.model:
@@ -11322,6 +11404,8 @@ def _main(argv=None):
         return _scratch_incidents(self_test_scope)
     if not (a.cwd and a.task_file):
         ap.error("--cwd and --task-file are required")
+    if a.validate_spec:
+        return validate_spec_job(a)
     held = None if a.check_verify else finish_guard(a.cwd)
     if held:  # before the endpoint config is read or prepare() runs: a re-run of a claimed job must not touch its work dir
         print(f"[mini-runner] {held}", flush=True)
@@ -11332,7 +11416,7 @@ def _main(argv=None):
         spec = json.loads(Path(a.task_file).read_text())
         chain = bool(spec.get("steps"))
         allowed = list(spec["allowed"]) if "allowed" in spec or not (chain or spec.get("mode") == "auto") else []
-        local = {} if (a.check_verify and (chain or spec.get("mode") in ("two-phase", "diagnose", "auto"))) else json.loads(LOCAL_JSON.read_text())
+        local = {} if (a.check_verify and (chain or spec.get("mode") in ("two-phase", "diagnose", "auto"))) else _read_local()
     except (OSError, ValueError, KeyError) as e:
         print(f"[mini-runner] bad spec or endpoint config: {type(e).__name__}", flush=True)
         return RC_FAIL

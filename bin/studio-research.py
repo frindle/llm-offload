@@ -50,6 +50,11 @@ recollection of having written it.
 """
 from __future__ import annotations
 
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import atexit
 import concurrent.futures as cf
@@ -83,7 +88,7 @@ except Exception as _e:  # pragma: no cover - fallback keeps this runnable stand
     WORKER_FETCH = None
     _WORKER_IMPORT_ERR = _e
 
-DEFAULT_SEARXNG = "http://203.0.113.154:8080"
+DEFAULT_SEARXNG = queue_config.get_str("search.searxng_url", "", env="SEARXNG_URL").rstrip("/")
 SEARCH_PACE_S = 2.0   # between successive searches; see stage_gather
 DOMAIN_CAP = 3        # max sources per domain per round; see stage_gather
 DEFAULT_HOST = _dbk.default_host()  # DARKBLOOM: local lane; F1/W2: sticky through a restart, the retired Ollama ONLY when Darkbloom is not configured
@@ -98,7 +103,7 @@ DEFAULT_HOST = _dbk.default_host()  # DARKBLOOM: local lane; F1/W2: sticky throu
 SEARXNG_CALLS = 0
 TAVILY_CALLS = 0
 _RESEARCH_META: dict = {}
-RESEARCH_METRICS = Path.home() / "bin" / "ollama-worker-logs" / "research-metrics.jsonl"
+RESEARCH_METRICS = queue_config.state_dir() / "ollama-worker-logs" / "research-metrics.jsonl"
 
 
 def _emit_research_metrics() -> None:
@@ -460,7 +465,7 @@ def fetch_one(ev: Evidence, max_chars: int, cwd: Path) -> Evidence:
 
 # --------------------------------------------------------------- vram guard
 
-RESIDENCY_FILE = Path.home() / "bin" / "studio-research-residency.json"
+RESIDENCY_FILE = queue_config.state_dir() / "studio-research-residency.json"
 
 
 def _canon_host(host: str) -> str:

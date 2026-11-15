@@ -319,14 +319,32 @@ def _default_http(url, headers, body, timeout):
         return e.code, e.read()
 
 
+def _darkbloom_endpoint():
+    """(base, key) of the Darkbloom chat API: queue_config.darkbloom_endpoint() (env, then local.json, then
+    config) when the module is importable (the API puts ~/bin on sys.path), else Darkbloom's own local.json (its
+    base_url follows the provider's bind address), else the loopback default."""
+    try:
+        import importlib
+        queue_config = importlib.import_module("queue_config")  # a ~/bin module, not stdlib
+        base, key = queue_config.darkbloom_endpoint()
+        # local.json's base_url ends in /v1 on the Mac; the path below adds /v1 itself.
+        return str(base).rstrip("/").removesuffix("/v1"), key
+    except ImportError:
+        with open(os.path.expanduser("~/.darkbloom/local.json")) as f:
+            d = json.load(f)
+        base = d.get("base_url")
+        if not (isinstance(base, str) and base.startswith(("http://", "https://"))):
+            base = "http://127.0.0.1:8000"
+        return base.rstrip("/").removesuffix("/v1"), d["api_key"]
+
+
 def call_model(request: dict, http_func=None) -> dict:
     """POST request["messages"] to the local Darkbloom chat endpoint; never raises."""
     key = None
     try:
         if not isinstance(request, dict) or not isinstance(request.get("messages"), list):
             return {"status": "error", "text": "invalid request"}
-        with open(os.path.expanduser("~/.darkbloom/local.json")) as f:
-            key = json.load(f)["api_key"]
+        base, key = _darkbloom_endpoint()
         if not isinstance(key, str) or not key:
             return {"status": "error", "text": "no api key"}
         body = json.dumps({
@@ -337,7 +355,7 @@ def call_model(request: dict, http_func=None) -> dict:
         }).encode()
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
         status, raw = (http_func or _default_http)(
-            "http://127.0.0.1:8000/v1/chat/completions", headers, body, 60)
+            base + "/v1/chat/completions", headers, body, 60)
         if status != 200:
             return {"status": "error", "text": "http " + str(status)}
         text = json.loads(raw)["choices"][0]["message"]["content"]

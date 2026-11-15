@@ -1,4 +1,5 @@
-"""Reverse proxy of /docsum/* on the queue API to the private doc-summary UI (127.0.0.1:7690). Stdlib only.
+"""Reverse proxy of /docsum/* on the queue API to the private doc-summary UI (127.0.0.1:7690 unless config docsum.upstream /
+QUEUE_DOCSUM_UPSTREAM names host:port: the UI is not in the queue image, so a containerised queue reaches it on another machine). Stdlib only.
 Never logs or prints a path, query, header, filename or body; a document body is held in memory only for the one request."""
 import http.client
 import json
@@ -7,8 +8,24 @@ from urllib.parse import urlsplit
 PREFIX = "/docsum"
 UPSTREAM = ("127.0.0.1", 7690)
 UPSTREAM_HOST = "%s:%d" % UPSTREAM
+_DEFAULT = UPSTREAM
 MAX_BODY = 110 * 1024 * 1024
 CHUNK = 64 * 1024
+
+
+def current_upstream():
+    """(host, port) the proxy forwards to: config docsum.upstream ("host:port"; env QUEUE_DOCSUM_UPSTREAM) over the default. An
+    unset, malformed or out-of-range value falls back to the default, never to a guess."""
+    try:
+        import queue_config
+        raw = queue_config.get_str("docsum.upstream", "").strip()
+    except Exception:
+        return UPSTREAM
+    host, sep, port = raw.rpartition(":")
+    host = host.strip("[]")
+    if not (sep and host and port.isdigit() and 0 < int(port) < 65536) or not all(c.isalnum() or c in ".-_" for c in host):
+        return UPSTREAM
+    return host, int(port)
 
 
 def origin_ok(headers):
@@ -21,15 +38,16 @@ def origin_ok(headers):
     return urlsplit(origin).netloc.lower() == host.strip().lower()
 
 
-def upstream_headers(headers):
-    result = {"Host": UPSTREAM_HOST}
+def upstream_headers(headers, upstream=None):
+    up_host = "%s:%d" % upstream if upstream else UPSTREAM_HOST
+    result = {"Host": up_host}
     for key in ("Cookie", "Content-Type", "Content-Length", "Accept"):
         val = headers.get(key)
         if val is not None:
             result[key] = val
     origin = headers.get("Origin")
     if origin:
-        result["Origin"] = "http://" + UPSTREAM_HOST
+        result["Origin"] = "http://" + up_host
     return result
 
 
@@ -91,8 +109,9 @@ def proxy(h, conn_factory=http.client.HTTPConnection):
                "Location", "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy")
     conn = None
     try:
-        conn = conn_factory(*UPSTREAM, timeout=60)
-        conn.request(h.command, path_no_prefix, body=raw_body, headers=upstream_headers(h.headers))
+        up = current_upstream() if UPSTREAM == _DEFAULT else UPSTREAM   # a patched module constant (tests) still wins
+        conn = conn_factory(*up, timeout=60)
+        conn.request(h.command, path_no_prefix, body=raw_body, headers=upstream_headers(h.headers, up))
         resp = conn.getresponse()
         status = resp.status
         resp_body = resp.read()

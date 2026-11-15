@@ -43,7 +43,15 @@ Private files, outside git, in $OFFLOAD_PRIVATE_DIR (default ~/.config/llm-offlo
 Private patterns: $OFFLOAD_PRIVATE_PATTERNS (default ~/.config/ollama-queue/private-patterns.txt), one regex per line,
 matched case-insensitively; required.
 
-Usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate]
+Build branch (--bin-ref REF --branch BRANCH, with optional --dash-ref REF): publishes a work-in-progress ~/bin ref (and
+the dashboard's) to a branch of the public repo for the queue image's pre-release build, WITHOUT touching main. The
+tree is staged from REF and run through the same secret guard, runtime check, private-info scan and test gate; it is
+committed in a temporary git worktree of the repo (the main checkout is never switched, its files and
+.sync-state.json are never written), the branch is created from main on first use, and `bin/queue-image/
+github-workflow-image.yml` is copied to `.github/workflows/queue-image.yml` on the branch. The push is
+fast-forward only. BRANCH may not be main or master.
+
+Usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate] [--bin-ref REF --branch BRANCH [--dash-ref REF]]
 """
 import fnmatch
 import hashlib
@@ -496,8 +504,9 @@ def report(found, what, limit=200):
 
 # ---------------------------------------------------------------- main
 
-def gate(head, skip):
-    """Run the test gate on the commit about to be synced; stop the sync unless it exits 0."""
+def gate(head, skip, dash_commit=None):
+    """Run the test gate on the commit about to be synced (and the dashboard commit being published, when a build
+    branch names one); stop the sync unless it exits 0."""
     if skip:
         SKIP_LOG.parent.mkdir(parents=True, exist_ok=True)
         with SKIP_LOG.open("a") as f:
@@ -505,35 +514,98 @@ def gate(head, skip):
         print("test gate skipped (--no-gate); logged to %s" % SKIP_LOG, file=sys.stderr)
         return
     sys.stdout.flush()
-    r = subprocess.run([str(GATE), "--commit", head])
+    r = subprocess.run([str(GATE), "--commit", head] + (["--dash-commit", dash_commit] if dash_commit else []))
     if r.returncode:
         die("test gate exit %d: not syncing, nothing written or pushed (--no-gate skips it, logged)" % r.returncode,
             r.returncode)
 
 
+def parse_args(argv):
+    """-> (flags set, {"bin-ref", "branch", "dash-ref"}); dies on anything else."""
+    flags, vals, i = set(), {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--dry-run", "--no-push", "--no-gate"):
+            flags.add(a)
+        elif a in ("--bin-ref", "--branch", "--dash-ref") and i + 1 < len(argv):
+            i += 1
+            vals[a[2:]] = argv[i]
+        else:
+            return None, None
+        i += 1
+    if ("bin-ref" in vals) != ("branch" in vals) or ("dash-ref" in vals and "branch" not in vals):
+        return None, None
+    for k, v in vals.items():
+        if k == "branch":
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,60}", v) or ".." in v or v.endswith((".lock", "/")) \
+                    or v.lower() in ("main", "master", "head"):
+                die("--branch %r: not a usable branch name (main and master are never a build branch)" % v)
+        elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}", v) or ".." in v:
+            die("--%s %r: not a usable ref" % (k, v))
+    return flags, vals
+
+
+def branch_worktree(td, branch):
+    """A detached temporary worktree of the public repo at BRANCH's tip (or main's, when BRANCH is new). -> (path, old
+    tip or None). The main checkout is not touched."""
+    old = run("git", "rev-parse", "--verify", "-q", "refs/heads/" + branch + "^{commit}", cwd=REPO, check=False)
+    if old.returncode:
+        old = run("git", "rev-parse", "--verify", "-q", "refs/remotes/origin/" + branch + "^{commit}", cwd=REPO, check=False)
+    tip = old.stdout.decode().strip() or None
+    base = tip
+    if not base:
+        for ref in ("refs/heads/main", "refs/remotes/origin/main"):
+            r = run("git", "rev-parse", "--verify", "-q", ref + "^{commit}", cwd=REPO, check=False)
+            if r.returncode == 0:
+                base = r.stdout.decode().strip()
+                break
+    if not base:
+        die("the repo has neither %s nor main to start the build branch from" % branch)
+    wt = Path(td) / "branch-wt"
+    run("git", "worktree", "add", "-q", "--detach", wt, base, cwd=REPO)
+    return wt, run("git", "rev-parse", "--verify", "-q", "refs/heads/" + branch + "^{commit}", cwd=REPO,
+                   check=False).stdout.decode().strip() or None
+
+
 def main():
-    args = set(sys.argv[1:])
-    if args - {"--dry-run", "--no-push", "--no-gate"} or not (REPO / "MANIFEST.txt").is_file():
-        die("usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate]   (repo: %s, needs MANIFEST.txt)" % REPO)
+    args, opts = parse_args(sys.argv[1:])
+    if args is None or not (REPO / "MANIFEST.txt").is_file():
+        die("usage: offload-repo-sync [--dry-run] [--no-push] [--no-gate] [--bin-ref REF --branch BRANCH [--dash-ref REF]]"
+            "   (repo: %s, needs MANIFEST.txt)" % REPO)
+    branch = opts.get("branch")
+    if branch:
+        try:
+            return sync(args, opts)
+        finally:
+            run("git", "worktree", "prune", cwd=REPO, check=False)
+    return sync(args, opts)
+
+
+def sync(args, opts):
+    branch = opts.get("branch")
     man = manifest()
     cfg = private_config()
     managed = FIXED_MANAGED + [d for d, _, _ in man["git-sources"]]
     heads = {}
     with tempfile.TemporaryDirectory(prefix="co-sync-") as td:
         stage = Path(td) / "tree"
-        bin_head = run("git", "-C", BIN, "rev-parse", "--verify", "HEAD^{commit}").stdout.decode().strip()
+        bin_head = run("git", "-C", BIN, "rev-parse", "--verify", opts.get("bin-ref", "HEAD") + "^{commit}").stdout.decode().strip()
+        wt, old_tip = branch_worktree(td, branch) if branch else (None, None)
+        out_repo = wt or REPO             # where the managed folders, the commit and the push come from
         image = image_entries(bin_head)
         head, n, skipped = stage_git(stage / "bin", BIN, bin_head, man["bin-exclude"], keep=set(image))
         for dest, checkout, ref in man["git-sources"]:
+            if branch and dest == IMAGE_DASH and "dash-ref" in opts:
+                ref = opts["dash-ref"]
             heads[dest] = stage_git(stage / dest, checkout, ref, [".github/*"])[0]
         runtime = man["runtime"] + (image_runtime(stage, image) if image else [])
         missing = []
         for sec in ["hooks", "launchd", "config", "state-docs"]:
             missing += stage_files(stage / DEST[sec], SOURCES[sec], man[sec])
         native = Path(td) / "native"      # the repo's own files (tracked or about to be) are checked too, never rewritten
-        listed = run("git", "ls-files", "-z", "-c", "-o", "--exclude-standard", cwd=REPO).stdout.decode().split("\0")
+        listed = run("git", "ls-files", "-z", "-c", "-o", "--exclude-standard", cwd=out_repo).stdout.decode().split("\0")
         for rel in sorted(set(filter(None, listed))):
-            p = REPO / rel
+            p = out_repo / rel
             if rel == STATE or any(rel == d or rel.startswith(d + "/") for d in managed):
                 continue
             if p.is_symlink():
@@ -571,20 +643,35 @@ def main():
             print("dry run: secret guard, runtime check and private-info scan clean; nothing written")
             return
         if "--no-push" not in args:
-            gate(head, "--no-gate" in args)
+            gate(head, "--no-gate" in args, heads.get(IMAGE_DASH) if (branch and "dash-ref" in opts) else None)
         for d in managed:
-            shutil.rmtree(REPO / d, ignore_errors=True)
+            shutil.rmtree(out_repo / d, ignore_errors=True)
             if (stage / d).exists():
-                (REPO / d).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(stage / d, REPO / d)
+                (out_repo / d).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(stage / d, out_repo / d)
+        if branch:   # the image workflow of this tree (scrubbed and scanned with the rest) builds the branch
+            wf = stage / "bin" / "queue-image" / "github-workflow-image.yml"
+            if wf.is_file():
+                (out_repo / ".github/workflows").mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(wf, out_repo / ".github/workflows/queue-image.yml")
+        return commit_and_push(args, opts, branch, out_repo, old_tip, head, heads, managed, cfg)
+
+
+def commit_and_push(args, opts, branch, repo, old_tip, head, heads, managed, cfg):
+    """Commit the staged folders in `repo` (the main checkout, or the temporary worktree of a build branch) and push."""
     st = REPO / STATE
-    prev = json.loads(st.read_text()).get("bin_head") if st.exists() else None
-    st.write_text(json.dumps({"bin_head": head, **{d + "_head": h for d, h in heads.items()}}, indent=1) + "\n")
-    run("git", "add", "-A", cwd=REPO)
+    if branch:   # the sync state of main stays as it is; the branch remembers its last ~/bin commit in its message
+        r = run("git", "log", "-1", "--format=%B", old_tip, cwd=REPO, check=False).stdout.decode() if old_tip else ""
+        m = re.search(r"^bin-head: ([0-9a-f]{40})$", r, re.M)
+        prev = m.group(1) if m else None
+    else:
+        prev = json.loads(st.read_text()).get("bin_head") if st.exists() else None
+        st.write_text(json.dumps({"bin_head": head, **{d + "_head": h for d, h in heads.items()}}, indent=1) + "\n")
+    run("git", "add", "-A", cwd=repo)
     # bin/.gitignore is ~/bin's whitelist; it would hide files ~/bin tracks anyway (qctl, bench expect
     # files, ...). The managed folders hold nothing but the staged copy, so they are added with -f.
-    run("git", "add", "-A", "-f", "--", *[d for d in managed if (REPO / d).exists()], cwd=REPO)
-    if not run("git", "diff", "--cached", "--quiet", cwd=REPO, check=False).returncode:
+    run("git", "add", "-A", "-f", "--", *[d for d in managed if (repo / d).exists()], cwd=repo)
+    if not run("git", "diff", "--cached", "--quiet", cwd=repo, check=False).returncode:
         print("no changes")     # still push below: an earlier --no-push commit goes out once the gate has passed
     else:
         log = run("git", "-C", BIN, "log", "--format=- %h %s", "-n", "80", "%s..%s" % (prev, head),
@@ -594,14 +681,25 @@ def main():
             log = ""
         msg = "sync: ~/bin %s\n\n%s" % (head[:12], ("~/bin commits since the last sync:\n" + log) if log else
                                              "Live tree as of this ~/bin commit.\n")
-        run("git", *GIT_ID, "commit", "-q", "-F", "-", cwd=REPO, data=msg.encode())
-        print(run("git", "log", "-1", "--format=%h %s", cwd=REPO).stdout.decode().strip())
+        if branch:
+            msg = "build: ~/bin %s for branch %s\n\n%sbin-head: %s\n" % (
+                head[:12], branch, msg.split("\n\n", 1)[1] + "\n", head)
+        run("git", *GIT_ID, "commit", "-q", "-F", "-", cwd=repo, data=msg.encode())
+        print(run("git", "log", "-1", "--format=%h %s", cwd=repo).stdout.decode().strip())
+        if branch:
+            new = run("git", "rev-parse", "HEAD", cwd=repo).stdout.decode().strip()
+            run("git", "update-ref", "refs/heads/" + branch, new, old_tip or "0" * 40, cwd=REPO)
     if "--no-push" in args:
         return
     if not run("git", "remote", cwd=REPO).stdout.strip():
         print("no remote: not pushed")
         return
-    r = run("git", "push", "-q", "origin", "HEAD", cwd=REPO, check=False)
+    if branch:
+        if run("git", "rev-parse", "--verify", "-q", "refs/heads/" + branch, cwd=REPO, check=False).returncode:
+            return   # nothing differs from main and the branch does not exist: nothing to push
+        r = run("git", "push", "-q", "origin", "refs/heads/%s:refs/heads/%s" % (branch, branch), cwd=REPO, check=False)
+    else:
+        r = run("git", "push", "-q", "origin", "HEAD", cwd=REPO, check=False)
     print("pushed" if not r.returncode else "push FAILED: " + r.stderr.decode(errors="replace")[-300:])
 
 

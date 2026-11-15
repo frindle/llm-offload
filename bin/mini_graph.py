@@ -278,7 +278,7 @@ def cli(argv, wt=None):
 
 # ---- self-test ----------------------------------------------------------------------------------------------------
 
-REAL = Path("/Users/user/Desktop/GitHub Projects/resell-tracker.nosync/graphify-out/graph.json")
+REAL = Path.home() / "Desktop" / "GitHub Projects" / "resell-tracker.nosync" / "graphify-out" / "graph.json"
 
 
 def _fixture(td):

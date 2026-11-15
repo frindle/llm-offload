@@ -5,7 +5,7 @@ prompt token is paid again on each turn; ~half of the context is old thinking th
 every turn. This subclass rewrites ONLY the API-bound copy of the messages (_prepare_messages_for_api); the trajectory
 mini writes to disk keeps the full history.
 
-  strip_old_thinking (default OFF: the model card wants preserve_thinking, so the owner must approve): drop the text up to
+  strip_old_thinking (default OFF: the model card wants preserve_thinking, so the operator must approve): drop the text up to
       `</think>` from every assistant turn but the last.
   shrink_obs (default ON): tool outputs older than the last `keep_whole` (6) become their first `shrink_chars` (300)
       chars plus a "rerun to see" note. The latest test-runner output is always kept whole.

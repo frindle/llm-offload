@@ -43,7 +43,7 @@ LANG_ALIASES = {"ts": "typescript", "js": "typescript", "javascript": "typescrip
                 "cs": "csharp", "c#": "csharp", "dotnet": "csharp", ".net": "csharp",
                 "f#": "fsharp", "vb": "fsharp"}
 
-# Languages the owner's repos use that the pipeline deliberately does NOT carry, and
+# Languages the operator's repos use that the pipeline deliberately does NOT carry, and
 # why. Refused up front (scaffold/auto/enqueue) -- never a mid-chain crash.
 # C# LEFT this table on 2026-09-27: the .NET 8 SDK is installed user-local at
 # ~/.dotnet and the csharp flavour (a plain net8.0 console test project that

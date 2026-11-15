@@ -513,7 +513,7 @@ def bundle_outcome(view, superseded=None, cancelled=None):
     """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
     "incomplete" | "superseded" (+ the number of failed slices).
 
-    ROOT CAUSE this closes (the owner 2026-10-06, "considered finished but have failed
+    ROOT CAUSE this closes (operator 2026-10-06, "considered finished but have failed
     flags"): the finished list was "every bundle with no queue row left", i.e.
     FINISHED meant NOTHING LIVE, so a bundle whose slice FAILED (or ended / needs_opus)
     and was never retried sat in Finished, "2/3", flagged failed. FINISHED now means
@@ -748,7 +748,7 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None, passed_
             phase = "done"
         elif heal_wait:
             # NOT terminal: the heal/escalation ladder still has a pending/held review that can
-            # advance this job (the owner 2026-10-09, needs-opus-auto-rt-bg-getcommitments-status
+            # advance this job (operator 2026-10-09, needs-opus-auto-rt-bg-getcommitments-status
             # read red `failed` beside its own pending `escalation / heal` row). `failed` is
             # reserved for a job nothing can still advance (see outstanding_heal).
             phase = "escalation-review"
@@ -770,7 +770,7 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None, passed_
                      "_base": base, "_t": max([_t(x) or 0 for x in mine] or [0]),
                      "_sup": [x.get("superseded_by") for x in mine
                               if x.get("status") in ("failed", "needs_opus") and x.get("superseded_by")]})
-    # SUPERSEDED FAILURES (the owner 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"
+    # SUPERSEDED FAILURES (operator 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"
     # beside chains that later exited 0): a failed pseudo-slice is OUTSTANDING only when
     # nothing later in its lineage passed or is still running. Three provable proofs, none
     # weaker; the row stays in the expanded history either way:
@@ -958,6 +958,65 @@ def _cached(kind, p, parse):
     return v
 
 
+BIRTH_SIDECAR = ".birthtimes.json"   # {"format": 1, "files": {"<name>": <epoch>}}, written by the standby export
+_STATX = []                          # [libc statx or None], resolved once
+
+
+def _statx_btime(path):
+    """Linux: the file's birth time from statx(2); Python's os.stat has no st_birthtime there. None when the
+    kernel, libc or filesystem does not report one."""
+    if not _STATX:
+        fn = None
+        if os.uname().sysname == "Linux":
+            try:
+                import ctypes
+                import ctypes.util
+                fn = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True).statx
+                fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _STATX.append(fn)
+    fn = _STATX[0]
+    if fn is None:
+        return None
+    import ctypes
+    import sys as _sys_bo
+    buf = ctypes.create_string_buffer(256)                   # struct statx
+    if fn(-100, os.fsencode(str(path)), 0, 0x800, buf) != 0:  # AT_FDCWD, STATX_BTIME
+        return None
+    raw, bo = buf.raw, _sys_bo.byteorder
+    if not int.from_bytes(raw[0:4], bo) & 0x800:              # stx_mask: no birth time on this filesystem
+        return None
+    sec = int.from_bytes(raw[80:88], bo, signed=True)         # stx_btime.tv_sec, then tv_nsec
+    return sec + int.from_bytes(raw[88:92], bo) / 1e9 if sec > 0 else None
+
+
+def _birth_sidecar(d):
+    v = _cached("births", Path(d) / BIRTH_SIDECAR, lambda p: json.loads(Path(p).read_text()))
+    files = v.get("files") if isinstance(v, dict) else None
+    return files if isinstance(files, dict) else {}
+
+
+def file_start(path, st=None):
+    """When the file was created (a job's launch, for a livelog or log), or None. macOS: st_birthtime. A file
+    imported into the standby container lost its birth time in the copy: the export's BIRTH_SIDECAR in the same
+    folder has it. A file the container wrote itself: statx. A time after the last write is not a start."""
+    try:
+        st = st or os.stat(path)
+    except OSError:
+        return None
+    end = st.st_mtime
+    b = getattr(st, "st_birthtime", None)
+    if b and 0 < b <= end:
+        return b
+    b = _birth_sidecar(os.path.dirname(str(path))).get(os.path.basename(str(path)))
+    if isinstance(b, (int, float)) and 0 < b <= end:
+        return float(b)
+    b = _statx_btime(path)
+    return b if b and b <= end else None
+
+
 def _json_any(log_dir, name):
     """<log_dir>/<name>, else <log_dir>/archive/<name> (a run-status 'clear' moves the
     sidecars there -- cleared from the worklist, still part of the history)."""
@@ -1046,13 +1105,11 @@ def load_history(live_dir, log_dir, since=None):
         jid = m.group(1)
         if jid in best and best[jid][0].st_mtime >= st.st_mtime:
             continue
-        best[jid] = (st, m.group(2))
+        best[jid] = (st, m.group(2), e.path)
     out = []
-    for jid, (st, fname_label) in best.items():
-        start = getattr(st, "st_birthtime", None)
+    for jid, (st, fname_label, fpath) in best.items():
         end = st.st_mtime
-        if not start or start > end:
-            start = end   # no birth time (Linux) / a copied file: finish is the best anchor
+        start = file_start(fpath, st) or end   # no birth time anywhere: finish is the best anchor
         rec = {"id": jid, "label": fname_label, HISTORIC: True,
                "launched_at": start, "finished_at": end,
                "active_s": round(max(0.0, end - start), 1) if start else None}

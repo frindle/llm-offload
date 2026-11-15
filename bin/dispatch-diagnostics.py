@@ -76,6 +76,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import queue_config  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 
 # ---- bounds ----------------------------------------------------------------
@@ -329,17 +332,56 @@ def _parse_since(s) -> datetime | None:
     return datetime.now(timezone.utc) - delta
 
 
+UNRAID_KEY_ENV = "UNRAID_API_KEY"
+UNRAID_KEY_KEYCHAIN = "unraid-api-key"
+
+
+def _unraid_key(key_from: dict) -> str:
+    """The Unraid API key, tried in order: the catalog's key_from (env NAME, keychain SERVICE, or file + dotted path),
+    then $UNRAID_API_KEY (the queue container's .env), then the macOS login Keychain item unraid-api-key. A source that
+    is missing or empty falls through to the next. The old default (~/.claude.json mcpServers.unraid) went away when
+    that MCP entry was parked on 2026-11-15; a catalog that still names it falls through too. The key never appears
+    in an error."""
+    tries = []
+    if key_from.get("env"):
+        tries.append(("env", key_from["env"]))
+    if key_from.get("keychain"):
+        tries.append(("keychain", key_from["keychain"]))
+    if key_from.get("file"):
+        tries.append(("file", (key_from["file"], key_from.get("path") or "")))
+    tries += [("env", UNRAID_KEY_ENV), ("keychain", UNRAID_KEY_KEYCHAIN)]
+    for kind, arg in tries:
+        val = None
+        try:
+            if kind == "env":
+                val = os.environ.get(str(arg))
+            elif kind == "keychain":
+                if os.path.exists("/usr/bin/security"):
+                    p = subprocess.run(["/usr/bin/security", "find-generic-password", "-w", "-s", str(arg)],
+                                       capture_output=True, text=True, timeout=10)
+                    val = p.stdout.strip() if p.returncode == 0 else None
+            else:
+                val = json.loads(Path(os.path.expanduser(str(arg[0]))).read_text())
+                for part in [x for x in str(arg[1]).split(".") if x]:
+                    val = val[part]
+        except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+            val = None
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    raise Refused("no Unraid API key: set %s in the environment (the queue container's .env) or the login Keychain item "
+                  "%s, or point the catalog's key_from at one" % (UNRAID_KEY_ENV, UNRAID_KEY_KEYCHAIN))
+
+
 def _unraid_graphql(query: str, variables: dict, src: dict, timeout: int) -> dict:
-    """Read-only GraphQL query against Unraid. Credentials come from the
-    catalog's `key_from` (a JSON file + dotted path), never from the request."""
+    """Read-only GraphQL query against Unraid. Credentials come from _unraid_key (catalog key_from, env, Keychain),
+    never from the request."""
     import urllib.request
-    url = src.get("url") or "https://unraid.example.com/graphql"
-    key_from = src.get("key_from") or {}
-    creds = json.loads(Path(os.path.expanduser(key_from.get("file", "~/.claude.json"))).read_text())
-    for part in (key_from.get("path") or "mcpServers.unraid.env.UNRAID_API_KEY").split("."):
-        creds = creds[part]
+    url = src.get("url") or queue_config.get_str("diagnostics.unraid_graphql_url", "")
+    if not url:
+        raise Refused("no Unraid GraphQL url: set src.url in the catalog or diagnostics.unraid_graphql_url in the queue config")
+    key = _unraid_key(src.get("key_from") or {})
     body = json.dumps({"query": query, "variables": variables}).encode()
-    r = urllib.request.Request(url, data=body, headers={"content-type": "application/json", "x-api-key": creds})
+    r = urllib.request.Request(url, data=body, headers={"content-type": "application/json", "x-api-key": key})
     with urllib.request.urlopen(r, timeout=timeout) as resp:
         return json.load(resp)
 

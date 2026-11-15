@@ -35,7 +35,7 @@ KILL_FILE = ESC_DIR / "ACTIONS-OFF"
 VERDICT_CACHE = ESC_DIR / "verdict-cache.json"
 
 DEFAULTS = {
-    # The owner 2026-10-09: the (d) "bigger model" may be ANY model Darkbloom can host; it
+    # operator 2026-10-09: the (d) "bigger model" may be ANY model Darkbloom can host; it
     # is configuration, never hardcoded. null => no model rung (d falls to re-slice).
     "bigger_model": None,
     "bigger_host": None,

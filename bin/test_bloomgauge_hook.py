@@ -104,3 +104,103 @@ def test_the_hook_hands_its_alert_writer_to_the_control_thread_before_running_it
     bgt = SimpleNamespace(wanted=lambda: True, run_async=_run, _STATE=st)
     oq.bloomgauge_hook({"jobs": []}, PK, 9.0, bgt=bgt)
     assert seen["deliver"] is oq._control_alert
+
+
+# ---- the queue runs away from the Mac (QUEUE_AGENT_URL): the Mac status service runs the step (2026-11-12)
+def _remote_reset(monkeypatch):
+    monkeypatch.setattr(oq, "_BG_REMOTE", {"thread": None, "last": None, "ack": 0, "epoch": None, "fails": 0})
+    monkeypatch.setattr(oq, "_BG_MODE", {"at": None, "mode": "off"})
+    monkeypatch.setattr(oq.queue_config, "agent_url", lambda: "http://mac-agent.invalid:7691")
+
+
+def test_remote_hook_posts_the_work_from_a_thread_and_never_imports_the_tick(monkeypatch):
+    _remote_reset(monkeypatch)
+    import sys as _sys
+    monkeypatch.delitem(_sys.modules, "bloomgauge_tick", raising=False)
+    posted = []
+    monkeypatch.setattr(oq.queue_config, "agent_post",
+                        lambda path, body, timeout=5.0: posted.append((path, body, timeout)) or
+                        {"epoch": "e1", "mode": "on", "alerts": []})
+    state = {"jobs": [{"id": "rrrrrrrrrrrr9", "status": "running", "model": "m1"}]}
+    work = oq.bloomgauge_hook(state, PK, 100.0)
+    assert work == {"busy": True, "why": oq.bloom_queue_work_remaining(state, PK, 100.0)[1], "target": "m1"}
+    oq._BG_REMOTE["thread"].join(5)
+    assert posted == [("/v1/bloomgauge-tick", dict(work, ack=0, epoch=None), oq.BG_REMOTE_TIMEOUT_S)]
+    assert "bloomgauge_tick" not in _sys.modules
+    assert oq._BG_MODE["mode"] == "on" and oq._BG_REMOTE["epoch"] == "e1"
+    assert oq.bloomgauge_hook(state, PK, 105.0) is None                     # within BG_REMOTE_EVERY_S
+    assert oq.bloomgauge_hook(state, PK, 100.0 + oq.BG_REMOTE_EVERY_S) is not None
+    oq._BG_REMOTE["thread"].join(5)
+    assert len(posted) == 2 and posted[1][1]["epoch"] == "e1"
+
+
+def test_remote_hook_skips_while_an_exchange_is_in_flight(monkeypatch):
+    import threading
+    _remote_reset(monkeypatch)
+    gate, calls = threading.Event(), []
+
+    def slow(path, body, timeout=5.0):
+        calls.append(body)
+        gate.wait(5)
+        return None
+    monkeypatch.setattr(oq.queue_config, "agent_post", slow)
+    assert oq.bloomgauge_hook({"jobs": []}, PK, 10.0) is not None
+    assert oq.bloomgauge_hook({"jobs": []}, PK, 100.0) is None              # previous still waiting
+    gate.set()
+    oq._BG_REMOTE["thread"].join(5)
+    assert len(calls) == 1 and oq._BG_REMOTE["fails"] == 1
+
+
+def test_remote_round_raises_each_alert_once_per_epoch(monkeypatch):
+    _remote_reset(monkeypatch)
+    seen = []
+    monkeypatch.setattr(oq, "_control_alert", lambda key, msg: seen.append((key, msg)))
+    answer = {"epoch": "e1", "mode": "shadow", "alerts": [
+        {"seq": 2, "key": "bloomgauge-control-manager", "msg": "3 Manager writes failed"},
+        {"seq": 1, "key": "bloomgauge-control-pick", "msg": "3 picks failed"},
+        {"seq": True, "key": "x", "msg": "bool seq ignored"}, "junk"]}
+    sent = []
+    post = lambda path, body, timeout=5.0: sent.append(dict(body)) or answer
+    W = {"busy": False, "why": "queue done", "target": None}
+    assert oq._bloomgauge_remote_round(W, post) == 2
+    assert seen == [("bloomgauge-control-pick", "3 picks failed"),
+                    ("bloomgauge-control-manager", "3 Manager writes failed")]
+    assert oq._BG_REMOTE["ack"] == 2 and oq._BG_MODE["mode"] == "shadow"
+    assert oq._bloomgauge_remote_round(W, post) == 0 and len(seen) == 2      # the service resent them: acked
+    assert sent[1]["ack"] == 2 and sent[1]["epoch"] == "e1"
+    answer.update(epoch="e2", alerts=[{"seq": 1, "key": "bloomgauge-control-log", "msg": "log unreadable"}])
+    assert oq._bloomgauge_remote_round(W, post) == 1                        # restarted service: numbers anew
+    assert seen[-1] == ("bloomgauge-control-log", "log unreadable") and oq._BG_REMOTE["ack"] == 1
+
+
+def test_remote_round_without_an_answer_raises_nothing(monkeypatch):
+    _remote_reset(monkeypatch)
+    seen = []
+    monkeypatch.setattr(oq, "_control_alert", lambda key, msg: seen.append((key, msg)))
+    W = {"busy": True, "why": "x", "target": None}
+    assert oq._bloomgauge_remote_round(W, lambda *a, **k: None) is None
+    assert oq._bloomgauge_remote_round(W, lambda *a, **k: (_ for _ in ()).throw(OSError("down"))) is None
+    assert oq._BG_REMOTE["fails"] == 2 and seen == [] and oq._BG_MODE["at"] is None
+
+
+def test_control_mode_comes_from_the_mac_when_remote(monkeypatch):
+    _remote_reset(monkeypatch)
+    got = []
+    monkeypatch.setattr(oq.queue_config, "agent_get", lambda path, timeout=3.0, text=False:
+                        got.append(path) or {"mode": "shadow"})
+    assert oq._bloomgauge_control_mode(1000.0) == "shadow" and got == ["/v1/bloomgauge-tick"]
+    assert oq._bloomgauge_control_mode(1001.0) == "shadow" and len(got) == 1     # cached
+    monkeypatch.setattr(oq, "_BG_MODE", {"at": None, "mode": "off"})
+    monkeypatch.setattr(oq.queue_config, "agent_get", lambda *a, **k: None)
+    assert oq._bloomgauge_control_mode(2000.0) == "off"
+
+
+def test_local_hook_unchanged_when_the_agent_url_is_unset(monkeypatch):
+    import sys as _sys
+    monkeypatch.setattr(oq.queue_config, "agent_url", lambda: None)
+    monkeypatch.setattr(oq.queue_config, "agent_post",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no remote call")))
+    bgt, calls = fake()
+    monkeypatch.setitem(_sys.modules, "bloomgauge_tick", bgt)       # what `import bloomgauge_tick` finds
+    work = oq.bloomgauge_hook({"jobs": [{"id": "rrrrrrrrrrrr8", "status": "running", "model": "m1"}]}, PK, 50.0)
+    assert work["target"] == "m1" and calls == [(work, 50.0)]

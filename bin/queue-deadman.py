@@ -31,6 +31,11 @@ Usage: queue-deadman.py [--dd DIR] [--queue-state FILE] [--now EPOCH] [--stall-m
 """
 import argparse, json, os, sys, time, urllib.request
 from pathlib import Path
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config  # noqa: E402  (the queue state wherever the queue runs: load_queue_state)
 
 HOME = Path.home()
 LOG_KEEP_LINES = 400
@@ -72,7 +77,7 @@ def pid_alive(pid):
 
 def health_url(dd_home):
     d = jload(Path(dd_home) / ".darkbloom" / "local.json") or {}      # base_url only; the key is never read
-    base = str(d.get("base_url") or "http://127.0.0.1:8000/v1").rstrip("/")
+    base = str(os.environ.get("DARKBLOOM_BASE_URL") or d.get("base_url") or "http://127.0.0.1:8000/v1").rstrip("/")
     return (base[:-3] if base.endswith("/v1") else base) + "/health"
 
 
@@ -87,7 +92,7 @@ def probe_health(url, timeout=4):
 
 def snapshot(a):
     dd = Path(a.dd)
-    return {"state": jload(a.queue_state), "wait": jload(dd / "queue-wait.json"),
+    return {"state": queue_config.load_queue_state(a.queue_state), "wait": jload(dd / "queue-wait.json"),
             "bloom": jload(dd / "bloom-control-state.json"),
             "health_ok": None if a.no_health else probe_health(a.health_url or health_url(Path(a.home)))}
 

@@ -1047,13 +1047,15 @@ def remote_lane(api, cpu_lane, tmp):
             put_lj({"api_key": FAKE_KEY})
             os.environ["DARKBLOOM_BASE_URL"] = "http://127.0.0.1:%d" % fake.port
             r2 = ecode(chat(jl, lt))
-            os.environ["DARKBLOOM_BASE_URL"] = "http://192.0.2.1:8000"
+            os.environ["DARKBLOOM_BASE_URL"] = "http://example.invalid:8000"      # a name, not an IP: never trusted
             r3 = ecode(chat(jl, lt))
+            os.environ["DARKBLOOM_BASE_URL"] = "http://192.0.2.1:8000"          # an exact IP the operator named = the endpoint
+            r4 = (cpu_lane._loopback_base("http://192.0.2.1:8000/v1"), cpu_lane._loopback_base("http://192.0.2.2:8000/v1"))
         finally:
             os.environ.pop("DARKBLOOM_BASE_URL", None)
             put_lj()
-        check("relay: the key only goes to a loopback endpoint (base_url, or DARKBLOOM_BASE_URL for a key-only record)",
-              (r1, n1, r2, r3), (off, 0, (200, None), off))
+        check("relay: the key only goes to a loopback endpoint (base_url, or DARKBLOOM_BASE_URL for a key-only record; an env-named exact IP is the endpoint)",
+              (r1, n1, r2, r3, r4), (off, 0, (200, None), off, ("http://192.0.2.1:8000", None)))
 
         # transport failures
         sk = socket.socket()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Queue RUNNER that serves ONE Goose (or any OpenAI-client) chat completion.
 
-WHY THIS EXISTS (the owner 2026-10-01: "goose needs to run through queue for everything,
+WHY THIS EXISTS (operator 2026-10-01: "goose needs to run through queue for everything,
 even chat"): standing policy is that ALL GPU/inference work goes through
 ~/bin/ollama-queue.py, so the single studio-db lane (local Darkbloom, cap shared with
 fleet traffic) is honestly accounted for and visible on the dashboard. Until now Goose

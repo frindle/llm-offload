@@ -26,6 +26,11 @@ break the queue, auto or the slicer.
 
   failure_ledger.py sweep | show [JOB] | counter RUN SID | selftest
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import json
 import os
 import re
@@ -36,9 +41,10 @@ from pathlib import Path
 
 HOME = Path(os.path.expanduser("~"))
 BIN = Path(os.environ.get("FAILURE_LEDGER_BIN") or HOME / "bin")
-QUEUE_LOGS = Path(os.environ.get("FAILURE_LEDGER_QUEUE_LOGS") or BIN / "ollama-queue-logs")
-LIVELOGS = Path(os.environ.get("FAILURE_LEDGER_LIVELOGS") or BIN / "ollama-queue-livelogs")
-STATE = Path(os.environ.get("FAILURE_LEDGER_STATE") or BIN / "ollama-queue-state.json")
+STATE_DIR = Path(os.environ.get("FAILURE_LEDGER_BIN") or queue_config.state_dir())  # the override still wins (tests); else the queue state dir
+QUEUE_LOGS = Path(os.environ.get("FAILURE_LEDGER_QUEUE_LOGS") or STATE_DIR / "ollama-queue-logs")
+LIVELOGS = Path(os.environ.get("FAILURE_LEDGER_LIVELOGS") or STATE_DIR / "ollama-queue-livelogs")
+STATE = Path(os.environ.get("FAILURE_LEDGER_STATE") or STATE_DIR / "ollama-queue-state.json")
 LEDGER = Path(os.environ.get("FAILURE_LEDGER") or HOME / ".ollama-dispatch" / "failures.jsonl")
 ROTATE_BYTES = 8 * 1024 * 1024
 

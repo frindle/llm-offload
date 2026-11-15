@@ -1,6 +1,6 @@
 """dispatch_progress.py -- live progress records for OFF-GPU dispatch work.
 
-WHY (the owner 2026-09-27: "is there a way to show these tasks so it doesn't look
+WHY (operator 2026-09-27: "is there a way to show these tasks so it doesn't look
 hung?"). While a committed bundle has no queue job running, its work still goes
 on, just not on the GPU: preflight's both-ways proof, the verify-relevance
 mutation run (minutes of CPU), a slicer advance, a self-heal regate. The queue

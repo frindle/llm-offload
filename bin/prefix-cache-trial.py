@@ -77,6 +77,8 @@ def darkbloom_keys():
         urls.append(json.loads(Path("~/.darkbloom/local.json").expanduser().read_text()).get("base_url", ""))
     except (OSError, ValueError):
         pass
+    if os.environ.get("DARKBLOOM_BASE_URL"):
+        urls.append(os.environ["DARKBLOOM_BASE_URL"])
     return set().union(*(endpoint_keys(u) for u in urls if u))
 
 

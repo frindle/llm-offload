@@ -33,7 +33,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RUNNER_REPO_CLIENT = Path.home() / "Desktop" / "GitHub Projects" / "dispatch-cpu-runner" / "client"
 RUNNER_FRESH_S = 120
-DEFAULT_API = "http://127.0.0.1:7684"
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
+DEFAULT_API = queue_config.queue_api()[0]   # QUEUE_API / queue.api_url, else http://127.0.0.1:7684
 
 
 def _load_client():

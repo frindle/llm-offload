@@ -23,7 +23,7 @@ from pathlib import Path
 
 REAL_BIN = Path.home() / "bin"
 REAL_TOOLS = ("ollama-queue.py", "handoff-emit.py", "signoff.py", "ollama-dispatch-slice",
-              "notify-owner.py", "dispatch-ack-reconcile.py", "dispatch-escalation-watcher.py",
+              "notify-operator.py", "dispatch-ack-reconcile.py", "dispatch-escalation-watcher.py",
               "ollama-dispatch-auto")
 TARGETS = [
     ("gate-on-complete.py", ["--self-test"]),

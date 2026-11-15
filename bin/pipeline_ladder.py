@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pipeline_ladder.py -- the TIER LADDER that replaces "park for a human" (2026-10-12).
 
-The owner: the dispatch pipeline runs UNATTENDED, LLM-only. A needs_opus row used to end at
+The operator: the dispatch pipeline runs UNATTENDED, LLM-only. A needs_opus row used to end at
 `_park_final` ("parking for human") or at self-heal's `skip:not an auto-author job`. This
 module is the escalation path every such row now walks, with a NAMED exit and an ACTION
 at every rung -- never a human.

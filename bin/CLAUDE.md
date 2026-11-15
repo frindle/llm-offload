@@ -7,7 +7,7 @@ Real location is `~/bin` (launchd cannot run jobs from ~/Desktop, so it cannot l
 Old dispatch tools (ollama-dispatch*, qagent, slicer) are removed. Do not recreate them.
 Flow: `mini-spec --repo <path> --base origin/main` -> `mini-validate` -> `mini-submit <dir>/spec.json --label <area-change> --model qwen3.8:27b-q4_K_M --bundle <b>` -> `mini-triage <jobid>` on failure.
 In TASK.md's `## Rule coverage`, list every rule of Required change, bad and missing input included. End each line with the frozen test that asserts it, in backticks (`mini-spec --lint` and mini-validate V8 check this).
-Job names: `area-change[-step]`, never project-fix-uN. After a failed job: `python3 ollama-queue.py resolve <id>` and `POST http://127.0.0.1:7684/api/runs/<id>/clear` in the same step.
+Job names: `area-change[-step]`, never project-fix-uN. After a failed job: `python3 ollama-queue.py resolve <id>` and `python3 ollama-queue.py clear-card <id>` in the same step (both work with the queue on the Mac or in the Unraid container).
 
 ## Layout
 - `ollama-queue.py` queue daemon/CLI; `qctl` operator CLI; `mini-*` mini-swe tools; `gate-on-complete.py`, `ollama-land` landing.

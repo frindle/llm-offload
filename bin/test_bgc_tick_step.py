@@ -70,3 +70,15 @@ def test_no_client_or_failed_write_keeps_state(tmp_path):
     cl = FakeClient(manager_on=True, fail_writes=True)
     assert T.tick(BUSY, 130.0, c, cl)["action"] == "mgr_off"
     assert not os.path.exists(c["lease_path"]) and rows(c)[-1]["result"] == "failed"
+
+
+def test_owner_pid_none_saves_a_lease_without_a_pid(tmp_path):
+    # The Mac status service runs the step for a queue elsewhere: the lease must not name the service's own pid,
+    # or the stale-lease guard (pid alive -> no action) would never hand the Manager back once the queue stops.
+    import bloomgauge_lease_guard as G
+    c, cl = cfg(tmp_path, "on"), FakeClient(manager_on=True)
+    c["owner_pid"] = None
+    assert T.tick(BUSY, 100.0, c, cl)["action"] == "mgr_off"
+    lease = json.load(open(c["lease_path"]))
+    assert lease["state"] == "HELD" and lease["heartbeat"] == 100.0 and lease["daemon_pid"] is None
+    assert G.pid_alive(lease["daemon_pid"]) is False

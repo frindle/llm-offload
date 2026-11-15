@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Act on an escalation watcher diagnosis for a HARNESS-side slice escalation.
 
-THE GAP THIS CLOSES (the owner 2026-09-26: "I shouldn't be having to manually override
+THE GAP THIS CLOSES (operator 2026-09-26: "I shouldn't be having to manually override
 things to get my queue to do what I want")
 -----------------------------------------------------------------------------
 dispatch-escalation-watcher.py detects an ESCALATED slice, has a headless reviewer
@@ -42,6 +42,11 @@ Actions by escalation class:
 """
 from __future__ import annotations
 
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import json
 import os
@@ -210,7 +215,7 @@ def record(plan, sid, entry, ctx=None, count=False, ledger_path=None):
 
 
 # ----------------------------------------------------------------------------
-# verified auto-skip (the owner 2026-10-02: "when our own gates decide a slice is
+# verified auto-skip (operator 2026-10-02: "when our own gates decide a slice is
 # already satisfied, the retirement must happen automatically, not by hand")
 # ----------------------------------------------------------------------------
 # A review that says VERDICT (a) / already satisfied is a CLAIM, never trusted as
@@ -425,7 +430,7 @@ def plan_slice_for_label(label, slice_runs=None):
 
 
 def _queue_jobs(queue_state=None):
-    st = _load(queue_state or (Path.home() / "bin" / "ollama-queue-state.json")) or {}
+    st = _load(queue_state or (queue_config.state_dir() / "ollama-queue-state.json")) or {}
     return st.get("jobs") or []
 
 
@@ -553,7 +558,7 @@ def _slicer_detached(plan_path, args, log_path):
 
 
 # ----------------------------------------------------------------------------
-# the rung ladder (the owner 2026-10-02: "take Claude and me out of the loop for
+# the rung ladder (operator 2026-10-02: "take Claude and me out of the loop for
 # escalations so nothing hangs for days")
 # ----------------------------------------------------------------------------
 # After the esc-review verdict the system ACTS, within MAX_ATTEMPTS per slice:
@@ -569,7 +574,7 @@ def _slicer_detached(plan_path, args, log_path):
 #                             Darkbloom model and Darkbloom sizes its own KV.
 # FINAL RUNG (the only one that parks for a human): the budget is spent, or the
 # escalation itself is "PIPELINE BUG SUSPECTED". It is never silent: ONE alert to
-# The owner (notify-owner.py, deduped) naming the slice and the exact qctl commands, and
+# The operator (notify-operator.py, deduped) naming the slice and the exact qctl commands, and
 # a decisions.jsonl entry that `qctl status` shows.
 DECISIONS = DISPATCH_DIR / "decisions.jsonl"
 _VERDICT_RE = re.compile(r"^\W*VERDICT\W*\(?\s*([abcd])\b", re.I)
@@ -644,7 +649,7 @@ def final_rung(plan, sid, why, ctx=None, ledger_path=None, notifier=None):
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                "notify_operator", Path(__file__).resolve().parent / "notify-operator.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -686,7 +691,7 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     st = _load(Path(slice_runs or SLICE_RUNS) / f"{plan}.json") or {}
     s = (st.get("slices") or {}).get(sid) or {}
     # A HUMAN cancel is terminal (plan_cancel.py): the ev-service-screen retry of
-    # 2026-09-27 18:42Z re-enqueued a job the owner had cancelled 37 min earlier.
+    # 2026-09-27 18:42Z re-enqueued a job the operator had cancelled 37 min earlier.
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
@@ -1266,7 +1271,7 @@ def harness_repair_sweep(ledger_path=None, slice_runs=None, hooks=None):
 # queue's needs_opus lane. The watcher detects it (source D), a local review runs and
 # gives a verdict -- and then self-heal answered "skip:job is not a slice of any plan",
 # because every lever above is a SLICER lever (--retry-slice / --regate). Nothing
-# acted, the driver had already exited, and the bundle parked "needs the owner"
+# acted, the driver had already exited, and the bundle parked "needs the operator"
 # (95234578bc40, verdict b: a fixture/harness defect). A human then enqueued exactly
 # the obvious remedy -- one more continuation authoring round on the SAME worktree
 # with --continues -- and it converged (3f75be3df79a, VERIFY_OK).
@@ -1299,7 +1304,7 @@ JOB_HEAL_WINDOW_S = 30 * 60      # the queue treats a fresh eligible row as heal
 JOB_HEAL_VERDICTS = ("a", "b", "c", "d")   # every verdict drives an action (2026-10-09)
 AUTHOR_LABEL_PREFIXES = ("auto-author-", "needs-opus-auto-")
 QUEUE_PY = Path(__file__).resolve().parent / "ollama-queue.py"
-QUEUE_LOG_DIR = Path.home() / "bin" / "ollama-queue-logs"
+QUEUE_LOG_DIR = queue_config.state_dir() / "ollama-queue-logs"
 _LIVE = ("pending", "running", "queued", "scheduled", "held", "paused", "planned")
 _REVIEW_NOTES_HEAD = "## ESCALATION REVIEW FINDINGS -- fix these FIRST"
 
@@ -2128,7 +2133,7 @@ def _park_final(job, key, why, notifier, decisions, ledger_path, now, job_cap=Fa
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                "notify_operator", Path(__file__).resolve().parent / "notify-operator.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -2312,7 +2317,7 @@ def resume_auto_driver(job, cid, ledger_path=None, runs_dir=None, launch=None, n
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_operator", Path(__file__).resolve().parent / "notify-operator.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -2561,7 +2566,7 @@ def _row_epoch(r):
 def passed_lineage_actions(jobs, runs, sidecars=None):
     """PURE. [('resolve', id, why)] for failed/needs_opus/blocked queue rows (and the
     job-form esc-review rows about them) whose lineage PROVABLY passed later, so a
-    superseded retry attempt no longer sits in Needs attention (the owner 2026-10-09,
+    superseded retry attempt no longer sits in Needs attention (operator 2026-10-09,
     rt-bg-commitments-guard: 5 failed rows of a chain whose later round exited 0).
     Two proofs, nothing weaker:
       (1) an ended auto-run `exit 0` for chain L (same bundle) finished AFTER the row, and
@@ -2689,7 +2694,7 @@ def hygiene_sweep(jobs=None, ledger_path=None, sidecars=None, act=None, notifier
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_operator", Path(__file__).resolve().parent / "notify-operator.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -3055,7 +3060,7 @@ def self_test():
         ctx.write_text("# ctx\n")
         calls, alerts = [], []
         launch = lambda pp, args, lp: calls.append(args)
-        # never alert the owner / write the live decisions log from a self-test
+        # never alert the operator / write the live decisions log from a self-test
         heal._notifier = lambda t, m, **k: alerts.append((m, k.get("dedupe_key")))
         # the in-place repair rung would run the REAL relevance gate on this toy tree
         heal._repair_hooks = {"jobs": [], "survey": lambda w, r: {
@@ -3135,7 +3140,7 @@ def self_test():
         # a HUMAN cancel is terminal: no lever is pulled for a cancelled plan
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
-        plan_cancel.mark_cancelled("p", "the owner cancelled", runs_dir=runs)
+        plan_cancel.mark_cancelled("p", f"{queue_config.operator_name()} cancelled", runs_dir=runs)
         base["slices"]["s2"]["status"] = "escalated"
         (runs / "p.json").write_text(json.dumps(base))
         calls.clear()
@@ -3203,7 +3208,7 @@ def main():
             try:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_operator", Path(__file__).resolve().parent / "notify-operator.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 _m.notify("stale dispatch drivers", "; ".join(

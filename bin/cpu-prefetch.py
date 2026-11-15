@@ -51,6 +51,11 @@ Every decision is appended to prefetch/decisions.jsonl. Seams are patchable for 
 functions; state dirs via env CPU_PREFETCH_DIR / OLLAMA_DISPATCH_DIR / OLLAMA_DISPATCH_AUTO_RUNS_DIR /
 OLLAMA_QUEUE_STATE).
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import fcntl
 import json
@@ -67,7 +72,7 @@ HOME = Path.home()
 DISPATCH = Path(os.environ.get("OLLAMA_DISPATCH_DIR") or HOME / ".ollama-dispatch")
 PDIR = Path(os.environ.get("CPU_PREFETCH_DIR") or DISPATCH / "prefetch")
 RUNS = Path(os.environ.get("OLLAMA_DISPATCH_AUTO_RUNS_DIR") or DISPATCH / "auto-runs")
-QUEUE_STATE = Path(os.environ.get("OLLAMA_QUEUE_STATE") or HOME / "bin" / "ollama-queue-state.json")
+QUEUE_STATE = Path(os.environ.get("OLLAMA_QUEUE_STATE") or queue_config.state_dir() / "ollama-queue-state.json")
 AUTO = Path(os.environ.get("CPU_PREFETCH_AUTO") or HERE / "ollama-dispatch-auto")
 KILL_FILE = DISPATCH / "cpu-prefetch.disabled"
 DEFAULTS = {"max_prep": 2, "target_ready": 3, "load_frac": 0.75, "lane_busy_max": 2,

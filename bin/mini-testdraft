@@ -166,12 +166,13 @@ def cmd_check(a):
     tmp = Path(tempfile.mkdtemp(prefix="mini-testdraft-"))
     try:
         base = tmp / "base"
-        shutil.copytree(os.path.expanduser(spec["baseline_from"]), base, symlinks=True,
+        bsrc = os.path.expanduser(a.baseline or spec["baseline_from"])   # --baseline: the queue's copy of the baseline (a remote draft job)
+        shutil.copytree(bsrc, base, symlinks=True,
                         ignore=shutil.ignore_patterns(".git", "__pycache__", "node_modules"))
-        nm = Path(os.path.expanduser(spec["baseline_from"])) / "node_modules"
+        nm = Path(bsrc) / "node_modules"
         if nm.exists():
             (base / "node_modules").symlink_to(nm)
-        venv = Path(os.path.expanduser(spec["baseline_from"])) / ".venv"
+        venv = Path(bsrc) / ".venv"
         if venv.exists():
             (base / ".venv").symlink_to(venv)
         for gcmd in (["init", "-q"], ["config", "user.email", "t@localhost"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"], ["add", "-A"],
@@ -298,6 +299,7 @@ def main(argv=None):
     c.add_argument("spec")
     c.add_argument("--draft", required=True)
     c.add_argument("--ref")
+    c.add_argument("--baseline", help="baseline dir to use instead of the spec's baseline_from (the queue's unpacked copy for a remote draft job)")
     c.add_argument("--keep", action="store_true")
     c.add_argument("--shadow", action="store_true")
     c.add_argument("--min-mutation", type=float, default=0.7, help="required mutation score on the changed functions (0 disables); plan threshold 0.70")

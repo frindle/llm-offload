@@ -1754,7 +1754,7 @@ def _measure_applied_core(worktree: Path, verify_cmd: str, diff_text: str, *,
     sample = _balanced_sample(evidence, max_mutants)
     rec["truncated"] = len(sample) < len(evidence)
     originals: dict[str, str] = {}
-    # LIVE PROGRESS (the owner 2026-09-27, "so it doesn't look hung"): this loop is
+    # LIVE PROGRESS (operator 2026-09-27, "so it doesn't look hung"): this loop is
     # minutes of CPU with nothing on the GPU; the queue status / dashboard read
     # this record to show "verify-relevance 18/40 mutants". Display only.
     try:

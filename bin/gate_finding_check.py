@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gate_finding_check.py -- make a gate reviewer's finding FALSIFIABLE.
 
-WHY (unattended-readiness item 4, owner/Main 2026-10-04)
+WHY (unattended-readiness item 4, operator/Main 2026-10-04)
 -------------------------------------------------------
 The authoritative re-gate reviewer (studio-27b-regate) flags correct code, and on a
 GREEN verify that parks the slice as needs_opus. Main overrode every one by hand:

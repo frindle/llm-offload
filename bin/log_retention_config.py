@@ -16,7 +16,7 @@ SCHEMA (version 1) -- three user-facing levels + holds:
                           #   (<id>.gate.json / .done.json / .diff) that gate-audit, `qctl results`,
                           #   run-status and the TTC median read. int 30..3650, default 365.
     "pins": [             # HOLDS: logs of a pinned job/bundle are kept until the pin is removed.
-      {"type": "job",    "id": "0160287d360a",    "who": "owner", "when": "2026-10-13T12:00:00Z", "why": "debugging X"},
+      {"type": "job",    "id": "0160287d360a",    "who": "the operator", "when": "2026-10-13T12:00:00Z", "why": "debugging X"},
       {"type": "bundle", "id": "smoke-egift-s4-api-route", "who": "...", "when": "...", "why": "..."}
     ]
   }

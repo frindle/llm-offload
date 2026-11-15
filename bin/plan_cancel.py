@@ -1,6 +1,6 @@
 """plan_cancel -- a HUMAN cancel of a slice plan is terminal until a human undoes it.
 
-WHY (2026-09-27, live: ev-service-screen-1-rivian-service). The owner cancelled every
+WHY (2026-09-27, live: ev-service-screen-1-rivian-service). The operator cancelled every
 job of the plan and killed its advance at ~18:05Z. Nothing recorded that intent
 anywhere the automation reads: the slicer maps a cancelled job to FAILED, FAILED
 is auto-retried, and at 18:42:07Z dispatch-self-heal.py ran `--retry-slice

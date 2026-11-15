@@ -18,6 +18,11 @@ Termination is based purely on "the model's response has no more
 tool_calls" -- never on injecting a self-generated "continue" prompt --
 which is the structural fix for bug #2 above.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import collections.abc
 import difflib
@@ -108,7 +113,10 @@ except ImportError:
     pdfplumber = None
 
 DEFAULT_MODEL = "qwen3-14b-agentic"
-DEFAULT_HOST = "http://198.51.100.145:11434"
+# Deployment hosts come from queue_config (env or config.toml); public defaults name no machine.
+UNRAID_OLLAMA_URL = queue_config.get_str("ollama.unraid_url", "", env="OLLAMA_UNRAID_URL").rstrip("/")  # the small-GPU Ollama host
+STUDIO_OLLAMA_URL = queue_config.studio_url()  # the big-memory host
+DEFAULT_HOST = UNRAID_OLLAMA_URL or "http://127.0.0.1:11434"
 # --api openai's default when --host is omitted: Darkbloom's local OpenAI endpoint
 # (2026-10-01; was the retired llama-server bypass on :8091). Read from
 # ~/.darkbloom/local.json, which Darkbloom rewrites on every provider restart; the old
@@ -128,7 +136,7 @@ def _darkbloom_base_from_record(rec):
     rec = rec if isinstance(rec, dict) else {}
     b = str(rec.get("base_url") or "").strip().rstrip("/")
     if not b and rec.get("api_key"):
-        b = (_o.environ.get("DARKBLOOM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+        b = queue_config.darkbloom_default_base()
     if b.endswith("/v1"):
         b = b[:-3]
     return b if b.startswith("http") else None
@@ -138,9 +146,10 @@ def _darkbloom_local_record():
     try:
         import json as _j, os as _o
         rec = _j.load(open(_o.path.expanduser("~/.darkbloom/local.json")))
-        return rec if isinstance(rec, dict) else {}
+        rec = rec if isinstance(rec, dict) else {}
     except Exception:
-        return {}
+        rec = {}
+    return queue_config.darkbloom_apply_env(rec)      # unchanged unless DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY is set
 
 
 def _darkbloom_default_host():
@@ -212,18 +221,18 @@ ITERATION_LOW_BUDGET_THRESHOLD = 3  # added 2026-08-29, paired with the per-turn
 # separate from CONTEXT_REVIEW_THRESHOLD (a fraction) because this is a small absolute count --
 # the two review gates are independent and can trip at different times.
 
-CONTEXT_REVIEW_THRESHOLD = 0.90  # added 2026-08-28 (the owner's request, "can we do the same for
+CONTEXT_REVIEW_THRESHOLD = 0.90  # added 2026-08-28 (the operator's request, "can we do the same for
 # context?" -- paired with request_more_iterations): fraction of --num-ctx at which a dispatch
 # pauses for review (same clean-stop-and-resume shape as the iteration request) rather than
 # risk an actual context overflow or a silently degraded response near the ceiling.
-# Proactive mid-run budget nudges (the owner 2026-09-08): the 0.90 pause above is post-hoc -- by
+# Proactive mid-run budget nudges (operator 2026-09-08): the 0.90 pause above is post-hoc -- by
 # the time it fires the run is already walled. These earlier thresholds warn the model to
 # CONVERGE while it still has room, each firing at most once per run. Kept strictly below
 # CONTEXT_REVIEW_THRESHOLD so the pause always supersedes the top nudge.
 CONTEXT_NUDGE_THRESHOLDS = (0.60, 0.78)
-DEFAULT_SEARXNG_HOST = "http://203.0.113.154:8080"
-LOG_DIR = Path.home() / "bin" / "ollama-worker-logs"
-UNRAID_OLLAMA_HOSTS = ("198.51.100.145",)  # substrings matched against --host to detect "this dispatch targets Unraid"
+DEFAULT_SEARXNG_HOST = queue_config.get_str("search.searxng_url", "", env="SEARXNG_URL").rstrip("/")
+LOG_DIR = queue_config.state_dir() / "ollama-worker-logs"
+UNRAID_OLLAMA_HOSTS = (((urllib.parse.urlsplit(UNRAID_OLLAMA_URL).hostname or ""),) if UNRAID_OLLAMA_URL else ())  # substrings matched against --host to detect "this dispatch targets Unraid"
 
 
 def _unraid_host_substrings() -> tuple:
@@ -253,7 +262,7 @@ def _unraid_host_substrings() -> tuple:
 # actually fits the GPU, not by a single hardcoded default.
 #
 # CONFIGURABLE (2026-09-26): the host table used to be this literal dict, which
-# hardwired the whole toolchain to the owner's own two boxes by IP. It now lives in
+# hardwired the whole toolchain to the operator's own two boxes by IP. It now lives in
 # ~/.ollama-dispatch/hosts.json, following the SAME convention as the other
 # edit-without-a-code-change config in this toolchain (gate-on-complete.py's
 # ~/.ollama-dispatch/model-ladder.json, ~/.ollama-dispatch/defaults.json):
@@ -274,20 +283,20 @@ DISPATCH_HOME = Path(os.environ.get("OLLAMA_DISPATCH_HOME",
                                     str(Path.home() / ".ollama-dispatch"))).expanduser()
 OLLAMA_HOSTS_FILE = DISPATCH_HOME / "hosts.json"
 SEEDED_OLLAMA_HOSTS = {
-    "unraid": {
-        "url": "http://198.51.100.145:11434",
+    **({"unraid": {
+        "url": UNRAID_OLLAMA_URL,
         # 3080, 12GB VRAM (confirmed 2026-08-27). Reserve ~20% for KV
         # cache/context overhead so a model that just barely fits the raw
         # VRAM figure doesn't still spill once a real context is loaded.
         "usable_bytes": int(12 * 1024**3 * 0.8),
-    },
-    "studio": {
-        "url": "http://127.0.0.1:11434",
+    }} if UNRAID_OLLAMA_URL else {}),
+    **({"studio": {
+        "url": STUDIO_OLLAMA_URL,
         # 64GB unified memory (confirmed live via `sysctl hw.memsize` on
-        # mac-host). Reserve ~20GB for the OS and whatever else is
+        # the studio host). Reserve ~20GB for the OS and whatever else is
         # running rather than the full 64GB.
         "usable_bytes": 44 * 1024**3,
-    },
+    }} if STUDIO_OLLAMA_URL else {}),  # empty = loopback inside the container: no studio host (queue_config.studio_url)
 }
 # The two names the auto-routing logic below still treats specially when they
 # exist: BIG is the preferred/overflow-safe host, SMALL the VRAM-limited card.
@@ -318,6 +327,8 @@ def _normalize_ollama_hosts(raw) -> dict:
         url = str(spec.get("url") or "").strip().rstrip("/")
         if not url.startswith("http"):
             continue
+        if name.lower() in ("studio", "studio-db") and queue_config.in_container() and not queue_config.studio_url_ok(url):
+            continue  # a loopback "studio" inside the container is the container itself: fail closed
         ub = spec.get("usable_bytes")
         try:
             ub = int(ub)
@@ -434,7 +445,7 @@ KNOWN_OLLAMA_HOSTS = _LiveOllamaHosts()
 # mapped". A hard cap, not a suggestion: Unraid's spillover check in
 # ensure_model_ready() already aborts on ANY spillover, but only AFTER a
 # real warmup load -- up to several minutes wasted finding out the hard way.
-# This catches it before dispatch even starts. The owner's call 2026-08-28
+# This catches it before dispatch even starts. the operator's call 2026-08-28
 # ("can we code that in as a hard cap that will catch prior to dispatch?"):
 # clamp down and log loudly, don't silently proceed and don't just warn.
 # A model with no entry here is simply unmeasured, not assumed safe --
@@ -448,7 +459,7 @@ UNRAID_SPILLOVER_EXCEPTIONS = {
     # touched when routed to, not every token -- confirmed live 2026-08-29,
     # gpt-oss:20b loaded at 10.96GB VRAM / 3.46GB CPU (24% spilled) and still
     # ran ~41 tok/s on a short response, competitive with several fully-
-    # on-GPU dense models tested the same night. The owner's call: document real
+    # on-GPU dense models tested the same night. the operator's call: document real
     # per-model exceptions here rather than loosen the rule generally.
     "gpt-oss:20b": {"max_spill_frac": 0.30},
 }
@@ -518,10 +529,10 @@ COPY_HELPER = str(Path.home() / "bin" / "copy-ollama-model-from-unraid.py")
 # helper's per-blob "SKIP (already at destination)" makes the second pass free.
 LOCAL_MODEL_CACHE = Path.home() / ".ollama" / "models"
 SMB_MODEL_SOURCE = Path("/Volumes/data/ollama-models")
-MODEL_PULL_LOG = Path.home() / "bin" / "ollama-model-pulls.log"
+MODEL_PULL_LOG = queue_config.state_dir() / "ollama-model-pulls.log"
 # Vault REST default (Basic Memory behind vault-shim). _vault_endpoint() resolves the URL and the
 # token per call through vault_conf.py, so nothing reads the token at import.
-VAULT_URL_DEFAULT = "http://192.0.2.240:27123"
+VAULT_URL_DEFAULT = queue_config.get_str("vault.url", "", env="VAULT_URL")
 # Unified dispatch ledger (2026-09-14): queue/qwen dispatches and Agent-tool
 # dispatches now share ONE note so the whole offload stream is in one place. This
 # used to point at "Claude/Ollama/Ollama-Dispatch-Log.md" (queue-only), while the
@@ -1904,7 +1915,7 @@ def tool_run_bash(cwd: Path, args: dict) -> str:
             "exit_code": rc,
             "stdout": clip_tool_stream(out)[0],
             "stderr": clip_tool_stream(err)[0],
-            # The owner 2026-09-20 (Opus root-cause, bonsai rep2 hard-zero): a `cd` in one
+            # operator 2026-09-20 (Opus root-cause, bonsai rep2 hard-zero): a `cd` in one
             # run_bash call does not persist to the next -- each call is a fresh
             # subprocess at `cwd`. Echoing it back lets a model correct a wrong belief
             # about its location on the VERY NEXT call instead of searching the
@@ -1952,7 +1963,7 @@ def _keychain_secret(service: str):
         return _KEYCHAIN_CACHE[service]
     val = None
     try:
-        acct = os.environ.get("USER") or "user"
+        acct = os.environ.get("USER") or queue_config.operator_handle()
         r = subprocess.run(["security", "find-generic-password", "-a", acct, "-s", service, "-w"],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
@@ -2081,7 +2092,7 @@ def tool_web_search(cwd: Path, args: dict, searxng_host: str) -> str:
         _WEB_SEARCH_CALLS["searxng"] += 1
         log("[worker] web_search: served by SearXNG")
         return searxng_out
-    # Brave (PAID -- $5/1k, card bills) is DELIBERATELY NOT in the auto-chain (e2 + the owner's free-
+    # Brave (PAID -- $5/1k, card bills) is DELIBERATELY NOT in the auto-chain (e2 + the operator's free-
     # services preference, 2026-08-30): a paid fallback that fires unnoticed accumulates a bill
     # quietly, and "last in chain" is not the same as "never fires without a decision". _search_brave
     # stays defined and the key stays in Keychain for a DELIBERATE future choice, but web_search never
@@ -2164,6 +2175,8 @@ def _search_searxng(query: str, searxng_host: str) -> str:
     Renamed 2026-08-30 from tool_web_search to _search_searxng: now the SearXNG fallback behind the
     Tavily (free) primary, with Brave (PAID -- $5/1k, card bills; not the free tier it once was) as a
     last resort only when both free paths are empty. Takes `query` directly (no longer the raw args)."""
+    if not searxng_host:
+        return "ERROR: web_search failed (no SearXNG host configured: set search.searxng_url or SEARXNG_URL)."
     url = f"{searxng_host}/search?" + urllib.parse.urlencode({
         "q": query, "format": "json",
         "engines": "brave,duckduckgo,google cse,startpage,bing,duckduckgo web",
@@ -2785,7 +2798,7 @@ def _host_is_free(host_url: str) -> bool:
 def pick_host(model: str) -> str:
     """Choose which of the two known Ollama hosts to dispatch `model` to.
 
-    Priority, the owner's call 2026-08-28: **Studio first if it's currently
+    Priority, the operator's call 2026-08-28: **Studio first if it's currently
     free, Unraid as parallel overflow capacity, Unraid only ever used when
     the model actually fits it.** (Previously preferred Unraid whenever a
     model fit, to keep Studio free for other things -- reversed because
@@ -2808,7 +2821,7 @@ def pick_host(model: str) -> str:
     an oversized model repeats the exact spillover this function exists to
     avoid)."""
     # Generalised over the user-editable host table (2026-09-26) WITHOUT changing
-    # the decision for the owner's studio+unraid pair: "primary" is BIG_HOST_NAME when
+    # the decision for the operator's studio+unraid pair: "primary" is BIG_HOST_NAME when
     # configured (the big-budget host, preferred and used as the queue-there
     # fallback), every OTHER configured host is overflow capacity, and an overflow
     # host is only ever eligible when the model's real size provably fits its
@@ -3112,7 +3125,7 @@ def _is_darkbloom_lane(host):
     h = str(host or "").rstrip("/")
     if h.endswith("/v1"):
         h = h[:-3]
-    _legacy = h in _DARKBLOOM_LOCAL_HOSTS or bool(_darkbloom_auth_headers(host))
+    _legacy = h in _DARKBLOOM_LOCAL_HOSTS or queue_config.is_darkbloom_host(h) or bool(_darkbloom_auth_headers(host))
     return _pr.shadow_is_lane(host, _legacy) if _pr is not None else _legacy
 
 
@@ -3385,7 +3398,7 @@ def write_dispatch_metrics(metrics: dict) -> None:
     metrics-logging failure must not fail (or mask the real error of) the
     actual dispatch. Called both from run_task's normal completion path and
     from main()'s crash handler, so a context-exhaustion crash -- the exact
-    failure mode this log exists to eventually let the owner threshold against --
+    failure mode this log exists to eventually let the operator threshold against --
     still gets a real entry instead of silently vanishing."""
     if _pr is not None:
         _pr.summary(metrics)      # request count for the daemon's reap-time GAP check (never raises)
@@ -3423,7 +3436,7 @@ def _darkbloom_known_host(host):
     env = (os.environ.get("DARKBLOOM_BASE_URL") or "").rstrip("/")
     if env.endswith("/v1"):
         env = env[:-3]
-    return bool(h) and (h in _DARKBLOOM_LOCAL_HOSTS or (bool(env) and h == env))
+    return bool(h) and (h in _DARKBLOOM_LOCAL_HOSTS or (bool(env) and h == env) or queue_config.is_darkbloom_host(h))
 
 
 # 401 from a key rotated MID-FLIGHT (2026-10-13 review item 6). The request goes out with key K1, the
@@ -3474,6 +3487,8 @@ def _darkbloom_key_rotated_retry(host, state, sleep=time.sleep, clock=time.monot
 
 def _darkbloom_key_rotated_retry_legacy(host, state, sleep=time.sleep, clock=time.monotonic):
     try:
+        if (os.environ.get("DARKBLOOM_API_KEY") or "").strip():
+            return False                      # a key from the environment cannot rotate under us: a 401 is a bad key
         if not _darkbloom_401_retry_enabled() or state.get("k401", 0) >= 1:
             return False
         h = _norm_openai_host(host)
@@ -4036,7 +4051,7 @@ def _live_find_new_checkpoints(text, seen, margin=20):
 
 class LiveLog:
     """Appends tagged, colored status lines to a file a human can `tail -f`
-    (the qwen.example.com ttyd terminal already does exactly this for
+    (a ttyd web terminal already does exactly this for
     qwen-dispatch.sh's log). Every line is prefixed with [tag] because
     multiple concurrent dispatches commonly share one --live-log file. The
     log path is whatever the caller passed -- this file stays host-agnostic
@@ -4170,7 +4185,7 @@ class ChatAbortedForProseRunaway(Exception):
 
 class ChatAbortedForReasoningLoop(Exception):
     """Raised by call_ollama_streaming when a SINGLE generation is stuck
-    re-deriving the same reasoning inside one turn (the owner 2026-09-20: three
+    re-deriving the same reasoning inside one turn (operator 2026-09-20: three
     separate live jobs -- bece829d8005, d08795db97ee, 0971afaccfa9 -- each
     burned 30min-6h temp=0 oscillating between a handful of near-identical
     thinking fragments, never emitting content/tool_calls, until num_predict
@@ -4915,12 +4930,12 @@ def _try_lan_copy(host: str, model: str) -> bool:
     return True
 
 
-# ZERO CPU spillover tolerated on Unraid -- the owner, 2026-08-28, in these exact
+# ZERO CPU spillover tolerated on Unraid -- the operator, 2026-08-28, in these exact
 # words, after a dispatch was reported as "should clear, ~10% spillover,
 # under threshold": "no spillover, at all, period." A percentage-threshold
 # framing (this constant used to be SPILLOVER_ABORT_FRACTION = 0.15) reads
 # as "up to 15% is fine," which is not the rule and got restated back to
-# The owner as if it were -- the standing rule has always been zero, going back
+# The operator as if it were -- the standing rule has always been zero, going back
 # to "no. no cpu spillover on unraid." earlier this same session. The
 # post-warmup check below now aborts on ANY measured spillover at all, no
 # threshold, no epsilon -- size/size_vram from /api/ps are exact integer
@@ -5122,9 +5137,9 @@ def _ensure_model_ready_once(host: str, model: str, temperature: float, num_ctx:
     omitted). Confirmed live: gpt-oss:20b's base weights (13.79GB) already
     exceed Unraid's 12GB card before any context is even added, and at
     --num-ctx 65536 it loaded at ~10GB VRAM / ~22.8GB total -- over half
-    spilled to CPU. The owner: "we need hard rules programmed for model
+    spilled to CPU. The operator: "we need hard rules programmed for model
     dispatching to prevent this. it keeps happening." Confirmed unconditional,
-    no override -- the owner: "no. no cpu spillover on unraid." This is that hard
+    no override -- the operator: "no. no cpu spillover on unraid." This is that hard
     rule, made non-bypassable by living here (every dispatch calls this,
     regardless of how --host was chosen) rather than only in pick_host()
     (which an explicit --host skips past), and by having no escape hatch at
@@ -5160,7 +5175,7 @@ def _ensure_model_ready_once(host: str, model: str, temperature: float, num_ctx:
                 raise RuntimeError(
                     f"Nothing is listening on {host} -- Darkbloom's local endpoint is down. "
                     f"BloomGauge runs Darkbloom (the queue's BloomGauge control starts it for "
-                    f"queued work); never run darkbloom by hand. Needs the owner if it stays down."
+                    f"queued work); never run darkbloom by hand. Needs {queue_config.operator_name()} if it stays down."
                 ) from e
             raise RuntimeError(
                 f"could not connect to {host}/health ({e}) -- is a server "
@@ -6569,7 +6584,7 @@ def write_thrash_abort(_write_repeats, threshold=3):
 
 
 # --- Anti-thrash guard for re-issued identical READ-ONLY tool calls -------------
-# Motivating failure (the owner 2026-09-08): a diagnosis dispatch re-issued near-identical
+# Motivating failure (operator 2026-09-08): a diagnosis dispatch re-issued near-identical
 # run_bash greps against the SAME files ("Let me grep app/bfmr/page.tsx..." fired
 # repeatedly), burning context going in circles. The existing loop-detect (below, in
 # the tool loop) only SOFT-nudges at 3/6/9 and still RE-RUNS the command every time,
@@ -6610,7 +6625,7 @@ def _anti_thrash_intercept(sig, cacheable, result_cache, repeat_counts):
 
 
 # --- Reasoning-novelty ("frozen thinking") detector ----------------------------
-# Motivating failure (the owner 2026-09-19, BFMR split-reservation diagnosis job
+# Motivating failure (operator 2026-09-19, BFMR split-reservation diagnosis job
 # 4b829e59598d, terminal_reason=read_thrash, exit 2, ZERO output). Post-mortem over
 # the resume transcript 20260919T160454Z.json:
 #
@@ -6688,7 +6703,7 @@ def reasoning_repeat_streak(thinking, prev_norm, streak,
     return 0, cur, False
 
 
-# --- Intra-turn reasoning-loop abort (the owner 2026-09-20) ----------------------
+# --- Intra-turn reasoning-loop abort (operator 2026-09-20) ----------------------
 # Same fixed-point failure as the frozen-reasoning detector above, but caught
 # WHILE a single turn is still generating instead of only after two full turns
 # complete. Not every occurrence is a verbatim repeat -- bece829d8005 oscillated
@@ -6753,7 +6768,7 @@ OUTPUT_CAP_CUT_MAX = 2
 # job log with a cut-off (2026-10-06): fired on 13 failed runs, 0 of 93 passing.
 PROSE_LOOP_WINDOW = 10
 PROSE_LOOP_CUTS = 4
-# WALL BUDGET (2026-10-06, the owner "refine shouldn't take hours"): an auto-generated
+# WALL BUDGET (2026-10-06, the operator "refine shouldn't take hours"): an auto-generated
 # authoring / refine / continuation job gets a wall-clock cap per worker process.
 # Passing auto author/refine runs: p50 7 min, p90 20, p99 42.5 (602 runs).
 # WORKER_WALL_BUDGET_S overrides (0 disables); other tasks are uncapped.
@@ -6900,7 +6915,7 @@ def think_buf_loop_check(think_buf, last_checked_len, has_output):
     return True, False, n, None
 
 
-# --- Harvest-on-abort (the owner 2026-09-19: "we should always improve") ------------
+# --- Harvest-on-abort (operator 2026-09-19: "we should always improve") ------------
 # The same BFMR run above died with terminal_reason=read_thrash and produced NOTHING:
 # every assistant turn's `content` was the empty string (the model spoke only through
 # tool calls), so _extract_final_answer in ollama-queue.py found no assistant text and
@@ -6983,7 +6998,7 @@ def build_harvested_answer(reason, reasoning):
     )
 
 
-# --- Resume-time transcript compaction (the owner 2026-09-08) ------------------------
+# --- Resume-time transcript compaction (operator 2026-09-08) ------------------------
 # A job that paused at ~92% context leaves a resume= transcript, but resuming INTO a
 # ~92%-full window can't make progress -- the pre-send projection re-pauses almost
 # immediately, so a plain resume is inert. (The queue's auto-resume bumps num_ctx
@@ -7344,7 +7359,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         "model": model, "host": host, "api_style": api_style,
         "configured_num_ctx": num_ctx,
         # How many times the queue's auto-resume watchdog raised this job's
-        # context before this run. The owner's framing 2026-09-02: resource cost is
+        # context before this run. the operator's framing 2026-09-02: resource cost is
         # REPORTED DATA, never a penalty -- "solved but needed 131072 and 3 bumps"
         # is a deployment fact worth having, and equalising budgets would measure
         # a model we had crippled rather than the one we would deploy. Kept as a
@@ -7423,9 +7438,9 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     nudge_count = 0
     MAX_NUDGES = 3  # hard ceiling regardless of progress -- see below for the
     # condition that governs whether a nudge under that ceiling is actually sent.
-    # Added 2026-08-28 (the owner's request): let a model ask for more iterations itself, via the
+    # Added 2026-08-28 (the operator's request): let a model ask for more iterations itself, via the
     # request_more_iterations tool, instead of the only recovery being a human noticing
-    # DID-NOT-CONVERGE after the fact. The owner's call: this is a review gate, not an auto-grant --
+    # DID-NOT-CONVERGE after the fact. the operator's call: this is a review gate, not an auto-grant --
     # setting this to a non-None reason string cleanly pauses the whole dispatch (both loops),
     # same as running out of iterations, so it's resumable via the exact same `--resume` flow
     # already proven live tonight. See its two setters below (request_more_iterations, and the
@@ -8028,7 +8043,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                         "_prose_runaway": pr_abort.reason, "_raw_thinking": pr_abort.thinking}
                 break
             except ChatAbortedForReasoningLoop as loop_err:
-                # The owner 2026-09-20, 4 live occurrences in one night (bece829d8005,
+                # operator 2026-09-20, 4 live occurrences in one night (bece829d8005,
                 # d08795db97ee, 0971afaccfa9, ...): a single turn stuck re-deriving the
                 # same reasoning at temperature=0. A same-temperature retry of a frozen
                 # decode reproduces itself deterministically, so bump temperature before
@@ -8133,7 +8148,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         _dispatch_metrics["peak_total_tokens"] = max(_dispatch_metrics["peak_total_tokens"], usage.get("total_tokens") or 0)
         _dispatch_metrics["sum_completion_tokens"] += usage.get("completion_tokens") or 0
         usage_accumulate(_dispatch_metrics, usage, _call_elapsed)   # per-job usage sums (optional new fields; never raises)
-        # Added 2026-08-28 (the owner: "can we put tok/s ... on the dashboard?") -- the
+        # Added 2026-08-28 (the operator: "can we put tok/s ... on the dashboard?") -- the
         # queue-tool API parses this line out of the job's log file to show live
         # throughput. completion_tokens is generation only (excludes prompt
         # processing), matching how tok/s is normally reported for LLM inference.
@@ -8212,7 +8227,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 "the same reasoning once more this dispatch will be stopped."
             )
 
-        # Context-usage counterpart to request_more_iterations, added same day at the owner's
+        # Context-usage counterpart to request_more_iterations, added same day at the operator's
         # request ("can we do the same for context?"): a model can't self-report running low
         # on context the way it can ask for more iterations, since it doesn't see its own
         # token accounting -- so this is harness-driven instead, checked every turn against
@@ -8479,7 +8494,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # underlying failure (treating description as the deliverable),
             # so the trigger is now "no mutation has happened yet at all" (see
             # any_mutation_called above for why read-only tool calls don't count).
-            # Fable gap-fix 2026-08-29 (the owner: rv6-control-checklist-r1 "said done but is on
+            # Fable gap-fix 2026-08-29 (the operator: rv6-control-checklist-r1 "said done but is on
             # iteration 40/41"): the mutation-count nudge below fires when any_mutation_called
             # is False -- but that flag only counts write_file/edit_file, so a task whose
             # deliverable is written via a run_bash heredoc (the review-bench pattern: the model
@@ -8551,7 +8566,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # claims every time even with iteration budget to spare. A ONE-TIME nudge here
             # proved genuinely insufficient in practice -- confirmed live: a Tesla research
             # dispatch got nudged once at 1/3 required fetches, made exactly one more real
-            # fetch attempt, then gave up and was accepted at 1/3 anyway. The owner's standing
+            # fetch attempt, then gave up and was accepted at 1/3 anyway. the operator's standing
             # instruction: when Unraid research comes back incomplete, the mechanism should be
             # strengthened and retried, not just reported thin. Bounded to MAX_MIN_FETCH_NUDGES
             # (matching the file's other bounded-nudge conventions) instead of exactly one, so
@@ -8852,7 +8867,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
 
             if name == "request_more_iterations":
                 # Special-cased here rather than in tool_impls/build_tool_impls: it needs to
-                # stop the whole dispatch, not just return a tool result. The owner's call
+                # stop the whole dispatch, not just return a tool result. the operator's call
                 # 2026-08-28: this is a REVIEW GATE, not an auto-grant or a wait-with-timeout --
                 # no in-process polling at all. The request pauses the dispatch cleanly (same
                 # incremental-save mechanism that already makes every DID-NOT-CONVERGE stop
@@ -8964,7 +8979,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                           f"shape, reason about it from documentation/what you already know instead "
                           f"of making a live call.")
             elif name == "task_complete":
-                # Fable design 2026-08-29 (the owner: "how do we fix so we get it to converge?"),
+                # Fable design 2026-08-29 (the operator: "how do we fix so we get it to converge?"),
                 # built against real transcripts where coding-tuned models structurally
                 # avoided the old silence-only convergence signal (some never emitted a
                 # single content-only turn across 13-30 iterations) while also, separately,
@@ -9561,7 +9576,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         # the daemon's last-wins parse always points at the freshest transcript.
         log(f"[worker] CHECKPOINT TRANSCRIPT: {log_path}")
 
-        # Context-usage counterpart to request_more_iterations (the owner's request, "can we do
+        # Context-usage counterpart to request_more_iterations (the operator's request, "can we do
         # the same for context?"): a model can't self-report running low on context the way
         # it can ask for more iterations, since it doesn't see its own token accounting --
         # so this is harness-driven instead, checked against the objective usage the API
@@ -9971,7 +9986,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         log("[worker] No --verify command given. Output has NOT been verified -- "
             "build/test it before trusting it.")
 
-    # Accept-on-verify-pass despite no task_complete (2026-08-30, the owner: "we're still
+    # Accept-on-verify-pass despite no task_complete (2026-08-30, the operator: "we're still
     # choking these processes"). Root cause of a class of false NON-CONVERGENCE:
     # qwen3-coder reliably WRITES a correct deliverable and verifies it by running it
     # via run_bash, but often never emits the task_complete tool call to SIGNAL done --
@@ -9998,7 +10013,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                           baseline_no_regression=_baseline_no_regression,
                           dispatch_tag=dispatch_tag, host=host, task_kind=task_kind)
 
-    # This log USED to be success-only by design (the owner's call): a crashed or
+    # This log USED to be success-only by design (the operator's call): a crashed or
     # non-converged run's token counts aren't a clean signal for "how much
     # context does a task like this actually need", and would pollute the
     # threshold analysis the log exists for.
@@ -10474,7 +10489,7 @@ def main():
     # CRASH PATH. write_dispatch_metrics' docstring has always claimed it is
     # "called both from run_task's normal completion path and from main()'s
     # crash handler, so a context-exhaustion crash -- the exact failure mode
-    # this log exists to eventually let the owner threshold against -- still gets a
+    # this log exists to eventually let the operator threshold against -- still gets a
     # real entry instead of silently vanishing." There was no crash handler.
     # The claim was aspirational, and the crashes it names were exactly the
     # rows missing from the file. Now it is true.

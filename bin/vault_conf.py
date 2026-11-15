@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared vault endpoint/token resolution for the owner's vault callers (stdlib only).
+"""Shared vault endpoint/token resolution for the operator's vault callers (stdlib only).
 
 The vault is Basic Memory behind vault-shim, which serves a small REST API on :27123 with a
 bearer token, so callers only need a base URL and a token source.
@@ -15,6 +15,11 @@ this module never logs it; the only CLI mode that emits it is `auth` (stdout, fo
   vault_conf.py --self-test
 """
 import os
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import sys
 from pathlib import Path
 
@@ -22,7 +27,7 @@ CONF_PATH = Path.home() / ".config" / "vault" / "env"
 # The live shim token's file. Its name predates the shim; renaming it means moving every reader
 # (other repos and hosts included) in the same change, so it keeps the old name until then.
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "ollama-worker" / "obsidian-token"
-DEFAULT_URL = "http://192.0.2.240:27123"
+DEFAULT_URL = queue_config.get_str("vault.url", "", env="VAULT_URL")
 
 
 def read_env_file(path=None) -> dict:

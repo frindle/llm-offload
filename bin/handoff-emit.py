@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ollama job handoff: what's in flight, and what's finished but not acted on.
 
-The owner's model is WORKFLOW STATE, not gate verdict:
+the operator's model is WORKFLOW STATE, not gate verdict:
 
     pending/   jobs still in flight (queued or running)
     complete/  jobs the MODEL finished that WE have not acted on yet --
@@ -33,6 +33,11 @@ Usage:
   handoff-emit.py --acted <id> [...] # mark acted on -> drops out of complete/
   handoff-emit.py --unact <id> [...] # undo that
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse, json, re, subprocess, sys, time
 import os
 import fcntl
@@ -40,18 +45,15 @@ import contextlib
 from pathlib import Path
 
 BIN = Path.home() / "bin"
-LOGS = BIN / "ollama-queue-logs"
-STATE = BIN / "ollama-queue-state.json"
+LOGS = queue_config.state_dir() / "ollama-queue-logs"
+STATE = queue_config.state_dir() / "ollama-queue-state.json"
 # HANDOFF_DIR overrides this. The path was hardcoded, so consolidating the
 # GitHub Projects folder on 2026-09-02 silently split the tool from its data:
 # the next run would have RECREATED an empty dir at the old location and written
 # there, while 100 acted entries sat in the real one. Nothing would have errored
 # -- it would just have quietly kept two records. Same shape as every other
 # "reads as fine while pointing at the wrong artifact" bug in this harness.
-OUT = Path(os.environ.get(
-    "HANDOFF_DIR",
-    Path.home() / "Desktop" / "GitHub Projects" / "ollama" / "ollama-handoff")
-).expanduser()
+OUT = queue_config.handoff_dir()     # $HANDOFF_DIR, then paths.handoff_dir, then ~/Desktop/GitHub Projects/ollama/ollama-handoff
 ACTED = OUT / "acted.json"
 MANIFEST = OUT / ".manifest.json"
 
@@ -337,7 +339,7 @@ def _report_verdict(job_id, kind):
 
 
 def final_verdict(job_id, g, job=None):
-    """Authoritative FINAL gate verdict (the owner: "the final pass or the final fail").
+    """Authoritative FINAL gate verdict (the operator: "the final pass or the final fail").
 
     The regate (Studio 27B) is the final authority when it ran, so its report
     wins over the pre-gate. We surface the reviewer's narrative `## VERDICT:`
@@ -480,7 +482,7 @@ def load_jobs():
 
 
 def needs_answer(job):
-    """The question of a mini-swe job parked on a NEEDS.md ask (paused, pause_reason needs_info), else None. The owner answers with `mini-answer`."""
+    """The question of a mini-swe job parked on a NEEDS.md ask (paused, pause_reason needs_info), else None. The operator answers with `mini-answer`."""
     if (job.get("status") or "").lower() == "paused" and job.get("pause_reason") == "needs_info":
         return str((job.get("pause_meta") or {}).get("question") or "(question unavailable)")
     return None
@@ -619,7 +621,7 @@ def signoff_blocks_acting(jid, label):
     """
     if _label_is_eval(label):
         return None
-    so = _load(Path(__file__).parent / "signoff.json", {}).get(jid) or {}
+    so = _load(queue_config.state_dir() / "signoff.json", {}).get(jid) or {}
     if so.get("required") and so.get("verdict") != "approve":
         return (f"{jid} ({label or '?'}) REQUIRES sign-off from "
                 f"{so.get('reviewer') or 'a reviewer'} and none is recorded "
@@ -778,7 +780,7 @@ def collect(acted):
     permanent acted-on mark. Reads never mutate.
     """
     pending, complete = [], []
-    signoffs = _load(Path(__file__).parent / "signoff.json", {})
+    signoffs = _load(queue_config.state_dir() / "signoff.json", {})
     
     for j in sorted(load_jobs(),
                     key=lambda x: (x.get("enqueued_at") or "", x.get("_mtime", 0)),
@@ -864,7 +866,7 @@ def rebuild(only_id=None):
         sub = "pending" if is_pending(j) else "complete"
         rel = f"{sub}/{page_name(j)}"
         # Check sign-off status for the complete bucket
-        signoffs = _load(Path(__file__).parent / "signoff.json", {})
+        signoffs = _load(queue_config.state_dir() / "signoff.json", {})
         awaiting_signoff = False
         if (signoffs.get(jid, {}).get("required", False) and 
             signoffs.get(jid, {}).get("verdict") != "approve"):

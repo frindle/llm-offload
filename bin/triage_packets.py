@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_packets -- read-only TRIAGE HANDOFF over the failure ledger (the owner 2026-10-06).
+"""triage_packets -- read-only TRIAGE HANDOFF over the failure ledger (operator 2026-10-06).
 
 NOT a headless model run. The ledger sweep writes ONE packet per distinct unresolved failure
 SIGNATURE under ~/.ollama-dispatch/triage/<slug>.md plus index.json; a human-driven Opus/Claude

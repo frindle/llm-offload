@@ -1,0 +1,20 @@
+[
+  {"container": "arr-webhook", "match": "Seed floor.*removal deferred", "action": "routine",
+   "why": "plex-automation: expected while a torrent is under its seed floor"},
+  {"container": "arr-webhook", "match": "\\[seed-tracking\\] skipping stalled candidate", "action": "routine",
+   "why": "plex-automation: expected"},
+  {"container": "arr-webhook", "match": "status fetch failed.*keeping provided info", "action": "routine",
+   "why": "plex-automation: single Deluge blips, handled"},
+  {"container": "arr-webhook", "match": "Library-seed guard.*keeping files", "action": "routine",
+   "why": "plex-automation: guard working as designed"},
+  {"container": "arr-webhook", "match": "Queue lane reorder failed", "action": "routine",
+   "why": "plex-automation: Deluge 45 s timeout on bulk reads, retried"},
+  {"container": "arr-webhook", "match": "late-gate|\\bchain\\b.*\\bpending\\b", "action": "routine",
+   "why": "plex-automation: LLM chain progress lines"},
+  {"container": "arr-webhook", "match": "Upgrade lane cap: dropped|Seed retirement: \\d+ retired", "action": "routine",
+   "why": "plex-automation: expected daily"},
+  {"container": "sonarr", "match": "HealthCheck|Unable to parse media info|No available indexers|Indexers? .*unavailable|Download clients? .*unavailable|root folder|IndexerStatusCheck|DownloadClientCheck|RootFolderCheck|IndexerRssCheck|IndexerSearchCheck", "action": "skip",
+   "why": "already alerted by plex-automation arr_health.py"},
+  {"container": "radarr", "match": "HealthCheck|Unable to parse media info|No available indexers|Indexers? .*unavailable|Download clients? .*unavailable|root folder|IndexerStatusCheck|DownloadClientCheck|RootFolderCheck|IndexerRssCheck|IndexerSearchCheck", "action": "skip",
+   "why": "already alerted by plex-automation arr_health.py"}
+]

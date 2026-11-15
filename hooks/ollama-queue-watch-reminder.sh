@@ -19,7 +19,7 @@ if [ -n "${CLAUDE_HEADLESS_DIAGNOSIS:-}" ]; then exit 0; fi
 
 ARM_MSG='OLLAMA QUEUE WATCHER: this session has queue jobs in flight. Unless a watcher is already running in this session, arm the Monitor tool (timeout_ms 1800000, description "queue events for this session") with command:
 python3 ~/bin/queue-events-deliver.py --watch
-It prints one line per passed/done/failed/blocked/needs_info/gate_nonpass event for jobs THIS session launched (plus orphaned/unstamped ones nobody has seen), and exits by itself ~3 min after none of your jobs is in flight. On a 30-min expiry re-arm only if `python3 ~/bin/queue-events-deliver.py --inflight` prints a number above 0. On a failed row: triage, then run `python3 ~/bin/ollama-queue.py resolve <id>` and `curl -s -X POST http://127.0.0.1:7684/api/runs/<id>/clear` in the same step.'
+It prints one line per passed/done/failed/blocked/needs_info/gate_nonpass event for jobs THIS session launched (plus orphaned/unstamped ones nobody has seen), and exits by itself ~3 min after none of your jobs is in flight. On a 30-min expiry re-arm only if `python3 ~/bin/queue-events-deliver.py --inflight` prints a number above 0. On a failed row: triage, then run `python3 ~/bin/ollama-queue.py resolve <id>` and `python3 ~/bin/ollama-queue.py clear-card <id>` in the same step.'
 
 emit() {
   jq -Rn --arg ev "$1" --arg msg "$ARM_MSG" '{

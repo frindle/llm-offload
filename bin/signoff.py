@@ -46,6 +46,11 @@ something the human sent back. Go live only after that number has stayed at
 zero over real dispatches. A missing mode key means shadow: the failure mode
 to design against is a config typo silently going live.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import fnmatch
 import argparse, json, os, sys, time
 from pathlib import Path
@@ -68,14 +73,15 @@ def signoff_file():
     if "SIGNOFF_DIR" in os.environ:
         return Path(os.environ["SIGNOFF_DIR"]) / "signoff.json"
     else:
-        return Path(__file__).parent / "signoff.json"
+        return queue_config.state_dir() / "signoff.json"
 
 
 def rules_file():
     """signoff-rules.json, overridable for tests via SIGNOFF_RULES."""
     if "SIGNOFF_RULES" in os.environ:
         return Path(os.environ["SIGNOFF_RULES"])
-    return Path(__file__).parent / "signoff-rules.json"
+    _state_rules = queue_config.state_dir() / "signoff-rules.json"
+    return _state_rules if _state_rules.exists() else Path(__file__).parent / "signoff-rules.json"
 
 
 def load_rules():
@@ -87,7 +93,7 @@ def ledger_dir():
     same env var and default as the gate; two spellings of one path drift."""
     return Path(os.environ.get(
         "OLLAMA_PREFLIGHT_LEDGER",
-        Path.home() / "bin" / "ollama-queue-logs" / "preflight-ledger"))
+        queue_config.state_dir() / "ollama-queue-logs" / "preflight-ledger"))
 
 
 def ledger_entry_for(job_cwd):
@@ -410,7 +416,7 @@ def check_requires_signoff(task_content, diff_files_list):
     basenames = set(rules.get("basenames", []))
     bglobs = rules.get("basename_globs") or []
     pglobs = rules.get("path_globs") or []
-    reviewer = rules.get("default_reviewer", "owner")  # NOT "fable": a
+    reviewer = rules.get("default_reviewer", queue_config.operator_handle())  # NOT "fable": a
         # hardcoded fallback silently reinstates a retired signer if the
         # key is ever missing or renamed, which is the same "reads as
         # configured when it is not" failure as an inert policy rule.

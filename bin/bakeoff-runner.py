@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Queue runner wrapper for the v10-bulk bake-off (the owner 2026-09-09: ALL GPU work,
+"""Queue runner wrapper for the v10-bulk bake-off (operator 2026-09-09: ALL GPU work,
 bake-offs included, must run THROUGH ollama-queue -- no standalone nohup).
 
 The queue's --runner contract calls: `python3 <runner> --model --host --num-ctx
@@ -19,8 +19,14 @@ Override with $BAKEOFF_ROSTER_ONLY if a future enqueue wants a different scope.
 """
 import argparse, json, os, re, signal, subprocess, sys
 from pathlib import Path
-
-DRIVER = "/Users/user/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-macstudio.sh"
+import urllib.parse
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
+DRIVER = queue_config.get_str("bakeoff.driver", str(Path.home() / "Desktop" / "GitHub Projects" / "bakeoff" / "bakeoff-v10-bulk-macstudio.sh"), env="BAKEOFF_DRIVER")
 
 # --- UNRAID OVERFLOW LANE (2026-10-01) ---------------------------------------
 # Bake-offs are NON-PRODUCTION candidate-model evals: nothing downstream depends
@@ -56,6 +62,8 @@ def resolve_host(host: str) -> str:
     if h.startswith("http://") or h.startswith("https://"):
         return h.rstrip("/")
     if h.lower() in ("local", "studio", "studio-db", "localhost"):
+        if queue_config.in_container():
+            return queue_config.studio_url("")  # the container is not the studio host: configured URL or nothing
         return LOCAL_URLS[0]
     try:
         tbl = json.loads(HOSTS_JSON.read_text())
@@ -119,6 +127,13 @@ def parse_max_s(task_text: str, env_val=None) -> int:
 def _self_test() -> int:
     """Unit-test the lane resolution + the mismatch guard. No GPU, no network."""
     ok = True
+    global HOSTS_JSON
+    import tempfile
+    _UNRAID_URL = "http://192.0.2.10:11434"
+    _tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    _tmp.write(json.dumps({"hosts": {"unraid": {"url": _UNRAID_URL}}}))
+    _tmp.close()
+    HOSTS_JSON = Path(_tmp.name)
 
     def check(name, got, want):
         nonlocal ok
@@ -129,7 +144,7 @@ def _self_test() -> int:
             print(f"FAIL {name}: got {got!r} want {want!r}")
 
     check("lane 'unraid' resolves to the shared host table's url",
-          resolve_host("unraid"), "http://198.51.100.145:11434")
+          resolve_host("unraid"), _UNRAID_URL)
     check("the studio lanes resolve to local", resolve_host("studio-db"), LOCAL_URLS[0])
     check("a url passes through", resolve_host("http://x:1/"), "http://x:1")
     check("no --host -> the driver owns the host (unchanged behaviour)",
@@ -143,7 +158,7 @@ def _self_test() -> int:
     # THE GUARD BITES: unraid lane + a localhost-pinned driver must abort.
     _why = host_mismatch("unraid", _pinned)
     check("unraid lane + localhost-pinned driver -> ABORT (names both hosts and the fix)",
-          (bool(_why), "198.51.100.145" in _why, "BAKEOFF_HOST" in _why), (True, True, True))
+          (bool(_why), urllib.parse.urlsplit(_UNRAID_URL).hostname in _why, "BAKEOFF_HOST" in _why), (True, True, True))
     # REVERT-STYLE: the same driver on the lane it actually pins is fine, and the
     # deferring driver is fine on ANY lane -- so the guard is discriminating, not
     # a blanket refusal.

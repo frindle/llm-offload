@@ -22,6 +22,11 @@ unrelated live work), children first, SIGTERM then SIGKILL.
 Default is a DRY RUN that prints what it would kill. Exit 0 always (it is a
 janitor); --json for machine output.
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import json
 import os
@@ -178,11 +183,11 @@ def reap(apply=False, worktrees=WORKTREES, min_age=MIN_AGE_S, log=print):
     return report
 
 
-LOG = Path.home() / "bin" / "ollama-queue-logs" / "verify-orphan-reap.jsonl"
+LOG = queue_config.state_dir() / "ollama-queue-logs" / "verify-orphan-reap.jsonl"
 
 
 def record_and_alert(report, applied, log_path=LOG, notifier=None):
-    """Append one JSONL line per tick that found something; alert the owner ONCE per
+    """Append one JSONL line per tick that found something; alert the operator ONCE per
     tick that actually killed something (dedupe per root pid set)."""
     if not report:
         return None
@@ -197,8 +202,8 @@ def record_and_alert(report, applied, log_path=LOG, notifier=None):
         return None
     if notifier is None:
         import importlib.util as _ilu
-        _s = _ilu.spec_from_file_location("notify_owner",
-                                          Path(__file__).resolve().parent / "notify-owner.py")
+        _s = _ilu.spec_from_file_location("notify_operator",
+                                          Path(__file__).resolve().parent / "notify-operator.py")
         _m = _ilu.module_from_spec(_s)
         _s.loader.exec_module(_m)
         notifier = _m.notify

@@ -49,6 +49,11 @@ Every action (and refusal) is appended to ~/.ollama-dispatch/decisions.jsonl, wh
   qctl runs-clear [--apply ID...]    run-status retention: preview (default) or clear
                                      ONLY the named ids (same predicate as auto-retention)
 """
+import os as _qc_os, sys as _qc_sys
+_qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
+if _qc_dir not in _qc_sys.path:
+    _qc_sys.path.append(_qc_dir)
+import queue_config
 import argparse
 import datetime
 import importlib.util
@@ -63,13 +68,14 @@ import urllib.request
 from pathlib import Path
 
 BIN = Path(os.environ.get("QCTL_BIN") or Path(__file__).resolve().parent)
+STATE_DIR = Path(os.environ.get("QCTL_BIN") or queue_config.state_dir())  # the override still wins (tests); else the queue state dir
 DISPATCH = Path(os.environ.get("QCTL_DISPATCH") or Path.home() / ".ollama-dispatch")
 SLICE_RUNS = DISPATCH / "slice-runs"
 LEDGER = DISPATCH / "escalations" / "ESCALATIONS.md"
 DECISIONS = DISPATCH / "decisions.jsonl"
-QUEUE_LOGS = Path(os.environ.get("QCTL_QUEUE_LOGS") or BIN / "ollama-queue-logs")
-QUEUE_STATE = Path(os.environ.get("QCTL_QUEUE_STATE") or BIN / "ollama-queue-state.json")
-API = os.environ.get("QCTL_API", "http://127.0.0.1:7684")
+QUEUE_LOGS = Path(os.environ.get("QCTL_QUEUE_LOGS") or STATE_DIR / "ollama-queue-logs")
+QUEUE_STATE = Path(os.environ.get("QCTL_QUEUE_STATE") or STATE_DIR / "ollama-queue-state.json")
+API = os.environ.get("QCTL_API") or queue_config.queue_api()[0]
 DASHBOARD_URL = API          # dashboard / run-status store base URL (qctl close)
 
 LIVE_JOB = ("running", "pending", "held", "planned", "paused", "launching")
@@ -187,7 +193,7 @@ def recent_decisions(bundle=None, n=8, path=None):
 def _api(method, path, body=None, timeout=10, base=None):
     req = urllib.request.Request((base or API) + path, method=method,
                                  data=None if body is None else json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **queue_config.queue_api_headers()})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"null")
@@ -875,6 +881,11 @@ def cmd_bundle(a):
 
 
 def main(argv=None):
+    if queue_config.queue_is_remote() and "1" not in (os.environ.get("QCTL_FORCE_LOCAL"),
+                                                       os.environ.get("OLLAMA_QUEUE_FORCE_LOCAL")):
+        # The queue's files are on another machine: run this verb there (POST /api/cli) and exit with its rc.
+        import queue_remote_cli
+        queue_remote_cli.passthrough("qctl", sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(prog="qctl", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="\n".join(__doc__.split("\n")[-9:]))

@@ -168,6 +168,58 @@ def t_leak():
     return all("KEY-abc123" not in json.dumps(o) for o in outs), outs
 check("key never in call_model results", t_leak)
 
+def t_endpoint():
+    import types
+    seen = []
+    fake = types.ModuleType("queue_config")
+    fake.darkbloom_endpoint = lambda: ("http://db.example:9000", "FAKE-KEY")
+    old = sys.modules.get("queue_config"); sys.modules["queue_config"] = fake
+    try:
+        out = dc.call_model({"messages": []}, http_func=lambda u, hd, b, t: (seen.append((u, hd["Authorization"])),
+                                                                         (200, b'{"choices":[{"message":{"content":"hi"}}]}'))[1])
+    finally:
+        if old is None: sys.modules.pop("queue_config", None)
+        else: sys.modules["queue_config"] = old
+    return seen == [("http://db.example:9000/v1/chat/completions", "Bearer FAKE-KEY")] and out.get("text") == "hi", (seen, out)
+check("call_model uses queue_config.darkbloom_endpoint() when importable", t_endpoint)
+
+def t_endpoint_v1():
+    import types
+    seen = []
+    fake = types.ModuleType("queue_config")
+    fake.darkbloom_endpoint = lambda: ("http://127.0.0.1:8000/v1", "FAKE-KEY")
+    old = sys.modules.get("queue_config"); sys.modules["queue_config"] = fake
+    try:
+        dc.call_model({"messages": []}, http_func=lambda u, hd, b, t: (seen.append(u),
+                                                                    (200, b'{"choices":[{"message":{"content":"hi"}}]}'))[1])
+    finally:
+        if old is None: sys.modules.pop("queue_config", None)
+        else: sys.modules["queue_config"] = old
+    return seen == ["http://127.0.0.1:8000/v1/chat/completions"], seen
+check("a base_url ending in /v1 (local.json on the Mac) is not doubled", t_endpoint_v1)
+
+def t_endpoint_fallback():
+    # queue_config not importable: the base comes from Darkbloom's local.json (it follows the bind address)
+    res = []
+    for lj, want in (({"api_key": "FAKE-KEY", "base_url": "http://192.0.2.5:8000/v1"}, "http://192.0.2.5:8000/v1/chat/completions"),
+                     ({"api_key": "FAKE-KEY"}, "http://127.0.0.1:8000/v1/chat/completions"),
+                     ({"api_key": "FAKE-KEY", "base_url": "file:///etc/passwd"}, "http://127.0.0.1:8000/v1/chat/completions")):
+        h = tempfile.mkdtemp(); os.makedirs(h + "/.darkbloom")
+        json.dump(lj, open(h + "/.darkbloom/local.json", "w"))
+        seen = []
+        old_home, old_mod = os.environ.get("HOME"), sys.modules.get("queue_config", "absent")
+        os.environ["HOME"] = h; sys.modules["queue_config"] = None   # import_module raises ImportError
+        try:
+            dc.call_model({"messages": []}, http_func=lambda u, hd, b, t: (seen.append(u),
+                                                                        (200, b'{"choices":[{"message":{"content":"hi"}}]}'))[1])
+        finally:
+            os.environ["HOME"] = old_home
+            if old_mod == "absent": sys.modules.pop("queue_config", None)
+            else: sys.modules["queue_config"] = old_mod
+        res.append(seen == [want])
+    return all(res), res
+check("without queue_config, call_model follows local.json's base_url (http(s) only, else loopback)", t_endpoint_fallback)
+
 # --- routes ---
 def t_routes():
     os.environ["DASHBOARD_CHAT_HOME"] = tmp()

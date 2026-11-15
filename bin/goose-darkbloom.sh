@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch the Unraid-hosted Goose chat front end.
 #
-# The owner 2026-10-01 (supersedes the chat-through-the-queue build; see
+# operator 2026-10-01 (supersedes the chat-through-the-queue build; see
 # goose-darkbloom.sh.bak-unraidchat):
 #   CHAT  -> Unraid Ollama, hard-bound, model kept warm, num_ctx pinned to the pregate's
 #            confirmed-safe value. Never queues behind Studio work.
@@ -9,7 +9,7 @@
 #            `queue_dispatch` tool in ~/bin/goose-queue-mcp.py. Every investigation /
 #            code change / research task is still a studio-db dashboard row.
 #
-#   goose -> ~/bin/goose-queue-proxy.py (127.0.0.1:8011) -> http://198.51.100.145:11434/api/chat
+#   goose -> ~/bin/goose-queue-proxy.py (127.0.0.1:8011) -> <ollama.unraid_url>/api/chat
 #         \-> ~/bin/goose-queue-mcp.py (stdio MCP) -> ollama-queue.py enqueue -> studio-db
 #
 # The name is kept for muscle memory and so nothing that calls it breaks. This script

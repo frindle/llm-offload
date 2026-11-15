@@ -28,7 +28,7 @@ def chk(name, got, want):
 
 
 def run(tmp, *args):
-    env = dict(os.environ, HANDOFF_DIR=str(tmp / "ho"))
+    env = dict(os.environ, HANDOFF_DIR=str(tmp / "ho"), QUEUE_STATE_DIR=str(tmp))
     p = subprocess.run([sys.executable, str(tmp / "handoff-emit.py"), *args],
                        capture_output=True, text=True, env=env)
     acted = json.loads((tmp / "ho" / "acted.json").read_text()) if (tmp / "ho" / "acted.json").exists() else {}
@@ -39,6 +39,7 @@ def main(src):
     tmp = Path(tempfile.mkdtemp(prefix="horeason-"))
     (tmp / "ho").mkdir()
     shutil.copy(src, tmp / "handoff-emit.py")
+    shutil.copy(Path(src).parent / "queue_config.py", tmp / "queue_config.py")
     # signoff.json is read from the script's own directory.
     (tmp / "signoff.json").write_text(json.dumps({
         "fffffff00002": {"required": True, "reviewer": "owner", "verdict": None,
