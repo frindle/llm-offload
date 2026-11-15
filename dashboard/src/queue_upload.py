@@ -370,6 +370,44 @@ def new_run_dir(root, label):
 
 # ---- results ----------------------------------------------------------------------------------------------------
 
+def _done_path(state_dir, jid):
+    """<state_dir>/ollama-queue-logs/<id>.done.json, or its archive/ copy (clearing a run card moves it there), when it
+    exists and is small enough to ship. None otherwise."""
+    jid = str(jid or "")
+    if not state_dir or not re.fullmatch(r"[0-9a-f]{6,64}", jid):
+        return None
+    ld = Path(state_dir) / "ollama-queue-logs"
+    for p in (ld / (jid + ".done.json"), ld / "archive" / (jid + ".done.json")):
+        try:
+            if p.is_file() and p.stat().st_size <= 4 * 1024 * 1024:
+                return p
+        except OSError:
+            pass
+    return None
+
+
+def pruned_job(job_id, state_dir):
+    """The row of a FINISHED job the queue has already pruned from its state (a done row leaves on the next tick, so a
+    client that polls /api/runs never sees it there), rebuilt from the never-pruned <id>.done.json or its archive/ copy,
+    with log_path = the run log <id>-<label>.log when it exists. None when there is no record or the record names a
+    different job. Never raises. (2026-11-15: the Mac's review tools got 404 for every job finished on Unraid.)"""
+    try:
+        p = _done_path(state_dir, job_id)
+        if p is None:
+            return None
+        rec = json.loads(p.read_text())
+        if not isinstance(rec, dict) or str(rec.get("id") or job_id) != str(job_id):
+            return None
+        job = dict(rec, id=str(job_id))
+        job.pop("log_path", None)
+        for lp in sorted((Path(state_dir) / "ollama-queue-logs").glob(str(job_id) + "-*.log")):
+            job["log_path"] = str(lp)
+            break
+        return job
+    except (OSError, ValueError):
+        return None
+
+
 def _tail(path, n):
     try:
         with open(path, "rb") as f:
@@ -403,10 +441,9 @@ def build_result(job, dest_tar, state_dir, mini_root, cap=RESULT_MAX_MB * 1024 *
 
         add_bytes("job.json", json.dumps(job, indent=1, default=str).encode())
         jid = str(job.get("id") or "")
-        if re.fullmatch(r"[0-9a-f]{6,64}", jid):
-            done = state_dir / "ollama-queue-logs" / (jid + ".done.json")
-            if done.is_file() and done.stat().st_size <= 4 * 1024 * 1024:
-                add_bytes("done.json", done.read_bytes())
+        done = _done_path(state_dir, jid)
+        if done is not None:
+            add_bytes("done.json", done.read_bytes())
         lp = job.get("log_path")
         if lp and _inside(state_dir, lp):
             t = _tail(lp, LOG_TAIL_BYTES)
@@ -450,8 +487,8 @@ def build_run_tar(job, dest_tar, mini_root, state_dir=None, cap=RESULT_MAX_MB * 
         import io
         jid = str(job.get("id") or "")
         recs = [("_queue/job.json", json.dumps(job, indent=1, default=str).encode())]
-        done = Path(state_dir) / "ollama-queue-logs" / (jid + ".done.json") if state_dir and re.fullmatch(r"[0-9a-f]{6,64}", jid) else None
-        if done is not None and done.is_file() and done.stat().st_size <= 4 * 1024 * 1024:
+        done = _done_path(state_dir, jid)
+        if done is not None:
             recs.append(("_queue/done.json", done.read_bytes()))
         lp = job.get("log_path")
         if state_dir and lp and _inside(state_dir, lp):

@@ -28,6 +28,7 @@ import mini_finish_remote as MFR
 HERE = Path(os.path.realpath(__file__)).parent
 RUNNER_NAME = "mini-swe-runner.py"
 MARK = "- validated on the queue: job "
+VANISH_GRACE_S = 120   # a job id the queue answered but never listed within this long is treated as gone
 FILL_KEYS = ("red_ok", "baseline_green", "fn_scope", "target_fn", "fix_steps", "fix_wall")
 
 
@@ -87,16 +88,18 @@ def snapshot(spec_path):
     return text, mod.fingerprint(spec_path, json.loads(text), mod.load_runner())
 
 
-def remote_validate(spec_path, model, label, say=print, timeout=7200):
+def remote_validate(spec_path, model, label, say=print, timeout=7200, host="auto"):
     """Run the validate job. Returns (ok, jid, output): ok only when the queue ran V1-V8, C5 and C6 green and VALIDATION.md was
-    written next to the spec. On failure output holds the reason / the job's log tail. Never raises for a queue problem."""
+    written next to the spec. On failure output holds the reason / the job's log tail. Never raises for a queue problem.
+    host is the submit's own --host, so the validate job waits in the same lane as the job it checks (host auto routed an
+    Unraid-only model to the Darkbloom lane, 2026-11-15)."""
     spec_path = Path(spec_path)
     jid = ""
     try:
         spec = json.loads(spec_path.read_text())
         QR.check_paths(spec, spec_path.parent)
         before = snapshot(spec_path)
-        job = {"host": "auto", "task_kind": "coding", "model": str(model or "check"),
+        job = {"host": str(host or "auto"), "task_kind": "coding", "model": str(model or "check"),
                "label": ("%s-val-%s" % (label, time.strftime("%H%M%S")))[:60], "allow_duplicate_label": True}
         base, _tok = queue_config.queue_api()
         headers = queue_config.queue_api_headers()
@@ -108,12 +111,17 @@ def remote_validate(spec_path, model, label, say=print, timeout=7200):
             if not MFR._JID.match(jid):
                 raise QR.RemoteError("the queue answered a validate job id %r that is not a plain job id" % jid[:40])
             say("mini-validate: validate job %s queued on %s (%s); waiting for it" % (jid, base, job["label"]))
-            row, end = None, time.time() + timeout
+            row, end, seen, start = None, time.time() + timeout, False, time.time()
             poll = float(os.environ.get("MINI_FINISH_POLL") or 5)
             while True:
                 row = next((j for j in MFR.queue_jobs() if str(j.get("id")) == jid), None)
                 if row is not None and row.get("status") not in MFR.LIVE:
                     break
+                # a cancelled job leaves the queue state at once: without this the submit waited out the whole timeout
+                if row is None and (seen or time.time() - start >= VANISH_GRACE_S):
+                    return False, jid, ("the validate job %s left the queue without finishing (cancelled?); validate again"
+                                        % jid)
+                seen = seen or row is not None
                 if time.time() >= end:
                     return False, jid, "the validate job %s did not finish within %ss" % (jid, timeout)
                 time.sleep(poll)

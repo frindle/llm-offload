@@ -2601,7 +2601,7 @@ def heal_continuation_live(j, by_id):
 
 def _bundle_commit_status_core(key, jobs, pk, plan=None, chain=None, settling=None,
                          final_verdict=None, esc_state=None, cpu_wait=None, next_step=None, now=None,
-                         kick_stalled=None, driverless_since=None, exhausted_yield=None):
+                         kick_stalled=None, driverless_since=None, exhausted_yield=None, infra_wait=None):
     """PURE given `plan` (slice_plan_runnability) / `chain` (chain_run_progress).
     ("working" | "blocked" | "complete", why, moving: bool). `moving` = something is
     running/launchable or a driver is live right now (the idle clock's reset).
@@ -2637,7 +2637,13 @@ def _bundle_commit_status_core(key, jobs, pk, plan=None, chain=None, settling=No
     SLICER_GAP_YIELD_S that is the same CPU/driver gap as a live driver's: "waiting", holds no GPU lane
     (parked cpu_wait, resumes FIRST when a row appears). `exhausted_yield` = truthy when the bundle's
     focus was released EXHAUSTED and another bundle has work: with nothing moving it yields at once
-    (the commit path must honour the release instead of re-holding the lane it just freed)."""
+    (the commit path must honour the release instead of re-holding the lane it just freed).
+    `infra_wait(job)` (INFRA-WAIT LANE HOLD FIX, 2026-11-15) -> the row's CURRENT infra wait note or None:
+    a bundle whose live rows are ALL pending rows in an INFRA WAIT (a Darkbloom sandbox hold, Darkbloom
+    not serving, a held path), with nothing running and no live driver, is "waiting": it holds no GPU
+    lane (parked cpu_wait, silent) and resumes FIRST when the wait clears. Before, any pending row read
+    as moving, so the H4 lease renewed every tick and one Darkbloom row in a sandbox hold held every
+    other lane (smoke-darkbloom-clamp-val 2026-11-15: 18 min, QUEUE-IDLE). Absent -> unchanged."""
     if key is None:
         return "complete", "no bundle", False
     plan = plan or {}
@@ -2668,6 +2674,20 @@ def _bundle_commit_status_core(key, jobs, pk, plan=None, chain=None, settling=No
     if plan.get("cancelled") and not live:
         return "complete", f"plan CANCELLED by a human ({plan['cancelled'].get('at')})", False
     if live:
+        if infra_wait is not None and not moving and all(j.get("status") == "pending" for j in live):
+            _notes = []
+            for j in live:
+                try:
+                    _n = infra_wait(j)
+                except Exception:
+                    _n = None
+                if not _n:
+                    break
+                _notes.append(_n)
+            if len(_notes) == len(live):
+                _short = str((_notes[0] or {}).get("short") or "infra wait")[:120]
+                return "waiting", (f"{len(live)} row(s) in an INFRA WAIT ({_short}) -- nothing can launch, "
+                                   f"holds no GPU lane"), False
         return "working", f"{len(live)} live row(s)", \
             any(j.get("status") == "pending" for j in live) or moving
     # CPU-ONLY CHAIN STAGE (2026-10-09): nothing running, nothing live, and the only activity is the
@@ -3466,6 +3486,60 @@ def wait_note(code, short, sentence=None, waiting_on=None):
             "waiting_on": waiting_on or {"kind": code, "detail": short}}
 
 
+INFRA_WAIT_CODES = ("darkbloom-sandbox", "infra-darkbloom", "infra-path-access")
+
+
+def infra_seen_update(seen, job_wait, jobs):
+    """PURE (mutates and returns `seen`). {job id: note} of the latest INFRA WAIT the launch loop recorded
+    for each pending row. A row the loop gave a non-infra reason this tick keeps its entry (the loop may
+    have skipped it before reaching the infra checks, e.g. focus); a row no longer pending is dropped.
+    Readers re-check the entry (infra_wait_recheck) before trusting it."""
+    for jid, note in (job_wait or {}).items():
+        if isinstance(note, dict) and note.get("code") in INFRA_WAIT_CODES \
+                and (note.get("waiting_on") or {}).get("kind") == "infra":
+            seen[jid] = note
+    pending = {j.get("id") for j in (jobs or ()) if j.get("status") == "pending"}
+    for jid in list(seen):
+        if jid not in pending:
+            seen.pop(jid, None)
+    return seen
+
+
+def infra_wait_recheck(job, note, now=None):
+    """The row's CURRENT infra wait note, or None once it cleared, for a row whose last recorded wait was
+    `note`. Cache-only, the same checks the launch loop makes (callers hold the state lock). Any error
+    -> None: fail toward the old behaviour (the row counts as live work)."""
+    code = (note or {}).get("code")
+    now = time.time() if now is None else now
+    try:
+        if code in ("darkbloom-sandbox", "infra-darkbloom"):
+            if _darkbloom_url() is None:
+                return None
+            return darkbloom_launch_wait(_darkbloom_model(job.get("model")), now)
+        if code == "infra-path-access":
+            return path_access_wait(job, now)
+    except Exception as e:
+        print(f"[queue] infra_wait_recheck {job.get('id')}: {e!r} (counted as live work)", file=sys.stderr)
+    return None
+
+
+def idle_alert_pending(jobs, infra_wait=None):
+    """PURE given `infra_wait`. The pending rows that count toward the QUEUE-IDLE alert: a row in an INFRA
+    WAIT (a Darkbloom sandbox hold, Darkbloom switching/not serving, a held path) is the provider or the
+    Mac doing its own thing; its reason is already in the wait state, and it is not paged (2026-11-15)."""
+    out = []
+    for j in jobs or ():
+        if j.get("status") != "pending":
+            continue
+        try:
+            if infra_wait is not None and infra_wait(j):
+                continue
+        except Exception:
+            pass
+        out.append(j)
+    return out
+
+
 def commit_wait_why(why, status, commit):
     """PURE. The text other bundles' `waiting: behind bundle X (...)` shows. bundle_incomplete's
     "N slice(s) still owned by the slicer" is only true while the slicer is actually advancing: when
@@ -3816,6 +3890,13 @@ def cpu_outstanding_by_bundle():
 
 
 _LAST_COMMIT_STATUS = {}    # {bundle: (status, why, moving)} of the last tick (for the wait-reason text)
+_INFRA_SEEN = {}            # {job id: wait_note} latest INFRA WAIT the launch loop recorded (infra_seen_update)
+
+
+def _infra_wait_live(j, now=None):
+    """The row's current infra wait (recorded by the launch loop, re-checked now), or None."""
+    n = _INFRA_SEEN.get(j.get("id"))
+    return infra_wait_recheck(j, n, now) if n else None
 
 
 def _plan_sig(plan, label):
@@ -3849,7 +3930,7 @@ def moving_hint_guard(plan, chain):
 
 def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, alert=None,
                          runs_dir=None, chain_dir=None, override_key=None, hooks=None,
-                         log_dir=None, cpu_outstanding=None, exhausted=None):
+                         log_dir=None, cpu_outstanding=None, exhausted=None, infra_wait=None):
     """The effectful half of the commitment for one daemon tick: evaluates the bundles
     (bundle_commit_status over slice_plan_runnability + chain_run_progress), runs
     bundle_commit_step, persists state["_bundle_commit"/"_bundle_parked"/
@@ -3942,7 +4023,9 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
                                                    cpu_wait=cpu_by.get(k),
                                                    next_step=_nxt_all.get(k), now=now,
                                                    kick_stalled=_kst, driverless_since=_dl_since,
-                                                   exhausted_yield=_exy)
+                                                   exhausted_yield=_exy,
+                                                   infra_wait=(infra_wait if infra_wait is not None else
+                                                               (lambda j_: _infra_wait_live(j_, now))))
             cache[k] = (st, why, moving, plan)
             _LAST_COMMIT_STATUS[k] = (st, why, moving)
         return cache[k][:3]
@@ -17102,6 +17185,12 @@ def cmd_run(args):
                           f"committed bundle {_commit_key} -- took the idle lane (same-"
                           f"bundle backfill only; no other bundle may)")
 
+            # INFRA-WAIT LANE HOLD FIX (2026-11-15): remember which pending rows sit in an INFRA WAIT so
+            # the next tick's commitment can release the lanes a bundle of only such rows was holding.
+            try:
+                infra_seen_update(_INFRA_SEEN, _job_wait, state["jobs"])
+            except Exception as _ise:
+                print(f"[queue] infra-seen error (ignored): {_ise!r}", file=sys.stderr)
             # Persist WHY lanes are idle (rewritten only on change + a heartbeat). Advisory:
             # an I/O failure here must never touch scheduling.
             try:
@@ -17138,11 +17227,13 @@ def cmd_run(args):
                 print(f"[queue] slot-measure error (ignored): {_se!r}", file=sys.stderr)
             # LOUD idle-with-pending alert (operator 2026-10-06: "nothing running for 949s").
             try:
+                _inow = time.time()
+                _ipend = idle_alert_pending(state["jobs"], lambda _ij: _infra_wait_live(_ij, _inow))
                 if idle_pending_alert_due(
                         _IDLE_PENDING, any(_ij.get("status") == "running" for _ij in state["jobs"]),
-                        sum(1 for _ij in state["jobs"] if _ij.get("status") == "pending"), time.time()):
+                        len(_ipend), _inow):
                     _imsg = (f"QUEUE IDLE {int(IDLE_PENDING_ALERT_S // 60)}+ min with "
-                             f"{sum(1 for _ij in state['jobs'] if _ij.get('status') == 'pending')} pending: "
+                             f"{len(_ipend)} pending (not counting rows in an INFRA WAIT): "
                              f"committed={_commit_key} hold={bool(_hold)} why={_active_why}")
                     print(f"[queue] !!! {_imsg}", file=sys.stderr)
                     _bundle_park_alert("QUEUE-IDLE", _imsg)

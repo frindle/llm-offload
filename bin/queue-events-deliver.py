@@ -39,10 +39,6 @@ LOG_DIR = os.environ.get("QEL_LOG_DIR") or str(queue_config.state_dir() / "ollam
 P = lambda n: os.path.join(DIR, n)
 NOT_IN_FLIGHT = {"done", "passed", "pass", "needs-review", "failed", "blocked", "needs_opus", "cancelled",
                  "done_unconverged", "error", "resolved"}
-# the queue API as the hook's reader reaches it: loopback needs no token; any other address (the container) needs one
-_QA_BASE, _QA_TOKEN = queue_config.queue_api()
-_CLEAR_CURL_PREFIX = (_QA_BASE + ' -H "Authorization: Bearer $(cat ~/.config/ollama-queue/queue-api-token)"'
-                      if _QA_TOKEN and queue_config.queue_is_remote() else _QA_BASE)
 HEADER = ("QUEUE EVENTS for this session (passed/done: review the result; passed with review=: this pass is in the 1-in-5 "
           "quality sample (the only check on false PASSes): before landing it, run the `review=` command shown and do the review it "
           "describes in THIS session or a Sonnet subagent of it (no API, no `claude -p`), then record the verdict with the "
@@ -56,7 +52,7 @@ HEADER = ("QUEUE EVENTS for this session (passed/done: review the result; passed
           "`~/bin/mini-finish <id>` shown, edit the files it lists in place, then `~/bin/mini-finish <id> --check` "
           "in the background; its PASS queues any remaining chain steps locally and resolves + clears the job; "
           "other failed/blocked/gate_nonpass: triage, then `python3 ~/bin/ollama-queue.py resolve <id>` and "
-          "`curl -s -X POST " + _CLEAR_CURL_PREFIX + "/api/runs/<id>/clear` in the same step; "
+          "`python3 ~/bin/ollama-queue.py clear-card <id>` in the same step; "
           "needs_info: answer the job's NEEDS.md):")
 
 

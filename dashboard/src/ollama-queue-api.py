@@ -9325,6 +9325,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             state = lock.load()
         job = next((j for j in state["jobs"] if str(j.get("id")) == job_id), None)
         if job is None:
+            # a finished row is pruned on the next tick: serve it from its never-pruned done.json (2026-11-15)
+            job = queue_upload.pruned_job(job_id, queue_config.state_dir())
+        if job is None:
             return self._text("job not found", 404)
         tmp = None
         try:

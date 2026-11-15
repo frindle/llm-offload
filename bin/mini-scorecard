@@ -217,6 +217,16 @@ def job_record(job_id):
     return {}
 
 
+def find_record(job_id):
+    """job_record, else (queue on another machine) the finished run fetched from the queue into the mirror: brief and review add
+    see the same record as for a local job (2026-11-15: every job finished on Unraid had no local record)."""
+    d = job_record(job_id)
+    if not d and queue_config.queue_is_remote():
+        import mini_finish_remote as MFR
+        d = MFR.remote_record(HOME, job_id)
+    return d
+
+
 def job_kind(d):
     """fix | auto | test_draft | diagnose, from the job's spec. Only fix jobs are in the pass sample: Claude reads every test draft and
     diagnosis before using it, and reviews every auto pass (the model wrote both the test and the fix). An unreadable spec counts as
@@ -294,9 +304,10 @@ One step records the verdict and, on ok, lands (copies the test + the fixed file
 
 
 def cmd_brief(a):
-    d = job_record(a.job)
+    d = find_record(a.job)
     if not d:
-        print(f"no finished-job record for {a.job} in {QLOGS} (or its archive/)")
+        print(f"no finished-job record for {a.job} in {QLOGS} (or its archive/)"
+              + (" and none on the remote queue" if queue_config.queue_is_remote() else ""))
         return 1
     pick, fam, pct = review_pick(d, load_state())
     print(f"REVIEW SAMPLE {a.job}  {d.get('label')}  family {fam or family_of(d)}  "
@@ -724,7 +735,7 @@ def main(argv=None):
     if a.cmd == "exclude":
         return cmd_exclude(a)
     if a.cmd == "review":
-        rec = job_record(a.job)
+        rec = find_record(a.job)
         fam = a.family or (family_of(rec) if rec else "")   # the throttle's re-promote streak and the per-family rates need it
         kind = a.kind or (job_kind(rec) if rec else "fix")
         kind = kind if kind in ("fix", "auto", "test_draft", "research") else "fix"

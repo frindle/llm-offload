@@ -353,7 +353,7 @@ class QueueStateTests(unittest.TestCase):
             self.assertEqual(qc._main(["x", "queue-state"]), 0)
         self.assertEqual(buf.getvalue().strip(), '{"jobs": []}')
 
-    def test_events_header_token_only_when_remote(self):
+    def test_events_header_clear_hint_both_modes(self):
         import importlib.util
         os.environ["QUEUE_API_TOKEN"] = "tok-not-real"
 
@@ -362,13 +362,16 @@ class QueueStateTests(unittest.TestCase):
             m = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(m)
             return m.HEADER
-        h = header()
-        self.assertNotIn("Authorization", h)                      # loopback needs no token
-        self.assertIn("http://127.0.0.1:7684/api/runs/<id>/clear", h)
-        os.environ["QUEUE_API"] = "http://192.0.2.11:7684"
-        h = header()
-        self.assertIn('-H "Authorization: Bearer $(cat ~/.config/ollama-queue/queue-api-token)"', h)
-        self.assertNotIn("tok-not-real", h)
+        # The clear hint is `ollama-queue.py clear-card <id>` in both modes (it sends the token itself when remote): a
+        # hand-built curl put the path after the -H header once the queue moved to the container.
+        for api in (None, "http://192.0.2.11:7684"):
+            if api:
+                os.environ["QUEUE_API"] = api
+            h = header()
+            self.assertIn("`python3 ~/bin/ollama-queue.py clear-card <id>` in the same step", h)
+            self.assertNotIn("curl", h)
+            self.assertNotIn("Authorization", h)
+            self.assertNotIn("tok-not-real", h)
 
 
 class StudioGuardTests(unittest.TestCase):

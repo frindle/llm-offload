@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("dd", HERE / "dispatch-diagnostics
 dd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dd)
 
-EXPECTED_CHECKS = 50
+EXPECTED_CHECKS = 56
 _n = 0
 _fail = []
 
@@ -160,6 +160,34 @@ with tempfile.TemporaryDirectory() as td:
     check(not r["ok"] and "cap" in r["refused"], "docker_logs since beyond the 7-day cap refused")
     r = one({"kind": "docker_logs", "container": "reselling-app-1", "since": "; rm -rf /"}, repo, catalog=str(cat), docker_fetch=fake_fetch)
     check(not r["ok"] and "duration" in r["refused"], "docker_logs since must be a duration")
+
+    # ---- Unraid API key lookup (catalog key_from, env, Keychain) -----------
+    old_env, old_kc = os.environ.pop("UNRAID_API_KEY", None), dd.UNRAID_KEY_KEYCHAIN
+    dd.UNRAID_KEY_KEYCHAIN = "no-such-keychain-item-for-tests"
+    try:
+        cj = Path(td) / "claude.json"
+        cj.write_text(json.dumps({"mcpServers": {"other": {}}}))
+        parked = {"file": str(cj), "path": "mcpServers.unraid.env.UNRAID_API_KEY"}
+        try:
+            dd._unraid_key(parked)
+            check(False, "no key anywhere is refused")
+        except dd.Refused as e:
+            check("UNRAID_API_KEY" in str(e), "no key anywhere is refused, naming where to put it")
+        os.environ["UNRAID_API_KEY"] = "env-key-123"
+        check(dd._unraid_key(parked) == "env-key-123", "a parked-MCP key_from falls through to $UNRAID_API_KEY")
+        check(dd._unraid_key({}) == "env-key-123", "no key_from uses $UNRAID_API_KEY")
+        cj.write_text(json.dumps({"mcpServers": {"unraid": {"env": {"UNRAID_API_KEY": "file-key-456"}}}}))
+        check(dd._unraid_key(parked) == "file-key-456", "a key_from file that still holds the key wins over the env")
+        os.environ["DIAG_TEST_KEY"] = "named-env-789"
+        check(dd._unraid_key({"env": "DIAG_TEST_KEY"}) == "named-env-789", "key_from env NAME is read first")
+        os.environ["DIAG_TEST_KEY"] = "  "
+        check(dd._unraid_key({"env": "DIAG_TEST_KEY"}) == "env-key-123", "a blank key_from env falls through")
+    finally:
+        os.environ.pop("DIAG_TEST_KEY", None)
+        os.environ.pop("UNRAID_API_KEY", None)
+        if old_env is not None:
+            os.environ["UNRAID_API_KEY"] = old_env
+        dd.UNRAID_KEY_KEYCHAIN = old_kc
 
     # ---- driver bounds --------------------------------------------------
     r = one({"kind": "shell", "command": "ls"}, repo)

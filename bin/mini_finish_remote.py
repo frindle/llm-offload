@@ -151,12 +151,40 @@ def localize(rec, home, fetch):
         pass
     merged = dict(done)
     merged.update({k: v for k, v in rec.items() if v is not None})
+    if not merged.get("_srv_run") and done.get("cwd"):   # a record built from the id alone (remote_record): the queue's cwd
+        merged["_srv_run"] = str(Path(str(done["cwd"])).parent)
     merged["cwd"] = str(m / "work")
     if (m / "spec.json").is_file():
         merged["task_file"] = str(m / "spec.json")
     merged["_mirror"] = str(m)
     return merged
 
+
+
+def remote_record(home, jid):
+    """A FINISHED remote job's record for the Mac's review tools (mini-auto review/land, mini-scorecard review brief), when this
+    machine has no <id>.done.json of it: its run dir is fetched into the mirror (once, as for mini-finish) and its done.json merged
+    (localize: cwd = the mirror's work dir, task_file = the mirror's spec). {} when the queue is local, the id is not a plain job
+    id, the fetch fails, or the job has not finished (a run without _queue/done.json: that mirror is removed again, so a later
+    call fetches the finished run, never a stale one). (2026-11-15: after the queue moved to Unraid, every review of a finished
+    job died with "no finished-job record".)"""
+    import sys
+    if not queue_config.queue_is_remote() or not _JID.match(str(jid)):
+        return {}
+    git_env()
+    m = mirror_dir(home, jid)
+    fresh = not m.is_dir()
+    try:
+        rec = localize({"id": str(jid)}, home, fetch=True)
+    except (QR.RemoteError, OSError) as e:
+        print("cannot fetch job %s from the queue: %s" % (jid, e), file=sys.stderr)
+        return {}
+    if not (m / "_queue" / "done.json").is_file():
+        if fresh:
+            shutil.rmtree(m, ignore_errors=True)
+        print("job %s has no finished record on the queue yet (still running, or never finished)" % jid, file=sys.stderr)
+        return {}
+    return rec
 
 def xlate(obj, rec):
     """Rewrite the queue's run-dir prefix to the mirror inside every string of a spec."""

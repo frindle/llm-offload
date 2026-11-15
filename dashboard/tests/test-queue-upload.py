@@ -496,5 +496,49 @@ except queue_remote.RemoteError:
     ok("unknown flag raises", True)
 ok("unhandled path keys are listed", queue_remote.unhandled_path_keys({"baseline_from": "/x", "notes": "/etc/hosts"}) == ["notes"])
 
+print("a finished job the queue already pruned (done.json fallback)")
+_sd = Path(api.queue_config.state_dir())
+_ld = _sd / "ollama-queue-logs"
+_ld.mkdir(parents=True, exist_ok=True)
+with api.q._Locked() as lock:
+    _st = lock.load()
+    _st["jobs"] = [j for j in _st["jobs"] if j.get("id") != jid]
+    lock.save(_st)
+
+
+def _get(path):
+    c = http.client.HTTPConnection("127.0.0.1", SRV.server_address[1], timeout=30)
+    try:
+        c.request("GET", path, headers=GOOD)
+        r = c.getresponse()
+        return r.status, r.read()
+    finally:
+        c.close()
+
+
+ok("pruned, no done.json -> 404", _get("/api/jobs/%s/result" % jid)[0] == 404)
+(_ld / (jid + ".done.json")).write_text(json.dumps({"id": jid, "label": "up-roundtrip", "cwd": job["cwd"],
+                                                     "task_file": job["task_file"], "status": "done", "exit_code": 0}))
+(_ld / (jid + "-up-roundtrip.log")).write_text("run log tail\n")
+got = queue_remote.fetch_result(BASE, GOOD, jid, tmp / "pruned-result")
+ok("pruned job: result served from done.json", (got / "work" / "out.txt").read_text() == "produced\n")
+ok("pruned job: done.json and the run log tail are in it",
+   json.loads((got / "done.json").read_text())["id"] == jid and (got / "log-tail.txt").read_text() == "run log tail\n")
+ok("pruned job: job.json is the done record", json.loads((got / "job.json").read_text()).get("status") == "done")
+got = queue_remote.fetch_result(BASE, GOOD, jid, tmp / "pruned-run", scope="run")
+ok("pruned job: ?scope=run serves the run dir with _queue/done.json",
+   (got / "work" / "out.txt").is_file() and (got / "_queue" / "done.json").is_file(), sorted(p.name for p in got.iterdir()))
+(_ld / "archive").mkdir(exist_ok=True)
+(_ld / (jid + ".done.json")).rename(_ld / "archive" / (jid + ".done.json"))
+got = queue_remote.fetch_result(BASE, GOOD, jid, tmp / "pruned-arch")
+ok("cleared card (done.json in archive/) still served", (got / "done.json").is_file() and (got / "work" / "out.txt").is_file())
+(_ld / "archive" / (jid + ".done.json")).write_text(json.dumps({"id": "0123456789ab", "cwd": job["cwd"]}))
+ok("a done.json that names another job -> 404", _get("/api/jobs/%s/result" % jid)[0] == 404)
+(_ld / "archive" / (jid + ".done.json")).write_text(json.dumps({"id": jid, "cwd": "/etc"}))
+got = queue_remote.fetch_result(BASE, GOOD, jid, tmp / "pruned-etc")
+ok("a done.json cwd outside the mini-work root ships no files", not (got / "work").exists())
+ok("...and ?scope=run refuses it", _get("/api/jobs/%s/result?scope=run" % jid)[0] == 404)
+ok("pruned_job: a non-hex id is never looked up", queue_upload.pruned_job("../x", _sd) is None)
+
 print("%d failed" % len(FAILS) if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

@@ -441,11 +441,23 @@ def wipe_workdir(ctx):
 def c5_remote(ctx):
     """Remote queue: C5 and C6 (and V1-V8) run as ONE validate job on the queue, never on this machine (spec tests execute project
     code). A VALIDATION.md the queue already produced (marked by mini_validate_remote) covers them; C3 has just proved it fresh."""
+    if (getattr(ctx, "spec", None) or {}).get("mode") == "auto":
+        # The validate job runs mini-validate (V1-V8), which is for frozen-test specs: an auto spec has no test_file (the model
+        # writes the test), so the job crashed on it (KeyError 'test_file', 2026-11-15 smoke). The runner checks a local C5 ran
+        # (task readable, baseline a git worktree, must-not-offload) open the coding job on the queue, before any model or
+        # project code; C3 already refused must-not-offload areas here.
+        return "auto spec: no frozen test to validate; the coding job runs the runner's spec checks first, on the queue"
     import mini_validate_remote as MVR
     jid = MVR.marked_job(ctx.spec_dir / "VALIDATION.md")
     if jid:
         return f"runner --check-only ran in the queue's validate job {jid}"
-    ok, jid, out = MVR.remote_validate(ctx.spec_path, ctx.model, ctx.label)
+    host = "auto"
+    try:
+        import queue_remote as QR
+        host = QR.parse_enqueue_flags(getattr(ctx, "rest", [])).get("host") or "auto"
+    except Exception:  # a bad flag fails in submit_remote with its own message; validate in the default lane meanwhile
+        pass
+    ok, jid, out = MVR.remote_validate(ctx.spec_path, ctx.model, ctx.label, host=host)
     if not ok:
         raise Fail("C5", f"the queue's validate job did not pass: {out.strip()[-600:]}", "fix the spec (the job's log is on the queue)")
     return f"the queue's validate job {jid} passed (V1-V8, C5, C6)"
@@ -637,6 +649,7 @@ def main(argv=None):
         return 2
     a.model = _vm
     ctx.label, ctx.model, ctx.R, ctx.spec = a.label, a.model, None, {}
+    ctx.rest = rest  # pass-through enqueue flags (--host ...): the remote validate job uses the same host
     if not ctx.spec_path.is_file():
         print(f"mini-submit: spec not found: {ctx.spec_path}", file=sys.stderr)
         return 2

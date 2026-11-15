@@ -186,14 +186,22 @@ def latest_review(job):
 def resolve(job):
     """(record, run dir, work dir, spec) of a finished queue job. The runner writes its packets next to the work dir."""
     rec = job_record(job) if re.fullmatch(r"[\w.-]+", job) else {}
+    if not rec and queue_config.queue_is_remote():   # finished on the remote queue: review its fetched run (the mirror)
+        import mini_finish_remote as MFR
+        rec = MFR.remote_record(OHOME, job)
     if not rec:
-        die(f"no finished-job record for {job} in {QLOGS} (or its archive/)")
+        die(f"no finished-job record for {job} in {QLOGS} (or its archive/)"
+            + (" and none on the remote queue" if queue_config.queue_is_remote() else ""))
     work = Path(os.path.expanduser(str(rec.get("cwd") or "")))
     try:
         spec = json.loads(Path(os.path.expanduser(str(rec.get("task_file") or ""))).read_text())
     except (OSError, ValueError):
         spec = {}
-    return rec, work.parent, work, spec if isinstance(spec, dict) else {}
+    spec = spec if isinstance(spec, dict) else {}
+    if rec.get("_mirror"):
+        import mini_finish_remote as MFR
+        spec = MFR.xlate(spec, rec)   # the queue's run-dir paths -> the mirror (auto_repo is this machine's and stays)
+    return rec, work.parent, work, spec
 
 
 def result_line(run):
@@ -255,6 +263,9 @@ def cmd_land(a):
             die(f"{', '.join(moved)} in {work} differ from what `mini-finish --check` passed ({cand}): rerun "
                 f"`~/bin/mini-finish {a.job} --check` first")
     dest = Path(os.path.realpath(os.path.expanduser(a.into or spec.get("auto_repo") or spec.get("baseline_from") or "")))
+    mir = rec.get("_mirror")
+    if mir and (dest == Path(os.path.realpath(mir)) or str(dest).startswith(os.path.realpath(mir) + os.sep)):
+        die(f"job {a.job} ran on the remote queue and its spec names no repo on this machine (no auto_repo): pass --into DIR")
     if not dest.is_dir():
         die(f"destination {dest} is not a directory")
     plan, bad = [], []
