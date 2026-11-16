@@ -14,6 +14,7 @@ Source: the 9 queue plists in `~/Library/LaunchAgents` (read only, 2026-11-12) a
 | verify-orphan-reap | `python3 ~/bin/verify-orphan-reap.py --apply`, Nice 10 | StartInterval 120, RunAtLoad | `verify-orphan-reap`: `every.sh 120 nice -n 10 ...` | same |
 | log-rotate | `python3 ~/bin/log-rotate.py --apply`, Nice 10 | StartCalendarInterval 04:17 daily (no RunAtLoad) | `log-rotate`: `every.sh at 04:17 nice -n 10 ...` | `~/.ollama-dispatch/log-rotate.out` (unchanged; that dir is a volume) |
 | error-digest (container only, new 2026-11-15) | `python3 ~/bin/error_digest.py run`, Nice 10 | none (no Mac plist) | `error-digest`: `every.sh at 05:07 nice -n 10 ...` | `~/.ollama-dispatch/error-digest.out`; digests in `~/.ollama-dispatch/error-digest/digests/` |
+| plex-glacier-watch (container only, new 2026-11-15) | `python3 ~/bin/plex_glacier_watch.py tick`, Nice 10 | none (no Mac plist) | `plex-glacier-watch`: `every.sh 120 nice -n 10 ...` | `~/.ollama-dispatch/plex-glacier-watch.out`; flag in `~/state/glacier/plex-busy`; samples in `~/.ollama-dispatch/plex-glacier/samples/` |
 
 Interpreter: every plist uses `/opt/homebrew/bin/python3`, which is Python 3.14.7 today. The image uses `python:3.14-slim-bookworm`.
 `~/bin` in the container is a symlink to `/opt/queue/bin` (the staged code), so the paths above stay the same.

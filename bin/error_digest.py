@@ -16,6 +16,7 @@ numbers, ids, addresses, URLs and secrets taken out), counts, and which kinds ar
 Known noise (noise.json in the same dir) is folded into "routine" counts or left out. The local model only adds one
 "what it probably means" line per new kind: `run` enqueues one queue job (error-digest-runner.py, Unraid lane) that
 fills them in later; when that job fails the digest stays as plain counts.
+A "Plex and Glacier" section is added from plex_glacier_watch.py's samples for that day, when there are any.
 
 Loki: $LOKI_URL (or $LOGQ_URL, or queue config logs.loki_url) and a bearer token from $LOKI_TOKEN, the file
 $LOKI_TOKEN_FILE / $LOGQ_TOKEN_FILE, or the macOS Keychain item service loki-token account loki. The token is never
@@ -526,6 +527,12 @@ def render(rec, top=5):
                         for what, n in (("error", more_e), ("warning", more_w)) if n]
                 out.append("- plus %s (all in %s.json)" % (" and ".join(bits), day))
             out.append("")
+    if rec.get("plex_glacier"):
+        try:
+            import plex_glacier_watch
+            out += plex_glacier_watch.render_section(rec["plex_glacier"])
+        except Exception:  # noqa: BLE001 - the error part of the digest must not depend on the Plex section
+            pass
     out += ["## By container", "", "| Container | Lines | Kinds | New | Most frequent |", "|---|---|---|---|---|"]
     for c, i in sorted(cs.items(), key=lambda kv: -sum(s["count"] for s in kv[1]["sigs"])):
         lines = sum(s["count"] for s in i["sigs"])
@@ -648,6 +655,13 @@ def cmd_run(argv, days=None):
         except LokiError as e:
             print("error-digest: %s: %s" % (day, e), file=sys.stderr)
             return 1
+        try:
+            import plex_glacier_watch
+            pg = plex_glacier_watch.day_summary(day)
+            if pg:
+                rec["plex_glacier"] = pg
+        except Exception:  # noqa: BLE001 - see render()
+            pass
         want_model = bool(model and model_items(rec))
         if want_model:
             rec["model"] = {"status": "pending", "model": model}

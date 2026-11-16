@@ -13496,6 +13496,37 @@ def _apply_fit_routing(job, w):
                                unraid_usable, studio_usable, extra)
 
 
+# --- PLEX GPU YIELD (the operator 2026-11-15: "Plex should get the GPU over ollama") ----------------------------
+# Plex hardware-transcodes on the Unraid RTX 3080 (12 GB) that the Unraid Ollama lane fills to ~11.9 GB with a
+# 9-11 GB model. While Plex is playing, plex_glacier_watch.py (same container, every 2 min) keeps
+# <GLACIER_SHARE_DIR or ~/state/glacier>/plex-busy fresh; the launch loop then starts nothing new on a lane in
+# PLEX_GPU_LANES (an auto job takes another lane if it has one, else it waits with code plex-gpu), and the
+# watcher unloads idle Ollama models there. A running job is never stopped: it finishes, then its model is
+# unloaded. A missing or stale flag (watcher down, Loki down) means go, so this can only delay, never wedge.
+# PLEX_GPU_YIELD=0 turns it off.
+PLEX_GPU_YIELD = os.environ.get("PLEX_GPU_YIELD", "1").strip().lower() not in ("0", "off", "false", "no")
+PLEX_GPU_LANES = tuple(x.strip() for x in os.environ.get("PLEX_GPU_LANES", "unraid").split(",") if x.strip())
+PLEX_BUSY_FRESH_S = 600     # same staleness rule glacier-mover.sh applies to the flag
+
+
+def plex_busy_path():
+    return Path(os.environ.get("GLACIER_SHARE_DIR") or Path.home() / "state" / "glacier").expanduser() / "plex-busy"
+
+
+def plex_gpu_wait(lane_name, now=None, path=None):
+    """The skip reason for lane `lane_name` while Plex is playing and that lane shares Plex's GPU, else None.
+    One stat per call; never raises."""
+    if not PLEX_GPU_YIELD or lane_name not in PLEX_GPU_LANES:
+        return None
+    try:
+        mtime = Path(path or plex_busy_path()).stat().st_mtime
+    except OSError:
+        return None
+    if (time.time() if now is None else now) - mtime >= PLEX_BUSY_FRESH_S:
+        return None
+    return f"{lane_name}: Plex is playing (the GPU goes to Plex first)"
+
+
 def _candidate_lanes(job, w):
     """Ordered list of lanes this job may run on. For auto jobs this mirrors
     pick_host()'s priority exactly: Studio always first; Unraid appended as
@@ -16891,8 +16922,15 @@ def cmd_run(args):
                         _lanes_try += gate_alt_lane_urls(job, w)
                     except Exception:
                         pass
+                _plex_why = None
                 for lane_url in _lanes_try:
                     name = _lane_name(lane_url)
+                    # PLEX GPU YIELD: nothing new starts on Plex's GPU while Plex is playing.
+                    _pgw = plex_gpu_wait(name)
+                    if _pgw:
+                        _plex_why = _pgw
+                        _lane_why.append(_pgw)
+                        continue
                     # (No gate-hold skip here anymore: long jobs launch immediately and
                     # are preempted for a Studio gate by the scan above, not held off the
                     # lane on a timer.)
@@ -16948,7 +16986,12 @@ def cmd_run(args):
                     # are the normal steady state, so they are not logged per-poll.
                     _lane_why.append(f"{name} busy (second slot denied: {reason})")
                 if chosen is None:
-                    if _lane_why:
+                    if _plex_why and _lane_why == [_plex_why]:
+                        _job_wait[job["id"]] = wait_note(
+                            "plex-gpu", "Plex is playing: waits for the Unraid GPU",
+                            f"waiting for Plex to finish ({_plex_why}); launches about 5 min after playback stops",
+                            {"kind": "plex", "detail": _plex_why})
+                    elif _lane_why:
                         _job_wait[job["id"]] = wait_note(
                             "lane-busy", "lane busy: " + "; ".join(_lane_why)[:160],
                             "waiting for a free lane (" + "; ".join(_lane_why)[:200] + ")",

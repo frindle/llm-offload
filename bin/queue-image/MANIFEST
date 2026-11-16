@@ -149,6 +149,7 @@ docsum_run.py
 error_digest.py
 error-digest-runner.py
 error_digest_noise.json
+plex_glacier_watch.py
 docsum_server.py
 docsum_ui_guard.py
 docsum_ui_jobs.py

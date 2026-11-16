@@ -2,7 +2,7 @@
 """Tests for the nightly container error digest (error_digest.py + error-digest-runner.py), 2026-11-15.
 
 Fake Loki and fake Ollama on 127.0.0.1 (http.server threads); synthetic log lines only. No queue, no network.
-  python3 test_error_digest.py      prints ALL PASS / N FAILED (rc 0 / 1)
+  python3 test-error-digest.py      prints ALL PASS / N FAILED (rc 0 / 1)
 """
 import contextlib
 import datetime as dt
