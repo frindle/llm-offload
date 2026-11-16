@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import docsum_cli  # noqa: E402
 import docsum_ui_guard  # noqa: E402
-from docsum_private import is_private_label  # noqa: E402
+from docsum_private import is_docsum_label  # noqa: E402
 from docsum_ui_jobs import list_jobs  # noqa: E402
 import docsum_ui_name  # noqa: E402
 from docsum_ui_multipart import parse_multipart  # noqa: E402
@@ -71,7 +71,7 @@ def queue_rows():
     if not isinstance(jobs, list):
         return []
     return [{"id": j.get("id"), "label": j.get("label"), "status": j.get("status")}
-            for j in jobs if isinstance(j, dict) and is_private_label(j.get("label"))]
+            for j in jobs if isinstance(j, dict) and is_docsum_label(j.get("label"))]
 
 
 def job_done(d):
