@@ -70,11 +70,6 @@ cpu-runner/*
 
 [hooks]
 claude-active-touch.sh
-dispatch-handauthor-gate.sh
-dispatch-handauthor-guard.sh
-dispatch-to-qwen-reminder.sh
-dispatch-troubleshoot-gate.sh
-dispatch-worktree-guard.sh
 ollama-prep-tokens-inject.sh
 ollama-prep-tokens-reminder.sh
 ollama-queue-watch-reminder.sh
