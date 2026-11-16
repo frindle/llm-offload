@@ -369,10 +369,11 @@ import re as _re
 _c = configparser.RawConfigParser(strict=True)
 _c.read(BIN / "queue-image" / "supervisord.conf")
 _progs = [x for x in _c.sections() if x.startswith("program:")]
-_wf = _re.search(r"assert len\(p\)==(\d+)", (BIN / "queue-image" / "github-workflow-image.yml").read_text())
+_wfn = [int(x) for x in _re.findall(r"startswith\('program:'\)\]\)?;?\s*(?:assert len\(p\))?\s*==\s*(\d+)",
+                                     (BIN / "queue-image" / "github-workflow-image.yml").read_text())]
 chk("image: the watcher is a supervisord program", "program:plex-glacier-watch" in _progs, _progs)
-chk("image: the build workflow's program count matches supervisord.conf (11-15: the build failed on 10)",
-    _wf and int(_wf.group(1)) == len(_progs), (_wf and _wf.group(1), len(_progs)))
+chk("image: both of the build workflow's program counts (static check, image smoke) match supervisord.conf "
+    "(11-15: the build failed twice on 10)", len(_wfn) == 2 and set(_wfn) == {len(_progs)}, (_wfn, len(_progs)))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%s (%d checks)" % ("ALL PASS" if not FAILS else "%d FAILED" % len(FAILS), N[0]))
