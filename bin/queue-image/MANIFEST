@@ -151,6 +151,7 @@ error-digest-runner.py
 error_digest_noise.json
 error_digest_alerts.json
 prompt_jobs.py
+digest_lines.py
 prompt-json-runner.py
 plex_glacier_watch.py
 docsum_server.py
