@@ -8229,6 +8229,12 @@ def _is_loopback_peer(addr):
     return ip.is_loopback
 
 
+def _is_prompt_jobs_path(path):
+    """/api/prompt-jobs and /api/prompt-jobs/<id> (prompt_jobs.py; its own scoped token)."""
+    p = str(path or "").split("?", 1)[0].rstrip("/")
+    return p == "/api/prompt-jobs" or p.startswith("/api/prompt-jobs/")
+
+
 def _write_auth_ok(peer_ip, headers, token=None):
     """True when the request may proceed: no token configured, or a loopback peer with no proxy header, or the
     correct Bearer token. `headers` is any mapping with a case-insensitive .get (an http.client message)."""
@@ -8437,6 +8443,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _prompt_jobs(self, method):
+        """/api/prompt-jobs*: thin socket wrapper over prompt_jobs.handle (all rules live there). The body is read only
+        after its declared length passes the cap. Never logs the text or the result."""
+        try:
+            import prompt_jobs
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > prompt_jobs.MAX_BODY:
+                return self._json({"error": "E_SIZE"}, 413 if length > 0 else 400)
+            body = self.rfile.read(length) if length else b""
+            status, obj = prompt_jobs.handle(q, method, self.path, self.headers, body)
+        except Exception as e:  # noqa: BLE001
+            print(f"[api] prompt-jobs {method}: {type(e).__name__}", file=sys.stderr)
+            return self._json({"error": "E_INTERNAL"}, 500)
+        if method != "GET" and status < 300:
+            self._invalidate_for_write()
+        return self._json(obj, status)
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -8990,6 +9016,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return _annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state))
 
     def do_GET(self):
+        if _is_prompt_jobs_path(self.path):
+            return self._prompt_jobs("GET")
         if self.path.startswith("/api/standby/"):
             return self._standby_get()
         if self.path.split("?", 1)[0].startswith("/api/admin/") and not queue_config.standby():
@@ -9173,6 +9201,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._admin_post()
         if self._drain_gate():
             return
+        if _is_prompt_jobs_path(self.path):          # its own scoped token (prompt_jobs.auth), never the queue's
+            return self._prompt_jobs("POST")
         if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
             return
         if _is_docsum_path(self.path):
@@ -9235,6 +9265,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         if self._standby_gate():
             return
+        if _is_prompt_jobs_path(self.path):
+            return self._prompt_jobs("DELETE")
         if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
             return
         self._invalidate_for_write()
