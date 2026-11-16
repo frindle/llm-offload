@@ -243,7 +243,7 @@ chk("digest: section rendered before the container table",
 
 os.environ["LOKI_URL"] = "http://127.0.0.1:9"
 orig = (ED.build_day, ED.model_items)
-ED.build_day = lambda loki, day, ddir, rules, say=print: {"day": day, "containers": {}, "baseline": False}
+ED.build_day = lambda loki, day, ddir, rules, say=print, **kw: {"day": day, "containers": {}, "baseline": False}
 ED.model_items = lambda rec, per_container=8: {}
 try:
     with contextlib.redirect_stdout(io.StringIO()):

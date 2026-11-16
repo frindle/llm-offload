@@ -5,7 +5,8 @@ The operator's OK, 2026-11-15: "automated error handling for docker containers e
 Unraid containers). Runs on Unraid (queue container), reads the operator's Loki log stack, never changes a container: no restarts,
 no fix jobs (not approved; ask first).
 
-  error_digest.py run [--day YYYY-MM-DD] [--model M | --no-model]   build one day's digest (default: yesterday)
+  error_digest.py run [--day YYYY-MM-DD] [--model M | --no-model] [--no-send]
+                                                                     build one day's digest (default: yesterday)
   error_digest.py backfill --days N [--no-model]                     build the last N days, oldest first
   error_digest.py show [--day YYYY-MM-DD]                            print a digest
   error_digest.py grading --days N                                   one page for the operator to mark the errors worth knowing
@@ -13,7 +14,11 @@ no fix jobs (not approved; ask first).
 Per day it writes <dir>/digests/<day>.json and <day>.md (dir: $ERROR_DIGEST_DIR, else <dispatch dir>/error-digest).
 The plain digest is always written: per container, error lines grouped into kinds (a "signature": the line with times,
 numbers, ids, addresses, URLs and secrets taken out), counts, and which kinds are NEW (not seen in the 14 days before).
-Known noise (noise.json in the same dir) is folded into "routine" counts or left out. The local model only adds one
+Known noise (error_digest_noise.json, plus noise.json in the digest dir) is folded into "routine" counts or left out.
+Alert rules (error_digest_alerts.json, plus alerts.json in the digest dir) route kinds "for you" (the daily message)
+or "for Claude" (logged for the operator's Claude sessions), or hold them back; see "alert routing" below. The daily
+message is <day>.notify.txt; when $ERROR_DIGEST_NOTIFY_URL and its token are set, `run` (yesterday only, once per
+day, never backfill) also POSTs it there. Unset: shadow, the file only. The local model only adds one
 "what it probably means" line per new kind: `run` enqueues one queue job (error-digest-runner.py, Unraid lane) that
 fills them in later; when that job fails the digest stays as plain counts.
 A "Plex and Glacier" section is added from plex_glacier_watch.py's samples for that day, when there are any.
@@ -173,8 +178,9 @@ def sig_id(container, sig):
 _LV = r"(trace|trc|debug|dbg|info|inf|notice|warn|warning|wrn|err|error|eror|fatal|crit|critical|panic|alert|emerg)"
 _TAG_BRACKET = re.compile(r"[\[<(]" + _LV + r"[\]>)]", re.I)
 _TAG_KV = re.compile(r"\b(?:level|lvl|severity|loglevel)[\"']?\s*[:=]\s*[\"']?" + _LV + r"\b", re.I)
-_TAG_LEAD = re.compile(r"^[\d\-/:.,TZ+ ]*(?:[A-Za-z_][\w.\-]*:?\s+)?(TRACE|TRC|DEBUG|DBG|INFO|INF|NOTICE|WARN|"
+_TAG_LEAD = re.compile(r"^[\d\-/:.,TZ+ ]*(?:\[[\w.\-]+\]\s*)*(?:[A-Za-z_][\w.\-]*:?\s+)?(TRACE|TRC|DEBUG|DBG|INFO|INF|NOTICE|WARN|"
                        r"WARNING|WRN|ERROR|ERR|FATAL|CRIT|CRITICAL|PANIC)\b")       # INF/WRN/ERR: zerolog (cloudflared)
+# ("[queue] WARNING: ..." and "[entrypoint] WARNING: ...": a bracketed component name may come before the level)
 _TAG_DASH = re.compile(r"\s[-|]\s(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s[-|:]")
 _LV_MAP = {"trace": None, "trc": None, "debug": None, "dbg": None, "info": None, "inf": None, "notice": None,
            "warn": "warn", "warning": "warn", "wrn": "warn"}
@@ -267,6 +273,115 @@ def noise_action(rules, container, line):
         if fnm.fnmatchcase(container, glob) and rx.search(line):
             return action
     return None
+
+
+# ---------------------------------------------------------------------------------------------------- alert routing
+# Who should hear about a kind of error: "owner" (the operator: in the daily message) or "claude" (the operator's Claude
+# sessions read and handle them; never in the message). Rules: error_digest_alerts.json, plus <digest dir>/alerts.json
+# checked first. A line goes to the first rule that matches it. Rule fields:
+#   route owner|claude, container "<glob>" or [globs], match "<regex on the line>", what "<one line for the message>",
+#   min_count N (default 1: fewer lines that day and it is held back), sustain_min M + gap_min G (lines at most G
+#   minutes apart are one run; held back unless a run lasts M minutes), hold "<why>" (held back whatever the count).
+# Held-back items are listed in the digest (so nothing is hidden) but not sent. New kinds of error that no rule
+# covers go to Claude, never straight to the operator ("for Claude": the operator's Claude sessions read the digest and
+# handle or ask; nothing here restarts or fixes anything).
+NEW_FOR_CLAUDE = 15        # new unrouted kinds listed for Claude per day; the rest are counted
+
+
+def load_alerts(*paths):
+    import fnmatch  # noqa: F401 - match_alerts uses it; imported here so a bad rules file fails the same way
+    out, seen = [], set()
+    for path in paths:
+        try:
+            rules = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            continue
+        for r in rules if isinstance(rules, list) else []:
+            try:
+                if r.get("route") not in ("owner", "claude") or not r.get("match") or not r.get("what"):
+                    continue
+                globs = r.get("container") or "*"
+                globs = [globs] if isinstance(globs, str) else [str(g) for g in globs]
+                key = (tuple(globs), r["match"], r["route"])
+                if key in seen:
+                    continue
+                a = {"globs": globs, "rx": re.compile(r["match"], re.I), "route": r["route"], "what": str(r["what"]),
+                     "min_count": max(1, int(r.get("min_count", 1))), "sustain_min": float(r.get("sustain_min", 0)),
+                     "gap_min": float(r.get("gap_min", 10)), "hold": str(r.get("hold") or "")}
+                seen.add(key)
+                out.append(a)
+            except (re.error, AttributeError, TypeError, ValueError):
+                continue
+    return out
+
+
+def match_alerts(container, rows, arules):
+    """{rule index: {"ts": [ns], "sample": shape of the first line, "sigs": {sig ids}}} for this container's lines."""
+    import fnmatch
+    mine = [(i, a) for i, a in enumerate(arules) if any(fnmatch.fnmatchcase(container, g) for g in a["globs"])]
+    hits = {}
+    if not mine:
+        return hits
+    for ns, raw in rows:
+        line = unglue(clean(raw))
+        for i, a in mine:
+            if a["rx"].search(line):
+                h = hits.get(i)
+                if h is None:
+                    h = hits[i] = {"ts": [], "sample": shape(line), "sigs": set()}
+                h["ts"].append(ns)
+                if len(h["sigs"]) < 200:
+                    h["sigs"].add(sig_id(container, signature(line)))
+                break
+    return hits
+
+
+def runs(ts, gap_ns):
+    """[(first_ns, last_ns, lines)] of sorted times, a new run after a gap longer than gap_ns."""
+    out = []
+    for t in ts:
+        if out and t - out[-1][1] <= gap_ns:
+            out[-1] = (out[-1][0], t, out[-1][2] + 1)
+        else:
+            out.append((t, t, 1))
+    return out
+
+
+def decide_alerts(acc, arules, containers):
+    """acc {rule index: [(container, hits)]} -> rec["alerts"]: owner, claude, held items and new kinds for Claude."""
+    out = {"owner": [], "claude": [], "held": [], "new_for_claude": [], "new_for_claude_more": 0}
+    covered = set()
+    for i in sorted(acc):
+        a, per = arules[i], acc[i]
+        ts = sorted(t for _, h in per for t in h["ts"])
+        for _, h in per:
+            covered |= h["sigs"]
+        item = {"what": a["what"], "route": a["route"], "containers": sorted(c for c, _ in per), "count": len(ts),
+                "first_ns": ts[0], "last_ns": ts[-1], "sample": _short(per[0][1]["sample"], 200)}
+        held = []
+        if len(ts) < a["min_count"]:
+            held.append("%d× today, %d needed" % (len(ts), a["min_count"]))
+        if a["sustain_min"]:
+            rr = runs(ts, a["gap_min"] * 60e9)
+            longest = max(r[1] - r[0] for r in rr) / 60e9
+            item["longest_min"] = round(longest, 1)
+            item["runs"] = [list(r) for r in sorted(rr, key=lambda r: r[0] - r[1])[:3]]
+            if longest < a["sustain_min"]:
+                held.append("longest run %d min, %d needed" % (longest, a["sustain_min"]))
+        if a["hold"]:
+            held.append(a["hold"])
+        if held:
+            item["held"] = "; ".join(held)
+            out["held"].append(item)
+        else:
+            out[a["route"]].append(item)
+    new = [(c, s) for c, i in containers.items() for s in i["sigs"]
+           if s.get("new") and s["level"] == "error" and s["id"] not in covered]
+    new.sort(key=lambda x: -x[1]["count"])
+    out["new_for_claude"] = [{"container": c, "id": s["id"], "count": s["count"], "text": _short(s["text"], 200)}
+                             for c, s in new[:NEW_FOR_CLAUDE]]
+    out["new_for_claude_more"] = max(0, len(new) - NEW_FOR_CLAUDE)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------- Loki
@@ -397,6 +512,24 @@ def history(ddir, day, days=LOOKBACK_DAYS):
     return seen, sorted(found)
 
 
+REPEAT_DAYS = 7             # an owner item also seen on any of these days before is "ongoing", not new
+
+
+def alert_history(ddir, day, days=REPEAT_DAYS):
+    """{rule "what": number of the `days` days before `day` whose digest had it for the owner or held back}."""
+    out = {}
+    d0 = dt.date.fromisoformat(day)
+    for k in range(1, days + 1):
+        dd = (d0 - dt.timedelta(days=k)).isoformat()
+        try:
+            al = json.loads((Path(ddir) / "digests" / (dd + ".json")).read_text()).get("alerts") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        for w in {i.get("what") for i in (al.get("owner") or []) + (al.get("held") or [])}:
+            out[w] = out.get(w, 0) + 1
+    return out
+
+
 def summarize_lines(container, rows, rules):
     """rows [(ns, line)] -> container record: kinds with counts, routine/skipped/benign/fragment counts."""
     sigs, routine, skipped, benign, frags = {}, {}, 0, 0, 0
@@ -452,13 +585,13 @@ def group_of(container):
     return ONE_OFF if a in _DOCKER_ADJ and re.fullmatch(r"[a-z]+\d*", b or "") else container
 
 
-def build_day(loki, day, ddir, rules, say=print):
+def build_day(loki, day, ddir, rules, say=print, arules=()):
     start, end = day_bounds(day)
     counts = loki.error_counts(start, end)
     seen, hist_days = history(ddir, day)
     rec = {"day": day, "window": [_iso(start), _iso(end)], "generated": _iso(time.time()),
            "history_days": hist_days, "baseline": not hist_days, "containers": {}, "model": None}
-    groups = {}
+    groups, acc = {}, {}
     for c in sorted(counts, key=lambda k: -counts[k]):
         if counts[c] > 0:
             groups.setdefault(group_of(c), []).append(c)
@@ -470,6 +603,8 @@ def build_day(loki, day, ddir, rules, say=print):
             capped = capped or cp
         rows.sort(key=lambda x: x[0])
         info = summarize_lines(c, rows, rules)
+        for i, h in match_alerts(c, rows, arules).items():
+            acc.setdefault(i, []).append((c, h))
         info["capped"] = capped
         info["loki_count"] = sum(counts[n] for n in names)
         if c == ONE_OFF:
@@ -481,6 +616,11 @@ def build_day(loki, day, ddir, rules, say=print):
             rec["containers"][c] = info
         say("[error-digest] %s %s: %d lines, %d kinds, %d new%s" % (day, c, info["lines"], len(info["sigs"]),
             sum(1 for s in info["sigs"] if s["new"]), " (capped)" if capped else ""))
+    if arules:
+        rec["alerts"] = decide_alerts(acc, list(arules), rec["containers"])
+        prev = alert_history(ddir, day)
+        for it in rec["alerts"]["owner"] + rec["alerts"]["held"]:
+            it["seen_days"] = prev.get(it["what"], 0)
     return rec
 
 
@@ -521,6 +661,7 @@ def render(rec, top=5):
     elif m.get("status") == "failed":
         out.append("_No model notes today (the model job failed); plain counts only._")
     out.append("")
+    out += render_alerts(rec.get("alerts"))
     if new:
         out += ["## New today", ""]
         by_c = {}
@@ -576,6 +717,110 @@ def render(rec, top=5):
     return "\n".join(out).rstrip() + "\n"
 
 
+def _when(item):
+    n = item["count"]
+    w = "%s×, %s" % (f"{n:,}", _hm(item["first_ns"]) if n == 1 else "%s to %s" % (_hm(item["first_ns"]), _hm(item["last_ns"])))
+    if item.get("seen_days"):
+        w += "; also on %d of the last %d days" % (item["seen_days"], REPEAT_DAYS)
+    return w
+
+
+def render_alerts(al):
+    """The "For you" / "Held back" / "For Claude" sections (empty list when the day has no routing)."""
+    if not al:
+        return []
+    out = ["## For you", ""]
+    for it in al["owner"]:
+        out.append("- **%s** (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
+        out.append("  e.g. `%s`" % _short(it["sample"]))
+    if not al["owner"]:
+        out.append("Nothing needs you today.")
+    out.append("")
+    if al["held"]:
+        out += ["## Held back (not sent)", ""]
+        for it in al["held"]:
+            out.append("- %s (%s; %s): %s" % (it["what"], ", ".join(it["containers"]), _when(it), it["held"]))
+        out.append("")
+    if al["claude"] or al["new_for_claude"]:
+        out += ["## For Claude", ""]
+        for it in al["claude"]:
+            out.append("- %s (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
+        if al["new_for_claude"]:
+            out.append("- new kinds no rule covers yet:")
+            for n in al["new_for_claude"]:
+                out.append("  - %s, %s×: `%s`" % (n["container"], f"{n['count']:,}", _short(n["text"])))
+            if al.get("new_for_claude_more"):
+                out.append("  - plus %d more (in the JSON)" % al["new_for_claude_more"])
+        out.append("")
+    return out
+
+
+def notify_text(rec):
+    """(subject, text) of the daily message to the operator: their items first, held items, then counts only."""
+    al = rec.get("alerts") or {}
+    day = rec["day"]
+    wd = dt.date.fromisoformat(day).strftime("%a %b %-d")
+    mine, held = al.get("owner") or [], al.get("held") or []
+    fresh = sum(1 for i in mine if not i.get("seen_days"))
+    subj = "Unraid %s: %s" % (wd, "nothing needs you" if not mine else "%d thing%s for you%s" % (
+        len(mine), "" if len(mine) == 1 else "s",
+        "" if fresh == len(mine) else ", %s new" % (fresh or "none")))
+    mine = sorted(mine, key=lambda i: bool(i.get("seen_days")))      # new first
+    t = []
+    for it in mine:
+        t.append("- %s (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
+        t.append("    e.g. %s" % _short(it["sample"], 200).replace("`", "'"))
+    if not mine:
+        t.append("Nothing needs you today.")
+    if held:
+        t += ["", "Held back (you asked not to be sent these yet):"]
+        t += ["- %s: %s" % (it["what"], _when(it)) for it in held]
+    cs = rec.get("containers") or {}
+    n_lines = sum(sc["count"] for i in cs.values() for sc in i["sigs"])
+    nc = len(al.get("claude") or []) + len(al.get("new_for_claude") or []) + (al.get("new_for_claude_more") or 0)
+    t += ["", "Also logged: %s error/warning lines from %d containers; %d item%s for Claude to look at (not for you)." % (
+        f"{n_lines:,}", len(cs), nc, "" if nc == 1 else "s")]
+    t.append("Full digest: error-digest/digests/%s.md on Unraid." % day)
+    return subj, "\n".join(t) + "\n"
+
+
+def notify_settings():
+    """(url, token) for the daily message, from $ERROR_DIGEST_NOTIFY_URL and $ERROR_DIGEST_NOTIFY_TOKEN (or the file
+    $ERROR_DIGEST_NOTIFY_TOKEN_FILE). Either one unset: shadow (the message is only written to <day>.notify.txt)."""
+    url = os.environ.get("ERROR_DIGEST_NOTIFY_URL", "").strip()
+    tok = os.environ.get("ERROR_DIGEST_NOTIFY_TOKEN", "").strip()
+    tf = os.environ.get("ERROR_DIGEST_NOTIFY_TOKEN_FILE", "").strip()
+    if not tok and tf:
+        try:
+            tok = Path(tf).read_text().strip()
+        except OSError:
+            tok = ""
+    return url, tok
+
+
+def send_notify(rec):
+    """POST {app, ref, subject, text} with the bearer token; -> the rec["notify"] record. Never raises, never prints
+    the token or the URL's query."""
+    url, tok = notify_settings()
+    now = _iso(time.time())
+    if not url or not tok:
+        return {"status": "shadow", "at": now}
+    if not url.startswith("https://"):
+        return {"status": "failed", "at": now, "why": "the notify URL must be https"}
+    subj, text = notify_text(rec)
+    body = json.dumps({"app": "error-digest", "ref": rec["day"], "subject": subj, "text": text}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + tok, "User-Agent": "error-digest"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            code = r.status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"status": "failed", "at": now, "why": str(getattr(e, "reason", e))[:200]}
+    return {"status": "sent" if 200 <= code < 300 else "failed", "at": now, "http": code}
+
+
 def _short(t, n=150):
     t = t.replace("`", "'")
     return t if len(t) <= n else t[:n - 1] + "…"
@@ -584,7 +829,11 @@ def _short(t, n=150):
 def write_day(ddir, rec):
     d = Path(ddir) / "digests"
     d.mkdir(parents=True, exist_ok=True)
-    for name, text in ((rec["day"] + ".json", json.dumps(rec, indent=1)), (rec["day"] + ".md", render(rec))):
+    files = [(rec["day"] + ".json", json.dumps(rec, indent=1)), (rec["day"] + ".md", render(rec))]
+    if rec.get("alerts"):
+        subj, text = notify_text(rec)
+        files.append((rec["day"] + ".notify.txt", "Subject: %s\n\n%s" % (subj, text)))
+    for name, text in files:
         tmp = d / (name + ".tmp")
         tmp.write_text(text)
         os.chmod(tmp, 0o600)
@@ -638,19 +887,26 @@ def _arg(argv, flag, default=None):
     return default
 
 
-def seed_noise(ddir):
-    """noise.json lives in the digest dir so the operator's edits survive image updates; the first run copies the shipped one."""
-    dst = Path(ddir) / "noise.json"
-    src = Path(HERE) / "error_digest_noise.json"
-    if not dst.exists() and src.is_file():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(src.read_text())
-    return dst
+def noise_rules(ddir):
+    """The shipped noise rules (from the image) plus the digest dir's own noise.json, which is checked first. Same rule
+    twice (an old copy of the shipped file) counts once."""
+    out, seen = [], set()
+    for path in (Path(ddir) / "noise.json", Path(HERE) / "error_digest_noise.json"):
+        for r in load_noise(path):
+            if (r[0], r[1].pattern, r[2]) not in seen:
+                seen.add((r[0], r[1].pattern, r[2]))
+                out.append(r)
+    return out
+
+
+def alert_rules(ddir):
+    """The digest dir's own alerts.json (checked first) plus the shipped error_digest_alerts.json."""
+    return load_alerts(Path(ddir) / "alerts.json", Path(HERE) / "error_digest_alerts.json")
 
 
 def cmd_run(argv, days=None):
     ddir = digest_dir()
-    rules = load_noise(seed_noise(ddir))
+    rules, arules = noise_rules(ddir), alert_rules(ddir)
     url, tok = loki_settings()
     try:
         loki = Loki(url, tok)
@@ -659,6 +915,7 @@ def cmd_run(argv, days=None):
         return 2
     model = None if "--no-model" in argv else (_arg(argv, "--model") or os.environ.get("ERROR_DIGEST_MODEL")
                                               or MODEL_DEFAULT)
+    send = days is None and "--no-send" not in argv      # never from backfill
     if days is None:
         days = [_arg(argv, "--day") or _yesterday()]
     for day in days:
@@ -668,7 +925,7 @@ def cmd_run(argv, days=None):
             print("error-digest: bad --day %r (YYYY-MM-DD)" % day, file=sys.stderr)
             return 2
         try:
-            rec = build_day(loki, day, ddir, rules)
+            rec = build_day(loki, day, ddir, rules, arules=arules)
         except LokiError as e:
             print("error-digest: %s: %s" % (day, e), file=sys.stderr)
             return 1
@@ -682,6 +939,13 @@ def cmd_run(argv, days=None):
         want_model = bool(model and model_items(rec))
         if want_model:
             rec["model"] = {"status": "pending", "model": model}
+        if rec.get("alerts") and send:
+            prev = _prev_notify(ddir, day)
+            if prev.get("status") == "sent":
+                rec["notify"] = prev                      # one message per day, whatever reruns there are
+            elif day == _yesterday():
+                rec["notify"] = send_notify(rec)
+                print("[error-digest] daily message: %s" % rec["notify"]["status"])
         out = write_day(ddir, rec)
         print("[error-digest] wrote %s" % out)
         if want_model:
@@ -693,6 +957,13 @@ def cmd_run(argv, days=None):
                 rec["model"] = {"status": "failed", "model": model, "why": "not queued"}
                 write_day(ddir, rec)
     return 0
+
+
+def _prev_notify(ddir, day):
+    try:
+        return json.loads((Path(ddir) / "digests" / (day + ".json")).read_text()).get("notify") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def cmd_backfill(argv):
