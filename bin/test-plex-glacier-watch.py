@@ -364,6 +364,16 @@ if _qp.exists():
     _dm = (BIN / "queue-deadman.py").read_text()
     chk("deadman: a plex-gpu wait is a long hold, not a stall after 15 min", '"plex-gpu": 8 * 60.0' in _dm)
 
+import configparser
+import re as _re
+_c = configparser.RawConfigParser(strict=True)
+_c.read(BIN / "queue-image" / "supervisord.conf")
+_progs = [x for x in _c.sections() if x.startswith("program:")]
+_wf = _re.search(r"assert len\(p\)==(\d+)", (BIN / "queue-image" / "github-workflow-image.yml").read_text())
+chk("image: the watcher is a supervisord program", "program:plex-glacier-watch" in _progs, _progs)
+chk("image: the build workflow's program count matches supervisord.conf (11-15: the build failed on 10)",
+    _wf and int(_wf.group(1)) == len(_progs), (_wf and _wf.group(1), len(_progs)))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n%s (%d checks)" % ("ALL PASS" if not FAILS else "%d FAILED" % len(FAILS), N[0]))
 sys.exit(1 if FAILS else 0)

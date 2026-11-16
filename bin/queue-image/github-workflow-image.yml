@@ -51,7 +51,7 @@ jobs:
         run: |
           set -eu
           bash -n entrypoint.sh every.sh throttle.sh stage.sh
-          python3 -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('supervisord.conf'); p=[s for s in c.sections() if s.startswith('program:')]; assert len(p)==10, p; print(sorted(p))"
+          python3 -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('supervisord.conf'); p=[s for s in c.sections() if s.startswith('program:')]; assert len(p)==11, p; print(sorted(p))"
   publish:
     needs: test
     runs-on: ubuntu-24.04
