@@ -662,6 +662,7 @@ def render(rec, top=5):
         out.append("_No model notes today (the model job failed); plain counts only._")
     out.append("")
     out += render_alerts(rec.get("alerts"))
+    out += render_extra(rec.get("extra"))
     if new:
         out += ["## New today", ""]
         by_c = {}
@@ -755,6 +756,16 @@ def render_alerts(al):
     return out
 
 
+def render_extra(extra):
+    """One section per app that posted count lines for the day (digest_lines.py); [] when none did."""
+    out = []
+    for e in extra or []:
+        out += ["## %s%s" % (e["title"], " (needs you)" if e.get("needs_you") else ""), ""]
+        out += ["- %s" % _short(x, 200) for x in e["lines"]]
+        out.append("")
+    return out
+
+
 def notify_text(rec):
     """(subject, text) of the daily message to the operator: their items first, held items, then counts only."""
     al = rec.get("alerts") or {}
@@ -762,16 +773,24 @@ def notify_text(rec):
     wd = dt.date.fromisoformat(day).strftime("%a %b %-d")
     mine, held = al.get("owner") or [], al.get("held") or []
     fresh = sum(1 for i in mine if not i.get("seen_days"))
+    extra = rec.get("extra") or []
+    asks = [e["title"] for e in extra if e.get("needs_you")]
     subj = "Unraid %s: %s" % (wd, "nothing needs you" if not mine else "%d thing%s for you%s" % (
         len(mine), "" if len(mine) == 1 else "s",
         "" if fresh == len(mine) else ", %s new" % (fresh or "none")))
+    if asks:
+        subj = "Unraid %s: %s needs you%s" % (wd, " and ".join(asks), "" if not mine else "; %d thing%s for you" % (
+            len(mine), "" if len(mine) == 1 else "s"))
     mine = sorted(mine, key=lambda i: bool(i.get("seen_days")))      # new first
     t = []
     for it in mine:
         t.append("- %s (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
         t.append("    e.g. %s" % _short(it["sample"], 200).replace("`", "'"))
     if not mine:
-        t.append("Nothing needs you today.")
+        t.append("No errors need you today." if extra else "Nothing needs you today.")
+    for e in extra:
+        t += ["", "%s%s:" % (e["title"], " (needs you)" if e.get("needs_you") else "")]
+        t += ["- %s" % _short(x, 200) for x in e["lines"]]
     if held:
         t += ["", "Held back (you asked not to be sent these yet):"]
         t += ["- %s: %s" % (it["what"], _when(it)) for it in held]
@@ -935,6 +954,13 @@ def cmd_run(argv, days=None):
             if pg:
                 rec["plex_glacier"] = pg
         except Exception:  # noqa: BLE001 - see render()
+            pass
+        try:
+            import digest_lines
+            ex = digest_lines.read_day(day, ddir)
+            if ex:
+                rec["extra"] = ex
+        except Exception:  # noqa: BLE001 - the digest goes out without them
             pass
         want_model = bool(model and model_items(rec))
         if want_model:
