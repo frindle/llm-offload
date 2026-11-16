@@ -214,6 +214,9 @@ ALLOWED_RUNNERS = {
     # 2026-11-15: the nightly container error digest's model step (one "probably means" line per NEW error kind,
     # free model on the Unraid lane). Reads one digest JSON, prints only counts. error_digest.py queues it.
     str(Path.home() / "bin" / "error-digest-runner.py"),
+    # 2026-11-16: prompt jobs (prompt_jobs.py, POST /api/prompt-jobs): one app prompt, the model's JSON back, on a free
+    # lane only (see PROMPT JOBS). Prints only ids/sizes/codes.
+    str(Path.home() / "bin" / "prompt-json-runner.py"),
 }
 # RESOLVED FORMS TOO (2026-10-06, found by pipeline-canary.py): enqueue compares
 # Path(--runner).resolve() against these Path.home() strings, so a HOME that has a
@@ -261,6 +264,23 @@ def _is_gpu_exclusive_job(job):
     """True for a row created by `enqueue-gpu` (kind AND runner both say so)."""
     return (isinstance(job, dict) and job.get("job_kind") == GPU_JOB_KIND
             and job.get("runner") == GPU_JOB_RUNNER)
+
+
+# --- PROMPT JOBS (2026-11-16) ------------------------------------------------------------------------------------
+# A row prompt_jobs.py made for an app (POST /api/prompt-jobs): host_pref "prompt" AND the prompt runner. It runs on
+# whichever FREE lane in PROMPT_JOB_LANES comes first: "darkbloom" = the local Darkbloom lane with the model it has
+# LOADED right now (no load, no switch; nothing loaded or a hold/not-ready = skip that lane), then the named Ollama
+# hosts with the row's own model (Plex yield applies as usual). Nothing free = it waits; it never goes paid, has no
+# fit pass, never counts toward the QUEUE-IDLE page and never feeds the Darkbloom drift alert.
+PROMPT_HOST_PREF = "prompt"
+PROMPT_RUNNER_NAME = "prompt-json-runner.py"
+PROMPT_JOB_LANES = tuple(x.strip() for x in os.environ.get("PROMPT_JOB_LANES", "darkbloom,unraid").split(",")
+                         if x.strip())
+
+
+def _is_prompt_job(job):
+    return (isinstance(job, dict) and job.get("host_pref") == PROMPT_HOST_PREF
+            and os.path.basename(str(job.get("runner") or "")) == PROMPT_RUNNER_NAME)
 
 
 def gpu_job_result_path(job):
@@ -3532,7 +3552,7 @@ def idle_alert_pending(jobs, infra_wait=None):
     Mac doing its own thing; its reason is already in the wait state, and it is not paged (2026-11-15)."""
     out = []
     for j in jobs or ():
-        if j.get("status") != "pending":
+        if j.get("status") != "pending" or _is_prompt_job(j):   # an app's background prompt waiting is not a page
             continue
         try:
             if infra_wait is not None and infra_wait(j):
@@ -13135,9 +13155,12 @@ def _build_cmd(job, host_url):
         if runner not in ALLOWED_RUNNERS:
             raise ValueError(f"job {job.get('id')} names non-allowlisted runner {runner!r} "
                              f"(allowed: {sorted(ALLOWED_RUNNERS)}) -- refusing to launch it")
+        _rm = job["model"]
+        if _is_darkbloom_host(host_url):
+            _rm = (prompt_db_model() or _darkbloom_model(job["model"])) if _is_prompt_job(job) \
+                else _darkbloom_model(job["model"])
         return ["python3", runner,
-                "--model", (_darkbloom_model(job["model"]) if _is_darkbloom_host(host_url)
-                            else job["model"]), "--host", host_url,
+                "--model", _rm, "--host", host_url,
                 "--num-ctx", str(job["num_ctx"]),
                 "--cwd", job["cwd"], "--task-file", job["task_file"],
                 # runner_args: set only by an upload (queue_upload.RUNNER_FLAGS allowlist), e.g. mini-finish's remote check
@@ -13527,6 +13550,57 @@ def plex_gpu_wait(lane_name, now=None, path=None):
     return f"{lane_name}: Plex is playing (the GPU goes to Plex first)"
 
 
+def _darkbloom_loaded_ids():
+    """Model ids Darkbloom has LOADED now (loaded-models.json; in the container via the Mac status service's facts),
+    exact casing. [] when unknown. Never raises."""
+    try:
+        if queue_config.agent_url():
+            lm = (_agent_lane_facts() or {}).get("loaded_models")
+            ids = lm.get("models") if isinstance(lm, dict) else None
+        else:
+            ids = json.loads(DARKBLOOM_LOADED_JSON.read_text()).get("models")
+    except (OSError, ValueError, AttributeError):
+        ids = None
+    return [str(x) for x in (ids or []) if x]
+
+
+def prompt_db_model(loaded=None):
+    """The Darkbloom model a prompt job uses: the default when it is loaded, else the first loaded one, else None
+    (then the Darkbloom lane is skipped: a prompt job never makes Darkbloom load or switch a model)."""
+    loaded = _darkbloom_loaded_ids() if loaded is None else loaded
+    if not loaded:
+        return None
+    for m in loaded:
+        if m.lower() == str(DARKBLOOM_DEFAULT_MODEL).lower():
+            return m
+    return loaded[0]
+
+
+def _prompt_lanes(w):
+    """Ordered lanes for a prompt job (PROMPT_JOB_LANES)."""
+    out = []
+    for name in PROMPT_JOB_LANES:
+        if name == DARKBLOOM_HOST_NAME:
+            u = _darkbloom_url()
+        else:
+            u = _host_url_for(w, name)
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def prompt_db_lane_wait(now=None):
+    """None when a prompt job may start on the Darkbloom lane now, else the skip reason (then it tries its next lane)."""
+    dbm = prompt_db_model()
+    if not dbm:
+        return "darkbloom: no loaded model known (a prompt job never loads one)"
+    try:
+        note = darkbloom_launch_wait(dbm, time.time() if now is None else now)
+    except Exception as e:  # noqa: BLE001
+        return f"darkbloom: not checkable ({type(e).__name__})"
+    return None if note is None else "darkbloom: " + str(note.get("short") or "not ready")
+
+
 def _candidate_lanes(job, w):
     """Ordered list of lanes this job may run on. For auto jobs this mirrors
     pick_host()'s priority exactly: Studio always first; Unraid appended as
@@ -13543,6 +13617,8 @@ def _candidate_lanes(job, w):
     if _is_gpu_exclusive_job(job):
         _u = _host_url_for(w, pref)
         return [_u] if _u else []
+    if _is_prompt_job(job):
+        return _prompt_lanes(w)
     # DARKBLOOM: auto/studio/darkbloom all resolve to the one local lane, ahead of
     # every Ollama-shaped decision below (the llama-server bypass and Studio's
     # native Ollama are retired from routing). Unraid and explicit URLs fall through.
@@ -16803,7 +16879,8 @@ def cmd_run(args):
                     # Only the next run's model (the row the control pins): rows queued behind it
                     # are not drift (darkbloom_drift_need, 2026-11-07).
                     _need = (darkbloom_drift_need(state["jobs"],
-                                                  lambda j: _darkbloom_url() in _candidate_lanes(j, w),
+                                                  lambda j: (not _is_prompt_job(j)
+                                                             and _darkbloom_url() in _candidate_lanes(j, w)),
                                                   _darkbloom_model)
                              if time.time() - _DB_DRIFT.get("at", 0) >= 60 else None)
                     # Under the state lock: the /v1/models ids the pre-lock prime fetched (2026-11-02, no
@@ -16941,6 +17018,12 @@ def cmd_run(args):
                     if _external_dispatch_running(name):
                         _lane_why.append(f"external dispatch running on {name}")
                         continue
+                    # PROMPT JOBS: the Darkbloom lane only with its loaded model, ready, no hold; else the next lane.
+                    if _is_prompt_job(job) and _darkbloom_url() is not None and lane_url == _darkbloom_url():
+                        _pdw = prompt_db_lane_wait()
+                        if _pdw:
+                            _lane_why.append(_pdw)
+                            continue
                     running_here = [j for j in state["jobs"]
                                     if j.get("status") == "running" and j.get("lane")
                                     and _lane_name(j.get("lane")) == name]
@@ -17010,7 +17093,8 @@ def cmd_run(args):
                 # OOM incident this exists to prevent. Best-effort; a failed
                 # evict surfaces as a clear compute-error on launch, not a
                 # silent hang.
-                if _darkbloom_url() is not None and chosen == _darkbloom_url():
+                if _darkbloom_url() is not None and chosen == _darkbloom_url() and not _is_prompt_job(job):
+                    # (a prompt job had this check per lane above, with its loaded model)
                     # DARKBLOOM: health-check ONLY -- it owns residency; no eviction,
                     # no start/stop. Fail loudly with the fix rather than burn retries.
                     # INFRA WAIT, never a job failure (2026-10-06: a provider restart reset

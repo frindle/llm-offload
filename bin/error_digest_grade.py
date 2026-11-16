@@ -177,7 +177,8 @@ def report(argv, out=print):
     g = load_grades(ddir)
     ks = list(g["kinds"].values())
     if not ks:
-        out("No grades yet.")
+        out("No grades saved yet. Grades save after you answer the first page:"
+            " run grade.sh without 'report' to start grading.")
         return 0
     want = [k for k in ks if k.get("want")]
     noted = [k for k in ks if k.get("note") in ("wrong", "not marked")]

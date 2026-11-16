@@ -148,6 +148,15 @@ def t_report():
     shutil.rmtree(d)
 
 
+def t_report_empty():
+    d = setup()
+    out = []
+    G.report(["--dir", str(d)], out=out.append)
+    text = "\n".join(out)
+    chk("empty report says how to start", "No grades saved yet" in text and "without 'report'" in text, text)
+    shutil.rmtree(d)
+
+
 def t_rest_none():
     d = setup()
     # alpha has 12: "x" on page 1 marks all 12 not wanted; note on id002 not read -> "unread"; then beta "1", one-off q
@@ -180,7 +189,7 @@ def t_no_dir():
     shutil.rmtree(d)
 
 
-for t in (t_load_kinds, t_parse, t_flow, t_report, t_rest_none, t_unchecked, t_no_dir):
+for t in (t_load_kinds, t_parse, t_flow, t_report, t_report_empty, t_rest_none, t_unchecked, t_no_dir):
     t()
 print("ALL PASS (%d checks)" % N[0] if not FAILS else "%d FAILED of %d" % (len(FAILS), N[0]))
 sys.exit(1 if FAILS else 0)

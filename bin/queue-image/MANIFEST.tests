@@ -290,6 +290,7 @@ test_queue_agent.py
 test-darkbloom-model-configs-remote.py
 test-queue-drain.py
 test-error-digest.py
+test-prompt-jobs.py
 test-plex-glacier-watch.py
 test_review_remote_job.py
 test-bundle-infra-wait.py
