@@ -9,6 +9,9 @@ no fix jobs (not approved; ask first).
                                                                      build one day's digest (default: yesterday)
   error_digest.py backfill --days N [--no-model]                     build the last N days, oldest first
   error_digest.py show [--day YYYY-MM-DD]                            print a digest
+  error_digest.py days                                               the last 14 digests with their counts
+On a machine whose queue runs elsewhere (queue_config.queue_is_remote(), e.g. the operator's Mac), show and days read
+the queue API's GET /api/error-digest (the queue token; see api_read) instead of the local digest dir.
   error_digest.py grading --days N                                   one page for the operator to mark the errors worth knowing
 
 Per day it writes <dir>/digests/<day>.json and <day>.md (dir: $ERROR_DIGEST_DIR, else <dispatch dir>/error-digest).
@@ -1001,6 +1004,15 @@ def cmd_backfill(argv):
 
 def cmd_show(argv):
     day = _arg(argv, "--day") or _yesterday()
+    if _use_remote():
+        status, obj = fetch_remote({"day": day})
+        if status != 200:
+            print("error-digest: %s: %s" % (day, _remote_why(status, obj)), file=sys.stderr)
+            return 1
+        sys.stdout.write(obj.get("md") or "")
+        if obj.get("md_truncated"):
+            print("\n(cut at %d characters)" % API_MAX_MD)
+        return 0
     p = digest_dir() / "digests" / (day + ".md")
     try:
         sys.stdout.write(p.read_text())
@@ -1008,6 +1020,131 @@ def cmd_show(argv):
         print("error-digest: no digest for %s" % day, file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_days(argv):
+    if _use_remote():
+        status, obj = fetch_remote({})
+        if status != 200:
+            print("error-digest: %s" % _remote_why(status, obj), file=sys.stderr)
+            return 1
+    else:
+        status, obj = api_read("")
+    rows = obj.get("days") or []
+    if not rows:
+        print("no digests yet")
+    for r in rows:
+        print("%s  for you %d, for Claude %d, held %d, message %s, model %s" % (
+            r.get("day"), r.get("owner") or 0, r.get("claude") or 0, r.get("held") or 0,
+            r.get("notify") or "-", r.get("model") or "-"))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- read from elsewhere
+# The digest dir lives on the queue's machine (the Unraid container). The operator's Claude sessions run on the Mac, so
+# the queue API serves the stored digests at GET /api/error-digest[?day=YYYY-MM-DD]: a private read (the queue token,
+# like /api/state), read-only, and the day is checked against a strict pattern before any path is built.
+API_DAYS = 14
+API_MAX_MD = 512 * 1024
+_DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+
+
+def _claude_count(al):
+    return len(al.get("claude") or []) + len(al.get("new_for_claude") or []) + (al.get("new_for_claude_more") or 0)
+
+
+def _read_rec(path):
+    try:
+        rec = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _status_of(v):
+    return v.get("status") if isinstance(v, dict) else None
+
+
+def api_read(query="", ddir=None):
+    """(status, obj) for GET /api/error-digest; `query` is the URL's query string. No day: the newest API_DAYS digests
+    with their counts. A day: its Markdown (capped at API_MAX_MD) and its routed items. Only the send and model
+    statuses are passed on, never the rest of those records. Never raises."""
+    try:
+        d = Path(ddir or digest_dir()) / "digests"
+        day = (urllib.parse.parse_qs(query or "").get("day") or [""])[0]
+        if not day:
+            try:
+                names = [p.name[:-5] for p in d.iterdir() if p.name.endswith(".json")]
+            except OSError:
+                names = []
+            rows = []
+            for k in sorted((n for n in names if _DAY_RE.match(n)), reverse=True)[:API_DAYS]:
+                rec = _read_rec(d / (k + ".json"))
+                al = rec.get("alerts") if isinstance(rec.get("alerts"), dict) else {}
+                rows.append({"day": k, "owner": len(al.get("owner") or []), "claude": _claude_count(al),
+                             "held": len(al.get("held") or []), "notify": _status_of(rec.get("notify")),
+                             "model": _status_of(rec.get("model"))})
+            return 200, {"days": rows}
+        if not _DAY_RE.match(day):
+            return 400, {"error": "day must be YYYY-MM-DD"}
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError:
+            return 400, {"error": "day must be YYYY-MM-DD"}
+        rec = _read_rec(d / (day + ".json"))
+        try:
+            md = (d / (day + ".md")).read_text(errors="replace")
+        except OSError:
+            md = None
+        if md is None and not rec:
+            return 404, {"error": "no digest for " + day}
+        md = md or ""
+        return 200, {"day": day, "md": md[:API_MAX_MD], "md_truncated": len(md) > API_MAX_MD,
+                     "alerts": rec.get("alerts") if isinstance(rec.get("alerts"), dict) else {},
+                     "notify": _status_of(rec.get("notify")), "model": _status_of(rec.get("model"))}
+    except Exception as e:  # noqa: BLE001 - a read route must answer, not crash the handler
+        return 500, {"error": type(e).__name__}
+
+
+def _use_remote():
+    """True when the queue (and so the digest dir) is on another machine. Never inside the queue container."""
+    if os.environ.get("ERROR_DIGEST_DIR"):
+        return False
+    try:
+        import queue_config
+        return bool(queue_config.queue_is_remote())
+    except Exception:  # noqa: BLE001 - no queue config: read the local dir
+        return False
+
+
+def fetch_remote(params, timeout=30):
+    """(status, obj) from the queue API's /api/error-digest. Status 0 = no answer. The token is never printed."""
+    import queue_config
+    base, _tok = queue_config.queue_api()
+    url = base + "/api/error-digest" + ("?" + urllib.parse.urlencode(params) if params else "")
+    hdrs = dict(queue_config.queue_api_headers())
+    hdrs["User-Agent"] = "error-digest"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=timeout) as r:
+            obj = json.loads(r.read() or b"{}")
+            return r.status, obj if isinstance(obj, dict) else {}
+    except urllib.error.HTTPError as e:
+        try:
+            obj = json.loads(e.read() or b"{}")
+        except ValueError:
+            obj = {}
+        return e.code, obj if isinstance(obj, dict) else {}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {"error": type(e).__name__}
+
+
+def _remote_why(status, obj):
+    why = str((obj or {}).get("error") or "")[:200]
+    if status == 0:
+        return "the queue API did not answer (%s)" % (why or "no reply")
+    if status == 404 and not why:
+        return "the queue API has no /api/error-digest route yet (older image)"
+    return "queue API %d%s" % (status, (": " + why) if why else "")
 
 
 def cmd_grading(argv):
@@ -1046,7 +1183,8 @@ def main(argv=None):
         print(__doc__)
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
-    fn = {"run": cmd_run, "backfill": cmd_backfill, "show": cmd_show, "grading": cmd_grading}.get(cmd)
+    fn = {"run": cmd_run, "backfill": cmd_backfill, "show": cmd_show, "days": cmd_days,
+          "grading": cmd_grading}.get(cmd)
     if not fn:
         print(__doc__)
         return 2

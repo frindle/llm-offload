@@ -88,7 +88,7 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
 "
     log "GitHub credential written"
 else
-    log "WARNING: GITHUB_TOKEN is not set; pushes and private clones will fail"
+    log "note: no GITHUB_TOKEN, so git push and private clones are off (no queue job used them in the 7 days to 2026-11-16)"
 fi
 
 # ---- secret files the code reads from ~/.config ------------------------------------------------

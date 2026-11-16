@@ -8196,8 +8196,8 @@ def _lr_handle(method, path, headers, body):
 #   do_DELETE every DELETE except /api/cpu/*: /api/jobs/<id> (cancel, force=1), /api/log-retention*
 #   do_PUT    every PUT except /api/cpu/* (none exist besides the cpu lane)
 #   do_GET    no GET changes state today; the GETs that need the token are the two mirror routes
-#             (/api/mirror/events, /api/mirror/escalations) and /api/gpu-hold. Re-check this list when a GET route
-#             is added.
+#             (/api/mirror/events, /api/mirror/escalations), /api/gpu-hold, /api/state, /api/results and
+#             /api/error-digest. Re-check this list when a GET route is added.
 # The token and the Authorization header are never logged or echoed.
 import hmac as _hmac
 
@@ -8693,6 +8693,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  (qs.get("label") or [None])[0], limit)
         self._json({"results": rows})
 
+    def _error_digest(self):
+        # The stored daily error digests (error_digest.api_read) for the operator's Claude sessions on the Mac, which
+        # cannot see the digest dir. Digests quote container log lines, so this is a private read like /api/state.
+        if not self._require_private_read_auth("/api/error-digest"):
+            return
+        try:
+            import error_digest
+            status, obj = error_digest.api_read(urllib.parse.urlsplit(self.path).query)
+        except Exception as e:  # noqa: BLE001
+            print(f"[api] error-digest: {type(e).__name__}", file=sys.stderr)
+            return self._json({"error": "E_INTERNAL"}, 500)
+        return self._json(obj, status)
+
     def _gpu_hold_route(self):
         # Token-gated like the mirror routes (see the gate's docstring); answers only whether a lane's GPU is held.
         if not self._require_private_read_auth("/api/gpu-hold"):
@@ -9053,6 +9066,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._state()
         if self.path.split("?", 1)[0] == "/api/results":
             return self._results()
+        if self.path.split("?", 1)[0] == "/api/error-digest":
+            return self._error_digest()
         if _is_docsum_path(self.path):
             return self._docsum()
         if self.path.startswith("/api/cpu/"):
