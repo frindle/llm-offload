@@ -248,6 +248,183 @@ def test_noise():
     chk("a missing noise file is no rules", ED.load_noise(d / "nope.json") == [])
 
 
+def test_noise_local_adds():
+    d = Path(tempfile.mkdtemp())
+    (d / "noise.json").write_text(json.dumps([{"container": "app", "match": "local only", "action": "skip"},
+                                              {"container": "arr-webhook", "match": "Seed floor", "action": "skip"}]))
+    rules = ED.noise_rules(d)
+    chk("a local noise.json adds rules to the shipped ones", ED.noise_action(rules, "app", "x local only x") == "skip"
+        and ED.noise_action(rules, "sonarr", "[Warn] HealthCheckService: Indexers unavailable") == "skip")
+    chk("the local file is checked first", ED.noise_action(rules, "arr-webhook", "Seed floor 3d") == "skip")
+    n_shipped = len(ED.load_noise(BIN / "error_digest_noise.json"))
+    (d / "noise.json").write_text((BIN / "error_digest_noise.json").read_text())
+    chk("an old copy of the shipped file counts once", len(ED.noise_rules(d)) == n_shipped, len(ED.noise_rules(d)))
+    chk("cameras dropping off is routine (the operator already gets camera notifications)",
+        ED.noise_action(ED.noise_rules(d), "scrypted", "connect EHOSTUNREACH 192.0.2.3:554") == "routine")
+
+
+def test_alerts():
+    shipped = json.loads((BIN / "error_digest_alerts.json").read_text())
+    rules = ED.load_alerts(BIN / "error_digest_alerts.json")
+    chk("every shipped alert rule loads", len(rules) == len(shipped) and len(rules) >= 20, (len(rules), len(shipped)))
+    chk("shipped rules route only to owner or claude", {r["route"] for r in rules} == {"owner", "claude"})
+    chk("a bracketed component before the level reads as that level",
+        ED.level("[queue] WARNING: couldn't query http://h/api/ps (<urlopen error [Errno 111] Connection refused>)")
+        == "warn" and ED.level("[entrypoint] WARNING: GITHUB_TOKEN is not set") == "warn", ED.level("[queue] WARNING: x"))
+
+    def route(c, line):
+        hits = ED.match_alerts(c, [(1, line)], rules)
+        return rules[next(iter(hits))]["route"] if hits else None
+    cases = [("arr-webhook", "[rar] unpack of /dl/x.rar failed: CRC error", "owner"),
+             ("autobrr", "irc: banned from network", "owner"),
+             ("sonarr", "[Warn] Deluge: Unable to connect to Deluge", "owner"),
+             ("unpackerr", "Extraction Failed: /dl/x: no compressed files found", None),
+             ("unpackerr", "Extraction Failed: /dl/x: crc error", "owner"),
+             ("homebridge", "[11/7/2026, 4:00:10 AM] [Lutron] Failed to re-subscribe to events", "owner"),
+             ("ollama", "error: out of memory", "claude"),
+             ("vault", "committer: git push timed out", "claude"),
+             ("radarr", "[Warn] Unable to send notification to Webhook", "claude"),
+             ("binhex-jackett", "Error: Login failed", "owner")]
+    bad = [(c, l, route(c, l), want) for c, l, want in cases if route(c, l) != want]
+    chk("shipped rules route sample lines as graded", not bad, bad)
+
+    d = Path(tempfile.mkdtemp())
+    (d / "a.json").write_text(json.dumps([
+        {"route": "owner", "container": "web*", "match": "fatal thing", "what": "Fatal"},
+        {"route": "owner", "container": "web*", "match": "bad login", "what": "Logins", "min_count": 3},
+        {"route": "owner", "container": "web*", "match": "backend down", "what": "Backend", "sustain_min": 30, "gap_min": 10},
+        {"route": "owner", "container": "web*", "match": "held thing", "what": "Held", "hold": "not yet"},
+        {"route": "claude", "container": ["db", "cache"], "match": ".", "what": "DB"},
+        {"route": "owner", "match": "fatal", "what": "never: the first rule wins"},
+        {"route": "nobody", "match": "x", "what": "bad route"}, {"route": "owner", "match": "(", "what": "bad regex"},
+        {"route": "owner", "match": "x"}]))
+    ar = ED.load_alerts(d / "a.json")
+    chk("bad alert rules are dropped", len(ar) == 6, len(ar))
+    m = 60 * 10**9
+    rows = [(1 * m, "fatal thing happened"), (2 * m, "bad login for x"), (3 * m, "bad login for y"),
+            (4 * m, "held thing")] + [(k * 5 * m, "backend down") for k in range(0, 6)]   # one run of 25 min
+    acc = {}
+    for i, h in ED.match_alerts("web1", rows, ar).items():
+        acc.setdefault(i, []).append(("web1", h))
+    for i, h in ED.match_alerts("db", [(9 * m, "slow query")], ar).items():
+        acc.setdefault(i, []).append(("db", h))
+    sig_cov = ED.sig_id("web1", ED.signature("fatal thing happened"))
+    cs = {"web1": {"sigs": [{"id": sig_cov, "new": True, "level": "error", "count": 1, "text": "fatal thing happened"}]},
+          "other": {"sigs": [{"id": "n1", "new": True, "level": "error", "count": 4, "text": "brand new error"},
+                             {"id": "n2", "new": True, "level": "warn", "count": 9, "text": "a new warning"},
+                             {"id": "n3", "new": False, "level": "error", "count": 9, "text": "old error"}]}}
+    al = ED.decide_alerts(acc, ar, cs)
+    chk("a matched owner rule is for the owner, once per rule", [i["what"] for i in al["owner"]] == ["Fatal"], al["owner"])
+    held = {i["what"]: i["held"] for i in al["held"]}
+    chk("under min_count, under sustain_min and hold are held back with the reason",
+        set(held) == {"Logins", "Backend", "Held"} and "2× today, 3 needed" in held["Logins"]
+        and "longest run 25 min, 30 needed" in held["Backend"] and held["Held"] == "not yet", held)
+    chk("claude rules go to claude", [i["what"] for i in al["claude"]] == ["DB"], al["claude"])
+    chk("new unrouted error kinds go to claude; covered, warning and old kinds do not",
+        [n["id"] for n in al["new_for_claude"]] == ["n1"], al["new_for_claude"])
+    rows2 = [(k * 5 * m, "backend down") for k in range(0, 6)] + [(200 * m + k * 5 * m, "backend down") for k in range(8)]
+    acc2 = {i: [("web1", h)] for i, h in ED.match_alerts("web1", rows2, ar).items()}
+    al2 = ED.decide_alerts(acc2, ar, {})
+    chk("a run of 35 min (lines 5 min apart) passes sustain_min 30", [i["what"] for i in al2["owner"]] == ["Backend"]
+        and al2["owner"][0]["longest_min"] == 35.0, al2)
+    md = "".join(ED.render_alerts(al))
+    chk("render: owner, held and claude sections",
+        "## For you" in md and "**Fatal**" in md and "## Held back" in md and "## For Claude" in md
+        and "brand new error" in md, md)
+    chk("render: an empty owner list says so", "Nothing needs you today." in "\n".join(ED.render_alerts(al2 | {"owner": []})))
+
+
+class FakeNotify:
+    calls = []
+    code = 202
+
+    def __init__(self, real):
+        self.real = real
+
+    def __call__(self, req, timeout=None):
+        if not getattr(req, "full_url", "").startswith(("https://notify.test", "http://notify.test")):
+            return self.real(req, timeout=timeout)     # Loki
+        FakeNotify.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data)))
+        if FakeNotify.code >= 300:
+            raise urllib.error.HTTPError(req.full_url, FakeNotify.code, "no", {}, io.BytesIO(b"{}"))
+
+        class R:
+            status = FakeNotify.code
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return R()
+
+
+def test_notify(base):
+    tmp = Path(tempfile.mkdtemp(prefix="ed-notify-"))
+    y = ED._yesterday()
+    os.environ.update(LOKI_URL=base, LOKI_TOKEN="tok-test", ERROR_DIGEST_DIR=str(tmp))
+    FakeLoki.logs = {"homebridge": [(ns_at(y, 4), "[Lutron] Failed to re-subscribe to events, error ECONNRESET")],
+                     "ollama": [(ns_at(y, 5), "error: CUDA out of memory")],
+                     "vaultwarden": [(ns_at(y, 6), "[ERROR] Username or password is incorrect. Try again. IP: 192.0.2.9")]}
+    real = ED.urllib.request.urlopen
+    ED.urllib.request.urlopen = FakeNotify(real)
+    try:
+        for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
+            os.environ.pop(k, None)
+        rc, out, err = quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        nt = (tmp / "digests" / (y + ".notify.txt")).read_text()
+        chk("no notify URL: shadow, nothing sent, the message is written", rc == 0 and r["notify"]["status"] == "shadow"
+            and not FakeNotify.calls and nt.startswith("Subject: Unraid ") and "1 thing for you" in nt, (out, err, nt))
+        chk("the message: owner item and its sample; vaultwarden under 3 held back; claude items only counted",
+            "Lutron Pico buttons went silent" in nt and "Failed Vaultwarden logins" in nt and "Held back" in nt
+            and "CUDA" not in nt and "1 item for Claude" in nt, nt)
+        tf = tmp / "tok"
+        tf.write_text("notify-secret\n")
+        os.environ.update(ERROR_DIGEST_NOTIFY_URL="http://notify.test/send", ERROR_DIGEST_NOTIFY_TOKEN_FILE=str(tf))
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a plain-http notify URL is refused", r["notify"]["status"] == "failed" and not FakeNotify.calls, r["notify"])
+        os.environ["ERROR_DIGEST_NOTIFY_URL"] = "https://notify.test/send"
+        FakeNotify.code = 500
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a 500 is recorded as failed (and tried again on the next run)", r["notify"] == {**r["notify"], "status": "failed", "http": 500})
+        FakeNotify.code, FakeNotify.calls = 202, []
+        rc, out, err = quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        c = FakeNotify.calls
+        chk("sent once with the bearer token from the file; subject and text in the body",
+            r["notify"]["status"] == "sent" and len(c) == 1 and c[0][1] == "Bearer notify-secret"
+            and c[0][2]["app"] == "error-digest" and c[0][2]["ref"] == y and "for you" in c[0][2]["subject"]
+            and "Lutron" in c[0][2]["text"], (r.get("notify"), c))
+        chk("the token is never printed", "notify-secret" not in out + err)
+        quiet(ED.main, ["run", "--no-model"])
+        quiet(ED.main, ["run", "--no-model", "--day", y])
+        yy = (dt.date.fromisoformat(y) - dt.timedelta(days=1)).isoformat()
+        (tmp / "digests" / (yy + ".json")).write_text(json.dumps({"day": yy, "containers": {}, "alerts": {
+            "owner": [{"what": "Lutron Pico buttons went silent (re-subscribe failed)"}], "held": []}}))
+        rec = ED.build_day(ED.Loki(base, "tok-test"), y, tmp, ED.noise_rules(tmp), say=lambda *a: None,
+                           arules=ED.alert_rules(tmp))
+        subj, text = ED.notify_text(rec)
+        chk("an owner item also seen the day before is marked ongoing; the subject counts the new ones",
+            rec["alerts"]["owner"][0]["seen_days"] == 1 and subj.endswith("1 thing for you, none new")
+            and "also on 1 of the last 7 days" in text, (subj, text))
+        chk("a rerun of a sent day sends nothing and keeps the sent record", len(FakeNotify.calls) == 1
+            and json.loads((tmp / "digests" / (y + ".json")).read_text())["notify"]["status"] == "sent")
+        (tmp / "digests" / (y + ".json")).unlink()
+        quiet(ED.main, ["run", "--no-model", "--no-send"])
+        quiet(ED.main, ["backfill", "--days", "2", "--no-model"])
+        old = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+        quiet(ED.main, ["run", "--no-model", "--day", old])
+        chk("--no-send, backfill and an older --day never send", len(FakeNotify.calls) == 1, FakeNotify.calls[1:])
+    finally:
+        ED.urllib.request.urlopen = real
+        for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
+            os.environ.pop(k, None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_build_and_new(base, tmp):
     os.environ.update(LOKI_URL=base, LOKI_TOKEN="tok-test", ERROR_DIGEST_DIR=str(tmp))
     d1, d2, d3 = "2026-11-01", "2026-11-02", "2026-11-03"
@@ -272,7 +449,7 @@ def test_build_and_new(base, tmp):
     r1 = json.loads((tmp / "digests" / (d1 + ".json")).read_text())
     r2 = json.loads((tmp / "digests" / (d2 + ".json")).read_text())
     r3 = json.loads((tmp / "digests" / (d3 + ".json")).read_text())
-    chk("noise.json was seeded into the digest dir", (tmp / "noise.json").is_file())
+    chk("the shipped noise rules apply with no noise.json in the digest dir", not (tmp / "noise.json").exists())
     a1 = r1["containers"]["app"]
     chk("day 1: two lines, one kind, the '0 errors' INFO line is not an error",
         a1["sigs"][0]["count"] == 2 and len(a1["sigs"]) == 1 and a1["benign"] == 1, a1)
@@ -440,6 +617,9 @@ def main():
         test_render_caps()
         r2 = test_build_and_new(lbase, tmp)
         test_model_step(tmp, r2, obase)
+        test_noise_local_adds()
+        test_alerts()
+        test_notify(lbase)
         test_supervisor_and_allowlist()
     finally:
         lsrv.shutdown()

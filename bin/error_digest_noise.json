@@ -16,5 +16,7 @@
   {"container": "sonarr", "match": "HealthCheck|Unable to parse media info|No available indexers|Indexers? .*unavailable|Download clients? .*unavailable|root folder|IndexerStatusCheck|DownloadClientCheck|RootFolderCheck|IndexerRssCheck|IndexerSearchCheck", "action": "skip",
    "why": "already alerted by plex-automation arr_health.py"},
   {"container": "radarr", "match": "HealthCheck|Unable to parse media info|No available indexers|Indexers? .*unavailable|Download clients? .*unavailable|root folder|IndexerStatusCheck|DownloadClientCheck|RootFolderCheck|IndexerRssCheck|IndexerSearchCheck", "action": "skip",
-   "why": "already alerted by plex-automation arr_health.py"}
+   "why": "already alerted by plex-automation arr_health.py"},
+  {"container": "scrypted", "match": "EHOSTUNREACH|ETIMEDOUT|Unable to gather device information", "action": "routine",
+   "why": "operator, 2026-11-16: cameras come and go with Unraid docker restarts and already notify"}
 ]

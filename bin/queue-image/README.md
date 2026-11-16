@@ -49,6 +49,7 @@ Full list with placeholders: `env.example`. Secrets are masked in the Unraid tem
 | `QUEUE_API_TOKEN` | write-route token (env only) |
 | `CPU_RUNNER_TOKEN` | written to `~/.config/dispatch-cpu-runner/token` |
 | `LOKI_URL`, `LOKI_TOKEN` | nightly container error digest (`error_digest.py`, 05:07); empty = no digest |
+| `ERROR_DIGEST_NOTIFY_URL`, `ERROR_DIGEST_NOTIFY_TOKEN` | the digest's daily message is POSTed here once a day (https); empty = written to `<day>.notify.txt` only |
 | `OBSIDIAN_TOKEN` | written to `~/.config/ollama-worker/obsidian-token` |
 | `TAVILY_API`, `BRAVE_SEARCH_API`, `OLLAMA_WEB_SEARCH` | worker search keys (env only) |
 | `QUEUE_STANDBY` | `1` (image default): standby. Only the API (and docsum) start; the daemon, watchers and reaper stay stopped; every POST/PUT/DELETE answers 503 `{"error":"standby"}` except `/api/standby/*` (state import, back-test; write token, 404 outside standby); nothing notifies or posts to the Mac. Set `0` and restart the container to go live. |
