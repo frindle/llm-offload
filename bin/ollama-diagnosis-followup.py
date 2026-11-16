@@ -148,7 +148,7 @@ except ImportError:  # script copied elsewhere (tests): same definition, kept in
     import re as _re_dp
 
     def is_private_label(label):
-        return _re_dp.fullmatch(r"docsum-[0-9a-f]{8}", str(label or "")) is not None
+        return _re_dp.fullmatch(r"(?:docsum-[0-9a-f]{8}|prompt-[a-z0-9][a-z0-9-]{0,31}-[0-9a-f]{12})", str(label or "")) is not None
 
 
 def is_diagnosis_job(rec):

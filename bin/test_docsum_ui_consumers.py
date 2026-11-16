@@ -31,6 +31,23 @@ def test_handoff_emit_collect_excludes_docsum(monkeypatch):
     assert "docsum-0a1b2c3d" not in labels and "real-work-fix" in labels
 
 
+def test_handoff_emit_collect_excludes_prompt_jobs(monkeypatch):
+    he = load("he_t6", "handoff-emit.py")
+    pj = dict(ROW, id="eeee11112222", label="prompt-resell-tracker-eeee11112222", status="done")
+    monkeypatch.setattr(he, "load_jobs", lambda: [pj, dict(REAL)])
+    pending, complete = he.collect({})[:2]
+    labels = [j.get("label") for j in pending + complete]
+    assert "prompt-resell-tracker-eeee11112222" not in labels and "real-work-fix" in labels
+
+
+def test_docsum_page_lists_only_docsum_rows():
+    import docsum_private
+    assert docsum_private.is_docsum_label("docsum-0a1b2c3d")
+    assert not docsum_private.is_docsum_label("prompt-resell-tracker-0a1b2c3d4e5f")
+    src = open(os.path.join(HERE, "docsum_server.py")).read()
+    assert "is_docsum_label(j.get(\"label\"))" in src and "is_private_label" not in src
+
+
 def test_handoff_emit_collect_keeps_builder_docsum_labels(monkeypatch):
     he = load("he_t3", "handoff-emit.py")
     rows = [dict(ROW, label="docsum-ui-jobs", id="cccc11112222"), dict(ROW, label="docsum-cli", id="dddd11112222")]
@@ -44,7 +61,10 @@ def test_all_helpers_agree_and_only_8hex_is_private():
     mods = [load("he_t4", "handoff-emit.py"), load("ac_t4", "handoff-autoclear.py"), load("ht_t4", "handoff-triage.py"),
             load("df_t4", "ollama-diagnosis-followup.py"), load("w_t4", "dispatch-escalation-watcher.py"), docsum_private]
     for lab, want in (("docsum-0a1b2c3d", True), ("docsum-ui-jobs", False), ("docsum-cli", False), ("docsum-0a1b2c3", False),
-                      ("docsum-0a1b2c3d9", False), ("docsum-0A1B2C3D", False), ("x-docsum-0a1b2c3d", False), (None, False)):
+                      ("docsum-0a1b2c3d9", False), ("docsum-0A1B2C3D", False), ("x-docsum-0a1b2c3d", False), (None, False),
+                      ("prompt-resell-tracker-0a1b2c3d4e5f", True), ("prompt-a-0a1b2c3d4e5f", True),
+                      ("prompt-resell-tracker", False), ("prompt-0a1b2c3d4e5f", False), ("prompt-x-0a1b2c3d4e5", False),
+                      ("prompt-x-0a1b2c3d4e5f0", False), ("prompt-X-0a1b2c3d4e5f", False), ("x-prompt-a-0a1b2c3d4e5f", False)):
         for m in mods:
             assert m.is_private_label(lab) is want, (m.__name__, lab)
 

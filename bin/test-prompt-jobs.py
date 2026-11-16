@@ -132,6 +132,9 @@ def t_create():
     chk("row: prompt host pref + runner", row["host_pref"] == "prompt" and row["runner"].endswith("prompt-json-runner.py"))
     chk("row: research kind, fit pass skipped", row["task_kind"] == "research" and row["fit_checked"] is True)
     chk("row: label has no ref", row["label"] == "prompt-resell-tracker-" + jid)
+    import docsum_private
+    chk("row: label is private (kept off handoff lists, auto-clear digests and follow-ups)",
+        docsum_private.is_private_label(row["label"]) and not docsum_private.is_docsum_label(row["label"]))
     chk("row: model from PROMPT_JOB_MODEL default", row["model"] == "qwen3:8b")
     d = base / jid
     chk("dir 0700", stat.S_IMODE(d.stat().st_mode) == 0o700)
