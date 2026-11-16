@@ -34,6 +34,10 @@ def chk(name, cond, detail=""):
         FAILS.append(name)
 
 
+def eq(name, got, want, detail=""):
+    chk(name, got == want, "got %r, want %r %s" % (got, want, detail))
+
+
 # ------------------------------------------------------------------------------------------------ fake servers
 class FakeLoki(http.server.BaseHTTPRequestHandler):
     logs = {}          # container -> [(ns, line)]
@@ -606,6 +610,123 @@ def test_supervisor_and_allowlist():
                                                                     "error_digest_noise.json")), man[:5])
 
 
+class FakeQueueApi(http.server.BaseHTTPRequestHandler):
+    reply = None       # callable(path, query) -> (code, body bytes)
+    seen = []          # (path, query, Authorization)
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        FakeQueueApi.seen.append((u.path, u.query, self.headers.get("Authorization")))
+        code, b = FakeQueueApi.reply(u.path, u.query)
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b)
+
+
+def test_api_read():
+    tmp = Path(tempfile.mkdtemp(prefix="ed-api-"))
+    eq("api: no digests dir -> an empty list, not an error", ED.api_read("", tmp), (200, {"days": []}))
+    d = tmp / "digests"
+    d.mkdir()
+    al = {"owner": [{"what": "a"}], "claude": [{"what": "b"}], "held": [{"what": "c"}, {"what": "d"}],
+          "new_for_claude": [{"container": "x", "id": "1", "count": 2, "text": "t"}], "new_for_claude_more": 3}
+    (d / "2026-11-10.json").write_text(json.dumps({"day": "2026-11-10", "alerts": al, "model": {"status": "done", "model": "m"},
+                                                   "notify": {"status": "failed", "why": "https://hook.example/SECRET"}}))
+    (d / "2026-11-10.md").write_text("# digest 10\n")
+    (d / "2026-11-11.json").write_text(json.dumps({"day": "2026-11-11"}))
+    (d / "2026-11-12.json").write_text("[1, 2]")
+    (d / "2026-11-13.json").write_text("{not json")
+    (d / "notes.json").write_text("{}")
+    (d / "2026-11-1x.json").write_text("{}")
+    (d / "2026-11-10.json.tmp").write_text("{}")
+    st, obj = ED.api_read("", tmp)
+    eq("api: list is newest first, only real day files", (st, [r["day"] for r in obj["days"]]),
+        (200, ["2026-11-13", "2026-11-12", "2026-11-11", "2026-11-10"]), obj)
+    r10 = obj["days"][-1]
+    eq("api: list counts (for Claude = claude + new + more)", (r10["owner"], r10["claude"], r10["held"]), (1, 5, 2), r10)
+    eq("api: only the send and model statuses are passed on", (r10["notify"], r10["model"]), ("failed", "done"), r10)
+    chk("api: nothing else of the send record leaks", "SECRET" not in json.dumps(obj), obj)
+    eq("api: damaged or non-object records count as empty", [(r["owner"], r["notify"]) for r in obj["days"][:2]],
+        [(0, None), (0, None)], obj)
+    st, obj = ED.api_read("day=2026-11-10", tmp)
+    eq("api: a day -> its Markdown and routed items", (st, obj["md"], obj["alerts"]["claude"], obj["md_truncated"]),
+        (200, "# digest 10\n", [{"what": "b"}], False), obj)
+    eq("api: a day keeps the send record private too", ("SECRET" not in json.dumps(obj), obj["notify"]), (True, "failed"))
+    eq("api: a day with JSON but no Markdown -> empty md",
+        (lambda r: (r[0], r[1]["md"]))(ED.api_read("day=2026-11-11", tmp)), (200, ""))
+    eq("api: a day with nothing -> 404", ED.api_read("day=2026-11-20", tmp)[0], 404)
+    bad = ["day=..%2F..%2Fetc%2Fpasswd", "day=2026-11-10%0A", "day=2026-13-40", "day=2026-11-10%2F..%2F..%2Fx",
+           "day=20261110", "day=2026-11-1x", "day=%2Ftmp%2Fx"]
+    eq("api: anything but a real YYYY-MM-DD -> 400", [ED.api_read(q, tmp)[0] for q in bad], [400] * len(bad))
+    (d / "2026-11-14.md").write_text("x" * (ED.API_MAX_MD + 10))
+    st, obj = ED.api_read("day=2026-11-14", tmp)
+    eq("api: Markdown is capped", (st, len(obj["md"]), obj["md_truncated"]), (200, ED.API_MAX_MD, True))
+    for k in range(20):
+        (d / ("2026-10-%02d.json" % (k + 1))).write_text("{}")
+    eq("api: the list stops at API_DAYS", len(ED.api_read("", tmp)[1]["days"]), ED.API_DAYS)
+    old = ED.digest_dir
+    ED.digest_dir = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        eq("api: an unexpected error -> 500 with the type only", ED.api_read(""), (500, {"error": "RuntimeError"}))
+    finally:
+        ED.digest_dir = old
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_remote_show():
+    import types
+    srv, base = serve(FakeQueueApi)
+    fake = types.ModuleType("queue_config")
+    fake.queue_api = lambda: (base, "tok-remote")
+    fake.queue_api_headers = lambda: {"Authorization": "Bearer tok-remote"}
+    fake.queue_is_remote = lambda: True
+    saved_mod, saved_dir = sys.modules.get("queue_config"), os.environ.pop("ERROR_DIGEST_DIR", None)
+    sys.modules["queue_config"] = fake
+    try:
+        eq("remote: used when the queue is on another machine", ED._use_remote(), True)
+        os.environ["ERROR_DIGEST_DIR"] = "/nonexistent"
+        eq("remote: never when ERROR_DIGEST_DIR is set (the container, the tests)", ED._use_remote(), False)
+        os.environ.pop("ERROR_DIGEST_DIR")
+        FakeQueueApi.reply = lambda path, q: (200, json.dumps(
+            {"day": "2026-11-10", "md": "# remote digest\n", "md_truncated": False}).encode())
+        rc, out, err = quiet(ED.main, ["show", "--day", "2026-11-10"])
+        eq("remote show prints the served Markdown", (rc, out), (0, "# remote digest\n"), err)
+        eq("remote show asks for that day with the queue token",
+            FakeQueueApi.seen[-1], ("/api/error-digest", "day=2026-11-10", "Bearer tok-remote"))
+        chk("remote show never prints the token", "tok-remote" not in out + err)
+        FakeQueueApi.reply = lambda path, q: (200, json.dumps({"days": [
+            {"day": "2026-11-10", "owner": 1, "claude": 5, "held": 2, "notify": "sent", "model": "done"}]}).encode())
+        rc, out, err = quiet(ED.main, ["days"])
+        eq("remote days lists the counts", (rc, out.strip()),
+            (0, "2026-11-10  for you 1, for Claude 5, held 2, message sent, model done"), err)
+        eq("remote days asks without a day", FakeQueueApi.seen[-1][:2], ("/api/error-digest", ""))
+        FakeQueueApi.reply = lambda path, q: (404, b"not found")
+        rc, out, err = quiet(ED.main, ["show", "--day", "2026-11-10"])
+        chk("remote show on an older image says the route is missing", rc == 1 and "older image" in err, err)
+        FakeQueueApi.reply = lambda path, q: (404, json.dumps({"error": "no digest for 2026-11-10"}).encode())
+        rc, out, err = quiet(ED.main, ["show", "--day", "2026-11-10"])
+        chk("remote show with no digest for the day says so", rc == 1 and "no digest for 2026-11-10" in err, err)
+        FakeQueueApi.reply = lambda path, q: (401, json.dumps({"ok": False, "error": "unauthorized"}).encode())
+        rc, out, err = quiet(ED.main, ["days"])
+        chk("remote days on a refused token: rc 1, says 401, no token", rc == 1 and "401" in err
+            and "tok-remote" not in out + err, err)
+        srv.shutdown()
+        srv.server_close()
+        rc, out, err = quiet(ED.main, ["show", "--day", "2026-11-10"])
+        chk("remote show with the queue down: rc 1, says it did not answer", rc == 1 and "did not answer" in err, err)
+    finally:
+        if saved_mod is not None:
+            sys.modules["queue_config"] = saved_mod
+        else:
+            sys.modules.pop("queue_config", None)
+        if saved_dir is not None:
+            os.environ["ERROR_DIGEST_DIR"] = saved_dir
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="ed-test-"))
     lsrv, lbase = serve(FakeLoki)
@@ -621,6 +742,8 @@ def main():
         test_alerts()
         test_notify(lbase)
         test_supervisor_and_allowlist()
+        test_api_read()
+        test_remote_show()
     finally:
         lsrv.shutdown()
         osrv.shutdown()

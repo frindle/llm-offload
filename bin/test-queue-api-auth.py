@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test-queue-api-auth.py -- write-route auth (QUEUE_API_TOKEN) and the two mirror routes of the queue dashboard API
+"""test-queue-api-auth.py -- write-route auth (QUEUE_API_TOKEN), the mirror routes and the private reads of the queue dashboard API
 (ollama-queue-api.py), run against the REAL Handler on 127.0.0.1 port 0.
 
 Proves: no token = every route open (as before); token + loopback peer = open; token + non-loopback peer (simulated by a
@@ -150,6 +150,18 @@ def main():
     check("no token / loopback: results -> 200", call(lo, "GET", "/api/results")[0], 200)
     check("no token / loopback + Cf header: results refused", call(lo, "GET", "/api/results", headers={"Cf-Ray": "x"})[0], 403)
 
+    # /api/error-digest: the stored daily error digests (error_digest.api_read), a private read like /api/results
+    edd = tmp / "error-digest" / "digests"
+    edd.mkdir(parents=True)
+    os.environ["ERROR_DIGEST_DIR"] = str(edd.parent)
+    (edd / "2026-11-10.json").write_text(json.dumps({"day": "2026-11-10", "alerts": {"claude": [{"what": "b"}]},
+                                                     "notify": {"status": "sent", "why": "never-served"}}))
+    (edd / "2026-11-10.md").write_text("# digest\n")
+    check("no token / LAN peer: error-digest -> 403", call(lan, "GET", "/api/error-digest")[0], 403)
+    check("no token / loopback: error-digest -> 200", call(lo, "GET", "/api/error-digest")[0], 200)
+    check("no token / loopback + Cf header: error-digest refused",
+          call(lo, "GET", "/api/error-digest?day=2026-11-10", headers={"Cf-Ray": "x"})[0], 403)
+
     # /api/cli: run an allowlisted command on the queue host. No token: loopback only, and never with a proxy header.
     CLI_OK = ("POST", "/api/cli", {"tool": "qctl", "argv": ["--help"]})
     check("no token / LAN peer: /api/cli -> 403", call(lan, *CLI_OK)[0], 403)
@@ -193,6 +205,25 @@ def main():
     check("results: label is a case-insensitive substring", [x["id"] for x in r[1]["results"]], ["r2"])
     check("results: limit=junk -> 400", call(lan, "GET", "/api/results?limit=abc", headers=bearer)[0], 400)
     check("results: limit=0 -> all", len(call(lan, "GET", "/api/results?limit=0", headers=bearer)[1]["results"]), 3)
+
+    # ---- /api/error-digest, key configured -------------------------------------------------------------------------------------------
+    check("error-digest: LAN peer without bearer -> 401", call(lan, "GET", "/api/error-digest")[0], 401)
+    check("error-digest: LAN peer with a wrong bearer -> 401",
+          call(lan, "GET", "/api/error-digest?day=2026-11-10", headers={"Authorization": "Bearer x"})[0], 401)
+    check("error-digest: loopback + Cf header needs the bearer",
+          call(lo, "GET", "/api/error-digest", headers={"Cf-Ray": "x"})[0], 401)
+    r = call(lan, "GET", "/api/error-digest", headers=bearer)
+    check("error-digest: right bearer -> the day list with counts",
+          (r[0], [(x["day"], x["claude"], x["notify"]) for x in r[1]["days"]]), (200, [("2026-11-10", 1, "sent")]))
+    r = call(lan, "GET", "/api/error-digest?day=2026-11-10", headers=bearer)
+    check("error-digest: right bearer -> that day's Markdown", (r[0], r[1]["md"]), (200, "# digest\n"))
+    check("error-digest: the send record's details are never served", "never-served" not in json.dumps(r[1]), True)
+    check("error-digest: a path in the day -> 400",
+          call(lan, "GET", "/api/error-digest?day=..%2F..%2Fetc%2Fpasswd", headers=bearer)[0], 400)
+    check("error-digest: a day with no digest -> 404",
+          call(lan, "GET", "/api/error-digest?day=2026-11-11", headers=bearer)[0], 404)
+    check("error-digest: a longer path is not this route",
+          call(lan, "GET", "/api/error-digest/2026-11-10", headers=bearer)[0] != 200, True)
 
     # ---- mirror routes -------------------------------------------------------------------------------------------------------------
     qel = tmp / "qel"
