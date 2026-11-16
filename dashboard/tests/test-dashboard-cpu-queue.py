@@ -15,7 +15,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REAL_HOME = os.environ["HOME"]
 FAILS = []
-DEFAULT_SRC = Path(REAL_HOME) / "Desktop/GitHub Projects/ollama-queue-dashboard/src/ollama-queue-api.py"
+# this checkout's own src (or $DASHBOARD_SRC, as the other dashboard tests), not a fixed Desktop path: the sandbox
+# gate and the queue image have no ~/Desktop checkout
+DEFAULT_SRC = Path(os.environ.get("DASHBOARD_SRC") or HERE.parent / "src") / "ollama-queue-api.py"
 
 MUTANTS = [
     ("empty line ignores CPU stages",

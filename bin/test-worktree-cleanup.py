@@ -141,6 +141,53 @@ class T(unittest.TestCase):
             os.utime(p, (t, t))
         r, _ = self.run_(d); self.assertEqual(r["action"], "remove", r); self.assertTrue(r["removed"], r); self.assertFalse(os.path.exists(d))
 
+    def clone_(self, name, src=None):
+        d = os.path.join(self.root, name)
+        g(self.tmp, "clone", "-q", src or os.path.join(self.tmp, "origin.git"), d)
+        return d
+
+    def old(self, d):
+        t = time.time() - 48 * 3600
+        for p in [d] + [os.path.join(d, n) for n in os.listdir(d) if n != ".git"] + \
+                [os.path.join(d, ".git", f) for f in ("HEAD", "index", "logs/HEAD")]:
+            if os.path.exists(p):
+                os.utime(p, (t, t))
+
+    def side_commit(self, d, branch="side"):
+        g(d, "checkout", "-q", "-b", branch); w(f"{d}/s.py", branch + "\n"); g(d, "add", "-A")
+        g(d, "commit", "-qm", branch); g(d, "checkout", "-q", "main")
+
+    def test_clone_with_unpushed_side_branch_kept(self):
+        # HEAD (main) is landed, but a local branch is not: rmtree would lose it (the 11-15 sweep bug)
+        d = self.clone_("side1"); self.side_commit(d); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "keep", r); self.assertIn("side", r["reason"])
+        self.assertTrue(os.path.isdir(d))
+
+    def test_clone_with_unpushed_annotated_tag_kept(self):
+        d = self.clone_("tag1"); w(f"{d}/t.py"); g(d, "add", "-A"); g(d, "commit", "-qm", "t")
+        g(d, "tag", "-a", "v9", "-m", "v9"); g(d, "reset", "-q", "--hard", "origin/main"); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "keep", r); self.assertIn("v9", r["reason"])
+
+    def test_clone_with_stash_kept(self):
+        d = self.clone_("stash1"); w(f"{d}/a.py", "2\n"); g(d, "stash", "-q"); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "keep", r); self.assertIn("stash", r["reason"])
+
+    def test_clone_whose_local_remote_is_gone_kept(self):
+        src = os.path.join(self.tmp, "gone.git"); g(self.tmp, "clone", "-q", "--bare", os.path.join(self.tmp, "origin.git"), src)
+        d = self.clone_("gone1", src); import shutil; shutil.rmtree(src); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "keep", r); self.assertIn("no remote", r["reason"])
+
+    def test_clone_whose_remote_is_under_the_root_kept(self):
+        inner = self.clone_("inner-src")      # a clone under the managed root may be swept in the same run
+        d = self.clone_("outer1", inner); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "keep", r); self.assertIn("no remote", r["reason"])
+
+    def test_clone_branch_found_in_local_source_repo_removed(self):
+        # tracking refs are stale, but the local source repo has the branch's commit on a ref: nothing is lost
+        d = self.clone_("src1", self.repo); self.side_commit(d)
+        g(self.repo, "fetch", "-q", d, "side:from-clone"); self.old(d)
+        r, _ = self.run_(d); self.assertEqual(r["action"], "remove", r); self.assertFalse(os.path.exists(d))
+
     def test_feature_branch_in_primary_is_not_landed(self):
         g(self.repo, "checkout", "-q", "-b", "feature"); w(f"{self.repo}/f.py"); g(self.repo, "add", "-A")
         g(self.repo, "commit", "-qm", "f")

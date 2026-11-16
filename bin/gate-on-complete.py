@@ -7083,38 +7083,15 @@ def _self_test() -> bool:
               _rec.get("auto_pipeline_action"), "advance-to-coding")
         check("C shadow: does NOT actually advance (no marker set)",
               _rec.get("auto_pipeline_advanced"), None)
-        # 2026-09-17: the shadow preview is now downstream of the RISK TIER. This
-        # tree has no fixture for the automated relevance pass to certify, so the
-        # tier holds it for a human and there is deliberately NO preview -- a
-        # preview of an auto-seal the live path would refuse is a preview of the
-        # wrong system.
-        check("C shadow: no-fixture tree is HELD for a human, not previewed",
-              (_rec.get("auto_confirm_tier"), _rec.get("auto_pipeline_status")),
-              ("human", "held-for-human-confirm"))
-        check("C shadow: a held tree records NO command preview",
-              _rec.get("auto_pipeline_advance_preview"), None)
-        # ...and the other half: a LOW-risk tree (benign task, faithful fixture,
-        # lint present) still previews exactly as before. Without this the tier
-        # could be refusing everything and the suite would look green.
-        _lowwt = _td / "wt_shadow_low"
-        _lowwt.mkdir(parents=True, exist_ok=True)
-        (_lowwt / "TASK.md").write_text(
-            "Fix the codec rank ordering in ranker.py so a higher tier never "
-            "sorts below a lower one. Only edit ranker.py.\n")
-        (_lowwt / "verify.sh").write_text("exit 0\n")
-        (_lowwt / "test_fixture.py").write_text(_SELFTEST_FAITHFUL_FIXTURE)
-        if (_orig_bin / "faithful-harness-lint.py").exists():
-            _sh.copy2(_orig_bin / "faithful-harness-lint.py",
-                      _td / "faithful-harness-lint.py")
-            _gjl = _td / "ollama-queue-logs" / "cadvlow.gate.json"
-            _pll = dict(_clean_proven)
-            _pll["job_label"] = "auto-author-low"; _pll["cwd"] = str(_lowwt)
-            auto_pipeline_consider("cadvlow", _pll, _gjl)
-            _recl = json.loads(_gjl.read_text())
-            check("C shadow: LOW-risk tree is previewed (tier discriminates)",
-                  (_recl.get("auto_confirm_tier"),
-                   bool(_recl.get("auto_pipeline_advance_preview"))),
-                  ("low", True))
+        # The auto-author -> coding pipeline is retired (advance_to_coding parks with
+        # "use mini-swe"), so its risk tier and shadow command preview are gone too:
+        # a shadow decision now records the park and nothing else.
+        check("C shadow: the retired advance parks (advance-failed) with no tier and no preview",
+              (_rec.get("auto_pipeline_status"), _rec.get("auto_confirm_tier"),
+               _rec.get("auto_pipeline_advance_preview")),
+              ("advance-failed", None, None))
+        check("C shadow: the park says to use mini-swe",
+              "mini-swe" in str(_rec.get("auto_pipeline_error")), True)
         # HALT+SURFACE: advance on an INCOMPLETE harness (no verify.sh) parks/records
         # the failure and never sets the advanced marker.
         _gjh = _td / "ollama-queue-logs" / "chalt.gate.json"

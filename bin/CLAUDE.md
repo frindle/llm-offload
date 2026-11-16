@@ -20,7 +20,7 @@ Job names: `area-change[-step]`, never project-fix-uN. After a failed job: `pyth
 ## Rules
 - No AI attribution in commits. I commit and push; origin is archived so commits stay local.
 - GitHub copy: `frindle/llm-offload` (PUBLIC; clone at `~/Desktop/GitHub Projects.nosync/llm-offload`). It also carries the dashboard and CPU runner checkouts, and CI builds the runner image (`ghcr.io/frindle/llm-offload-cpu-runner`) that Unraid pulls. After committing here, or in the dashboard or runner checkout, or changing a hook, plist or config listed in its `MANIFEST.txt`, run `offload-repo-sync`: it copies HEAD and those files one-way, runs the secret guard, scrubs private info (rules outside git in `~/.config/llm-offload/`), scans what is left, runs the test gate, commits and pushes. A scan hit means a new scrub rule, a `.private-allow` line for a known fake, or (for `[runtime]` files such as `cpu-runner/`) a fix at the source. Never edit the copy's synced folders. The old repos (claude-offload, local-llm-dispatch, ollama-queue-dashboard, dispatch-cpu-runner, ollama-bakeoff) are retired: never push to them.
-- Never create/remove `~/.claude/.qwen-manual`. Bulk work goes to the queue, reasoning stays with Claude.
+- Coding is not offloaded to Qwen (2026-11-15): Claude writes code directly; the old coding gates and `~/.claude/.qwen-manual` are retired. Bulk non-coding work goes to the queue, reasoning stays with Claude.
 - Never print secrets (Keychain, tokens, TL passkey).
 
 ## Darkbloom / BloomGauge: hands off

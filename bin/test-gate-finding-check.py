@@ -30,8 +30,7 @@ against the model family that made the claims):
     b1b085738769  relevance LOW (the spec-defect case)                      -> PARKS (plan none)
   pre-existing: ee33616e78f9's real stores_image defect, run on a330's trees -> advisory
 
-Usage: GATE=<gate-on-complete.py> GFC=<gate_finding_check.py> CRA=<code-review-agent.py>
-       SLICE=<ollama-dispatch-slice> python3 this.py
+Usage: GATE=<gate-on-complete.py> GFC=<gate_finding_check.py> CRA=<code-review-agent.py> python3 this.py
 Revert check: point them at the .bak files (GFC at a missing path) -> every test FAILs.
 """
 import importlib.machinery
@@ -51,7 +50,6 @@ BIN = Path.home() / "bin"
 GATE = Path(os.environ.get("GATE", BIN / "gate-on-complete.py"))
 GFC = Path(os.environ.get("GFC", BIN / "gate_finding_check.py"))
 CRA = Path(os.environ.get("CRA", BIN / "code-review-agent.py"))
-SLICE = Path(os.environ.get("SLICE", BIN / "ollama-dispatch-slice"))
 sys.path.insert(0, str(BIN))   # sibling modules the loaded scripts import
 
 TMP = Path(tempfile.mkdtemp(prefix="test-gfc-"))
@@ -99,7 +97,7 @@ _mods = {}
 def mod(key):
     if key not in _mods:
         path, name = {"gfc": (GFC, "gate_finding_check"), "goc": (GATE, "goc_under_test"),
-                      "cra": (CRA, "cra_under_test"), "slice": (SLICE, "slice_under_test")}[key]
+                      "cra": (CRA, "cra_under_test")}[key]
         m = load(path, name)
         if key == "goc":
             m._GFC_MOD = mod("gfc")   # one module object (raises on the .bak: no _GFC_MOD)
@@ -583,17 +581,8 @@ def test_runner_refute_mode():
         str(out["rows"][0]["problem"]).startswith("model call failed"), True)
 
 
-# ------------------------------------------------------------------ slicer
-
-@test
-def test_slicer_never_lands_a_lost_check():
-    sl = mod("slice")
-    chk("pending finding check -> wait", sl.coding_land_route("pending-finding-check", 60), "wait")
-    chk("lost finding check -> ESCALATE, never land on the live verify alone",
-        sl.coding_land_route("pending-finding-check", sl.GATE_VERDICT_WAIT_S), "escalate")
-    chk("untimeable -> escalate", sl.coding_land_route("pending-finding-check", None), "escalate")
-    chk("unchanged: no verdict past the wait still lands",
-        sl.coding_land_route(None, sl.GATE_VERDICT_WAIT_S), "land")
+# (test_slicer_never_lands_a_lost_check retired 2026-11-15: ollama-dispatch-slice and its coding_land_route were
+#  removed in 2637810 with the rest of the old dispatch tools; nothing lands slices any more.)
 
 
 @test

@@ -14,6 +14,10 @@ by file content. A worktree/clone is removed ONLY when ALL hold:
   6. no commit missing from landed work: HEAD is an ancestor of a landed ref (origin/HEAD,
      origin/main|master, main|master, the primary checkout's branch) OR contained in a
      remote-tracking branch
+  7. a plain clone (deleted whole) also needs: no stash, and EVERY local branch and tag tip (not
+     just HEAD) on a remote that outlives it -- a network remote's tracking refs, or a local
+     source repo that still exists outside the managed roots and has the commit on one of its refs
+     (2026-11-15: 76 of 97 clones in a sweep held local-branch commits that HEAD alone hid)
 Anything it cannot prove (unreadable gitdir, git error) is KEPT, with the reason logged.
 
   worktree_cleanup.py sweep [--apply] [--grace-hours H] [--root DIR]...   # dry-run default
@@ -34,6 +38,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -182,6 +187,68 @@ def landed_refs(wt, common):
     return out
 
 
+def _surviving_remotes(wt, roots):
+    """A plain clone's remotes that outlive it -> [(name, local_repo_path or None for network)]. A local-path
+    remote that is gone, or that sits under a managed root (it may be swept in the same run), does not count."""
+    out = []
+    for name in git(["remote"], wt).stdout.split():
+        url = git(["remote", "get-url", name], wt).stdout.strip()
+        if not url:
+            continue
+        path = None
+        if url.startswith("file://"):
+            path = url[len("file://"):]
+        elif url.startswith(("/", ".", "~")) or not re.match(r"^[^/]*:", url):   # not scheme:// or scp-like host:
+            path = url
+        if path is not None:
+            path = os.path.expanduser(path)
+            if not os.path.isabs(path):
+                path = os.path.join(wt, path)
+            path = real(path)
+            if not os.path.isdir(path) or any(under(path, real(r)) for r in roots):
+                continue
+        out.append((name, path))
+    return out
+
+
+def clone_loses(wt, roots):
+    """A plain clone is deleted whole, so HEAD landing is not enough. -> why it must stay, or '' when every
+    local branch and tag tip (and HEAD) is on a surviving remote and there is no stash."""
+    if git(["rev-parse", "-q", "--verify", "refs/stash"], wt).returncode == 0:
+        return "clone has a stash"
+    keepers = _surviving_remotes(wt, roots)
+    if not keepers:
+        return "clone has no remote that outlives it (none, gone, or under a managed root)"
+    r = git(["for-each-ref", "--format=%(objectname) %(*objectname) %(refname:short)", "refs/heads", "refs/tags"], wt)
+    if r.returncode != 0:
+        return "cannot list the clone's branches and tags"
+    tips = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            tips.setdefault(parts[0], parts[1])
+        elif len(parts) >= 3:                       # annotated tag: the peeled commit
+            tips.setdefault(parts[1], parts[2])
+    h = git(["rev-parse", "-q", "--verify", "HEAD"], wt)
+    if h.returncode == 0:
+        tips.setdefault(h.stdout.strip(), "HEAD")
+    if not tips:
+        return ""
+    rl = git(["rev-list", *sorted(tips), "--not", *[f"--remotes={n}" for n, _ in keepers]], wt)
+    if rl.returncode != 0:
+        return f"cannot verify the clone's branches: {rl.stderr.strip()[:120]}"
+    missing = [s for s in sorted(tips) if s in set(rl.stdout.split())]
+    local = [p for _, p in keepers if p]
+    if missing and local and len(missing) <= 50:   # tracking refs can be stale: ask the local source repo itself
+        missing = [s for s in missing if not any(
+            (c := git(["for-each-ref", "--contains", s, "--count=1", "--format=%(refname)"], p)).returncode == 0
+            and c.stdout.strip() for p in local)]
+    if missing:
+        return (f"clone has {len(missing)} branch/tag tip(s) on no surviving remote, e.g. {tips[missing[0]]}"
+                f" ({missing[0][:10]})")
+    return ""
+
+
 # --- decision ----------------------------------------------------------------------
 
 def running_cwds():
@@ -273,6 +340,10 @@ def _evaluate(wt, now, grace, live, procs, rp, roots):
                 [f"--branches=main", "--branches=master"], wt)
         return "keep", f"unlanded commits: HEAD {sha[:10]} not on any landed ref or remote" \
                        f" ({n.stdout.strip() or '?'} unique)", {}
+    if kind == "clone":
+        lost = clone_loses(wt, roots)
+        if lost:
+            return "keep", lost, {}
     info = {"branch": branch, "landed_on": landed, "kind": kind, "head": sha[:10]}
     return "remove", f"clean, HEAD {sha[:10]} landed on {landed}, idle {age / 3600:.0f}h", info
 

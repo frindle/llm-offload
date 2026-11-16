@@ -176,10 +176,14 @@ gate._escalate_regate = _boom
 # COMPLETED_ROOT; with the REAL ids of s4/s5 this rewrote the live
 # ollama-queue-logs/auto-fix/<id>.rounds.json (2026-10-02). Reads that matter
 # here come from the temp out_dir, so a temp BIN is safe.
+# The ledger moved under STATE_DIR (queue_config.state_dir(), ~/bin on the Mac) when the queue got a state dir of
+# its own, so STATE_DIR and what is derived from it at import are sandboxed too.
 _SANDBOX = Path(tempfile.mkdtemp(prefix="rfch-sandbox-"))
 (_SANDBOX / "ollama-queue-logs" / "auto-fix").mkdir(parents=True)
-_REAL_AUTOFIX = Path(gate.BIN) / "ollama-queue-logs" / "auto-fix"
+_REAL_AUTOFIX = Path(gate.STATE_DIR) / "ollama-queue-logs" / "auto-fix"
 gate.BIN = _SANDBOX
+gate.STATE_DIR = _SANDBOX
+gate.QUEUE_STATE = _SANDBOX / "ollama-queue-state.json"
 gate.COMPLETED_ROOT = _SANDBOX / "Completed"
 gate.TEST_MODE = True
 

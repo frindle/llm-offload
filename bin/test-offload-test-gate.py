@@ -2,7 +2,7 @@
 """Tests for offload-test-gate (baseline compare, hidden check, flow with a fake ssh) and offload-repo-sync (scrub, scans,
 runtime check, gate hook).
 No network: ssh is a fake command on PATH."""
-import importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile
+import importlib.machinery, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory() as t:
     env = {**os.environ, "PATH": "%s:%s" % (t / "pb", os.environ["PATH"]), "FAKE_LOG": str(t / "ssh.log"),
            "FAKE_RESULT": str(t / "res.txt"), "OFFLOAD_GATE_BIN": str(bin_), "OFFLOAD_GATE_DASH": str(dash),
            "OFFLOAD_GATE_BASELINE": str(t / "base.json"), "OFFLOAD_GATE_CARDS": str(t / "cards"),
-           "OFFLOAD_GATE_SHIM": str(t / "shim")}
+           "OFFLOAD_GATE_SHIM": str(t / "shim"), "OFFLOAD_GATE_LOCK": str(t / "gate.lock")}
     def gate(*args, **ev):
         r = subprocess.run([sys.executable, str(HERE / "offload-test-gate"), *args], env={**env, **ev}, capture_output=True, text=True)
         return r.returncode, r.stdout, r.stderr
@@ -124,6 +124,18 @@ with tempfile.TemporaryDirectory() as t:
     ok(((t / "ssh.log").read_text().count("rm -rf")) >= 2, "sandbox dir removed")
     (t / "ssh.log").write_text(""); gate("--keep")
     ok(((t / "ssh.log").read_text().count("rm -rf")) == 1, "--keep leaves the sandbox dir (only the pre-run wipe)")
+    # one run at a time even against another baseline file: the runs share the sandbox dir
+    import fcntl, time
+    shutil.copy(base_p, t / "base-copy.json")
+    held = open(t / "gate.lock", "a"); fcntl.flock(held, fcntl.LOCK_EX)
+    p = subprocess.Popen([sys.executable, str(HERE / "offload-test-gate")], env={**env, "OFFLOAD_GATE_BASELINE": str(t / "base-copy.json")},
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    waiting = p.poll() is None
+    fcntl.flock(held, fcntl.LOCK_UN); held.close()
+    out, err = p.communicate(timeout=60)
+    ok(waiting and p.returncode == 0 and "another run is in progress" in err,
+       "a run against a copied baseline waits for the running gate (%r %r %r)" % (waiting, p.returncode, err[-200:]))
 
     # --- offload-repo-sync. Private-looking values are built from parts, so this file passes the scrub unchanged.
     ip = lambda *p: ".".join(map(str, p))
@@ -239,11 +251,72 @@ with tempfile.TemporaryDirectory() as td:
         "import os, shutil, sys\n"
         "w = shutil.which('python3')\n"
         "sys.exit(0 if w and os.path.dirname(w).endswith('venv314/bin') else 3)\n")
+    (tb / "test-git-commit.py").write_text(
+        "import subprocess, sys, tempfile\n"
+        "d = tempfile.mkdtemp()\n"
+        "g = lambda *a: subprocess.run(['git', '-C', d] + list(a), capture_output=True).returncode\n"
+        "ok = g('init', '-q') == 0 and g('commit', '-q', '--allow-empty', '-m', 'x') == 0\n"
+        "a = subprocess.run(['git', '-C', d, 'log', '-1', '--format=%an'], capture_output=True, text=True).stdout\n"
+        "sys.exit(0 if ok and a.strip() == 'gate' else 3)\n")
     rr = subprocess.run([sys.executable, "-"], input=G.RUNNER.encode(), capture_output=True, timeout=120,
-                        env=dict(os.environ, HOME=str(rh), PATH="/usr/bin:/bin"))
+                        env={k: v for k, v in dict(os.environ, HOME=str(rh), PATH="/usr/bin:/bin").items()
+                             if not k.startswith("GIT_")})
     got = G.parse_results(rr.stdout.decode()) if b"GATE-RESULT" in rr.stdout else {}
     ok(got.get("test-which-python.py", (None,))[0] == 0,
        "runner: a test's child python3 resolves to the gate's venv python (%r %r)" % (got, rr.stderr[-300:]))
+    ok(got.get("test-git-commit.py", (None,))[0] == 0,
+       "runner: a test can git commit in a scratch repo (identity in the throwaway HOME) (%r)" % (got,))
+
+# --- the runner installs ts-mutator's lockfile deps once (stand-in npm), links them in, and leaves the tree alone
+# when the install fails
+with tempfile.TemporaryDirectory() as td:
+    rh = Path(td); vb = rh / "venv314" / "bin"; vb.mkdir(parents=True)
+    for n in ("python", "python3"):
+        os.symlink(sys.executable, vb / n)
+    tb = rh / G.WORK / "bin"; tm = tb / "ts-mutator"; (tm / "node_modules" / "typescript").mkdir(parents=True)
+    (tm / "node_modules" / "typescript" / "README.md").write_text("shipped readme only\n")
+    (tm / "package.json").write_text('{"dependencies": {"typescript": "5.7.3"}}\n')
+    (tm / "package-lock.json").write_text('{"lockfileVersion": 3}\n')
+    (tb / "test-ts-dep.py").write_text(
+        "import os, sys\n"
+        "p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ts-mutator', 'node_modules', 'typescript', 'package.json')\n"
+        "sys.exit(0 if os.path.isfile(p) else 3)\n")
+    gt = rh / "gate-tools" / "bin"; gt.mkdir(parents=True); calls = rh / "npm-calls"
+    npm = gt / "npm"
+
+    def fake_npm(fail):
+        npm.write_text("#!/bin/sh\necho x >> %s\n%s\nmkdir -p node_modules/typescript\n"
+                       "echo '{}' > node_modules/typescript/package.json\n" % (calls, "exit 1" if fail else ""))
+        npm.chmod(0o755)
+
+    def run_runner():
+        rr = subprocess.run([sys.executable, "-"], input=G.RUNNER.encode(), capture_output=True, timeout=120,
+                            env=dict(os.environ, HOME=str(rh), PATH="/usr/bin:/bin"))
+        got = G.parse_results(rr.stdout.decode()) if b"GATE-RESULT" in rr.stdout else {}
+        return got.get("test-ts-dep.py", (None,))[0], rr.stderr.decode("utf-8", "replace")
+
+    def ncalls():
+        return len(calls.read_text().split()) if calls.exists() else 0
+
+    fake_npm(True)
+    rc, err = run_runner()
+    ok(rc == 3 and ncalls() == 1 and not (tm / "node_modules").is_symlink()
+       and (tm / "node_modules" / "typescript" / "README.md").is_file() and "npm ci failed" in err,
+       "runner: a failed ts-mutator install leaves the shipped tree as is (%r %d %r)" % (rc, ncalls(), err[-200:]))
+    fake_npm(False)
+    rc, err = run_runner()
+    ok(rc == 0 and ncalls() == 2 and (tm / "node_modules").is_symlink()
+       and "ts-mutator-cache" in os.readlink(tm / "node_modules"),
+       "runner: ts-mutator deps installed from the lockfile and linked in (%r %d %r)" % (rc, ncalls(), err[-200:]))
+    nmd = tm / "node_modules"
+    if nmd.is_symlink(): os.unlink(nmd)
+    else: shutil.rmtree(nmd)
+    nmd.mkdir()
+    rc, err = run_runner()
+    ok(rc == 0 and ncalls() == 2 and (tm / "node_modules").is_symlink(),
+       "runner: the cached install is reused, npm not run again (%r %d)" % (rc, ncalls()))
+    ok(not [p for p in (rh / "gate-tools" / "ts-mutator-cache").iterdir() if p.name.startswith("install-")],
+       "runner: no half-finished install dirs left in the cache")
 
 # --- offload-repo-sync units
 cfg = {"rules": [(re.compile("(?i)zorblax"), "owner")], "patterns": [re.compile("zorblax|quillon", re.I)],

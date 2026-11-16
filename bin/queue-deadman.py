@@ -45,7 +45,8 @@ INFRA_CODES = {"infra-darkbloom", "host-unavailable"}
 # sandbox job (hours are normal), and the path-access gate holding jobs while macOS holds ~/Desktop
 # for the locked screen (overnight is normal). A stall on one of these is flagged only past this many
 # minutes, not --stall-min.
-LONG_HOLD_MIN = {"darkbloom-sandbox": 6 * 60.0, "infra-path-access": 12 * 60.0}
+LONG_HOLD_MIN = {"darkbloom-sandbox": 6 * 60.0, "infra-path-access": 12 * 60.0,
+                 "plex-gpu": 8 * 60.0}   # 2026-11-15: Unraid GPU yields to Plex while it plays (an evening is normal)
 BLOOM_HOLD_PHASES = {"switching", "releasing", "release-pending"}
 
 

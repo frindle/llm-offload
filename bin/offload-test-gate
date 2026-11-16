@@ -9,7 +9,8 @@ test-fixtures*/fixtures-* data dirs of ~/bin (real job artifacts, kept out of gi
 `ollama-queue.py --self-test` runs there with ~/venv314/bin/python (python 3.14 + PyYAML), 8 at a time, 300 s each, in a temp
 HOME whose `bin` links to the shipped tree, with that python and ~/gate-tools/bin first on PATH; (4) the result list is
 compared with ~/.ollama-dispatch/test-gate-baseline.json.
-Sandbox setup (once, by hand): ~/venv314 (python 3.14) with PyYAML, pytest and openpyxl; lsof; ~/gate-tools/bin with
+Sandbox setup (once, by hand): ~/venv314 (python 3.14) with openpyxl plus queue-image/requirements-mac.txt (the
+image's own pinned set: some fixtures import requests/fastapi; re-run `pip install -r` when it changes); lsof; ~/gate-tools/bin with
 node 26 (official linux-x64 tarball, SHASUMS256 checked) and the .NET 8 SDK (dotnet-install.sh --channel 8.0).
 
 Exit: 0 pass (no newly failing test) | 1 a test newly fails | 2 no baseline (run --take-baseline) or bad usage |
@@ -19,7 +20,7 @@ passing in the baseline (only on an overall pass). A test missing from the basel
 
 Usage: offload-test-gate [--take-baseline] [--commit SHA] [--dash-commit SHA] [--json] [--keep]
 Env (tests): OFFLOAD_GATE_BIN, OFFLOAD_GATE_DASH, OFFLOAD_GATE_BASELINE, OFFLOAD_GATE_CARDS, OFFLOAD_GATE_SHIM, OFFLOAD_GATE_HOST
-(default claude-sandbox).
+(default claude-sandbox), OFFLOAD_GATE_LOCK.
 The tests themselves run only on the sandbox; here we only run ssh and git archive.
 """
 import argparse
@@ -36,6 +37,9 @@ BIN = Path(os.environ.get("OFFLOAD_GATE_BIN") or HOME / "bin")
 DASH = Path(os.environ.get("OFFLOAD_GATE_DASH") or HOME / "Desktop/GitHub Projects/ollama-queue-dashboard")
 BASELINE = Path(os.environ.get("OFFLOAD_GATE_BASELINE") or HOME / ".ollama-dispatch/test-gate-baseline.json")
 HOST = os.environ.get("OFFLOAD_GATE_HOST") or "claude-sandbox"
+# One gate run at a time: runs share the sandbox dir (WORK) whatever baseline they compare with, so the lock does not
+# follow OFFLOAD_GATE_BASELINE (a run against a copied baseline must still wait for a real one).
+LOCK = Path(os.environ.get("OFFLOAD_GATE_LOCK") or HOME / ".ollama-dispatch/test-gate.lock")
 WORK = "work/test-gate"          # relative to the sandbox HOME
 HIDDEN_CMD = "ls -d ~/work/rb/bench/*/hidden 2>/dev/null | wc -l"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
@@ -59,6 +63,38 @@ for n in os.listdir(B):
         q = os.path.join(base, "dash", t[k + len("/ollama-queue-dashboard/"):]) if k >= 0 else ""
         if q and os.path.exists(q):
             os.unlink(p); os.symlink(q, p)
+# ts-mutator's typescript dependency: the image installs it from the lockfile (queue-image/Dockerfile), but the
+# shipped tree has only node_modules READMEs, so verify-relevance's TS mutants come back empty here. Install it
+# once per lockfile into ~/gate-tools/ts-mutator-cache/<lock sha> and link it in. Any failure leaves the tree as is.
+def ts_deps():
+    import hashlib
+    tm = os.path.join(B, "ts-mutator"); lock = os.path.join(tm, "package-lock.json")
+    if not (os.path.isfile(lock) and os.path.isfile(os.path.join(tm, "package.json"))): return
+    root = os.path.join(home, "gate-tools", "ts-mutator-cache")
+    cache = os.path.join(root, hashlib.sha256(open(lock, "rb").read()).hexdigest()[:16])
+    nm = os.path.join(cache, "node_modules")
+    if not os.path.isfile(os.path.join(nm, "typescript", "package.json")):
+        os.makedirs(root, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="install-", dir=root)
+        for f in ("package.json", "package-lock.json"):
+            shutil.copy(os.path.join(tm, f), tmp)
+        env = dict(os.environ, PATH=os.pathsep.join([os.path.join(home, "gate-tools", "bin"),
+                                                     os.environ.get("PATH", "/usr/bin:/bin")]))
+        r = subprocess.run(["npm", "ci", "--omit=dev", "--no-audit", "--no-fund"], cwd=tmp, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        if r.returncode != 0 or not os.path.isfile(os.path.join(tmp, "node_modules", "typescript", "package.json")):
+            shutil.rmtree(tmp, ignore_errors=True)
+            sys.stderr.write("[gate] ts-mutator npm ci failed: " + r.stdout.decode("utf-8", "replace")[-400:] + "\n")
+            return
+        try: os.rename(tmp, cache)
+        except OSError: shutil.rmtree(tmp, ignore_errors=True)   # a concurrent gate got there first
+        if not os.path.isfile(os.path.join(nm, "typescript", "package.json")): return
+    dst = os.path.join(tm, "node_modules")
+    if os.path.islink(dst) or os.path.isfile(dst): os.unlink(dst)
+    elif os.path.isdir(dst): shutil.rmtree(dst)
+    os.symlink(nm, dst)
+try: ts_deps()
+except Exception as e: sys.stderr.write("[gate] ts-mutator deps: " + repr(e) + "\n")
 def reg(d):
     if not os.path.isdir(d): return []
     return sorted(n for n in os.listdir(d) if n.startswith("test") and n.endswith(".py")
@@ -72,6 +108,10 @@ def run(j):
     cwd = B if sub == "bin" else D
     h = tempfile.mkdtemp(prefix="gate-home-")
     os.symlink(B, os.path.join(h, "bin"))
+    # tests that commit in scratch repos need a git identity: the Mac has one in ~/.gitconfig, the sandbox's
+    # throwaway HOME has none, so `git commit` fails there ("Please tell me who you are")
+    with open(os.path.join(h, ".gitconfig"), "w") as g:
+        g.write("[user]\n\tname = gate\n\temail = gate@example.invalid\n[init]\n\tdefaultBranch = main\n")
     # the gate's python first on PATH: tests that spawn `python3` get 3.14 like the Mac and the queue image,
     # not the sandbox's system python (3.11 rejects the workers' PEP 701 f-strings). Then ~/gate-tools/bin:
     # the Mac's other test tools (node 26 for TS type-stripping, .NET 8 SDK), installed there once by hand.
@@ -220,7 +260,11 @@ _PROJ = Path.home() / "Desktop" / "GitHub Projects"
 REFS = (
     (Path(os.environ.get("OFFLOAD_GATE_CARDS") or _PROJ / "references"), "models", "references"),   # vendored model cards
     (Path(os.environ.get("OFFLOAD_GATE_SHIM") or _PROJ / "vault-stack" / "shim"), "vault_shim.py", "vault-shim"),
-)
+) + tuple(
+    # the installed Claude Code hooks dispatch-escalation-watcher's self-test runs against a synthetic HOME; it looks
+    # for them at <bin>/../claude-hooks, i.e. WORK/claude-hooks (no env var needed)
+    (Path(os.environ.get("OFFLOAD_GATE_HOOKS") or Path.home() / ".claude" / "hooks"), h, "claude-hooks")
+    for h in ("session-start-handoff-panel.sh", "session-start-escalations.sh", "ollama-queue-watch-reminder.sh"))
 
 
 def ship_refs():
@@ -277,7 +321,8 @@ def main(argv=None):
         return 2 if e.code else 0
     # One gate run at a time on this Mac: runs share the sandbox dir and the baseline file. Held until exit.
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(str(BASELINE) + ".lock", "a")
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(str(LOCK), "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

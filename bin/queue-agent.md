@@ -12,6 +12,9 @@ claude-sandbox only). Launchd template: `LaunchAgents-staged/com.example.queue-a
   - `notify_per_hour` (default 30)
   - `mirror_url` (empty = mirror off), `mirror_interval_s` (default 15), `mirror_token_file`
     (default `~/.config/ollama-queue/queue-api-token`)
+  - `darkbloom_relay` (default false), `darkbloom_relay_allow` (list of exact peer IPs, required),
+    `darkbloom_relay_port` (default 8000), `darkbloom_relay_target` (loopback only, default `127.0.0.1:8000`),
+    `darkbloom_relay_max_conns` (default 32). See "Darkbloom relay" below.
 - Token: `~/.config/ollama-queue/agent-token`. Without it the service refuses to start unless bind is loopback.
   Bearer compare is constant time (`hmac.compare_digest`). `/health` is open. Everything else needs
   `Authorization: Bearer <token>`.
@@ -24,7 +27,7 @@ claude-sandbox only). Launchd template: `LaunchAgents-staged/com.example.queue-a
 
 | Endpoint | What | Source of truth |
 |---|---|---|
-| `GET /health` | `ok`, mirror status | none |
+| `GET /health` | `ok`, mirror status, Darkbloom relay status | none |
 | `GET /v1/hold[?model=M]` | hold state | below |
 | `GET /v1/mac` | `screen_locked`, `memory`, `load_avg` | below |
 | `GET /v1/lane-plan` | vendor-file facts, pid | below |
@@ -151,6 +154,22 @@ Rules for cutover:
 - Not mirrored (still need an answer from the other branches): `ollama-land summary`, `handoff-emit.py --json`,
   the per-session cursors under `queue-events.sessions/` (these stay on the Mac, the hook writes them),
   `ollama-queue-watch-reminder.sh --inflight` (reads the queue state file: needs the API).
+
+## Darkbloom relay (2026-11-15)
+
+Off unless `darkbloom_relay = true`. BloomGauge turns its Manager on (and pre-warms) only when Darkbloom's
+`[local] bind` is loopback (`provider_control.endpoint_issue` accepts 127.0.0.1, localhost, ::1). With
+`bind = '0.0.0.0'` the Manager cannot come back on after the queue turns it off. So Darkbloom stays on 127.0.0.1 and
+this service relays plain TCP from `<bind>:darkbloom_relay_port` to the loopback target, on the same port Darkbloom
+used, so the container's `DARKBLOOM_BASE_URL` does not change.
+
+- Only peers in `darkbloom_relay_allow` get through; others are closed at once (counted `refused_peer`). Darkbloom
+  still checks its own token (a tokenless loopback call gets 401).
+- It never listens on loopback or a wildcard address, and never relays to a non-loopback target.
+- If the port is still taken (Darkbloom on 0.0.0.0 before its restart), it retries every 10 s.
+- At most `darkbloom_relay_max_conns` connections at once; more are closed (`busy`). Target down: `target_down`.
+- `/health` gives `darkbloom_relay`: `listening`, `port`, `active`, `relayed`, `refused_peer`, `busy`,
+  `target_down`, `last_error` (no addresses).
 
 ## What this service does not do
 
