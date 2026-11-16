@@ -60,7 +60,9 @@ BENIGN = re.compile(
     r"|\b(?:errors?|failures?|failed|exceptions?|warnings?)(?:_count|_total|_rate)?[\"']?\s*[=:]\s*[\"']?"
     r"(?:0(?:\.0+)?|none|null|false|\[\]|\{\})(?![\w.])"
     r"|\berror_?(?:log|page|handler|reporting|level)\b"
-    r"|\bon_?error\b|\bignore_?errors?\b|\bfail_?(?:fast|over|safe)\b|\bnon-?critical\b",
+    r"|\bon_?error\b|\bignore_?errors?\b|\bfail_?(?:fast|over|safe)\b|\bnon-?critical\b"
+    r"|\bhad_?errors?[\"']?\s*[=:]\s*[\"']?false\b"            # node's "Socket closed, hadError=false"
+    r"|\bcritical-exit\b|\bwatching for fatal\b",              # a supervisord listener's name and its start line
     re.I)
 
 
@@ -110,6 +112,21 @@ def clean(line):
     return "".join(ch if ch >= " " or ch == "\t" else " " for ch in s).strip()
 
 
+_COUNT_KEY = re.compile(r"(?i)(?:errors?|failures?|failed)(?:_count|_total)?")
+
+
+def _err_counts(d, path=(), depth=0):
+    """Nonzero error counts nested in a JSON line ({"llm": {"errors": 1}} -> ["llm errors 1"]): the only part of a
+    line like '{"event": "result_posted", ...}' that says why it is an error (11-15: the model invented a reason)."""
+    out = []
+    for k, v in d.items():
+        if isinstance(v, dict) and depth < 3:
+            out += _err_counts(v, path + (str(k),), depth + 1)
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and v and _COUNT_KEY.fullmatch(str(k)):
+            out.append(" ".join(path[-1:] + (str(k), str(v))))
+    return out[:3]
+
+
 def _json_line(s):
     """A JSON log line as 'level logger: msg (error)', the fields a person reads; None when it isn't one."""
     if not s.startswith("{"):
@@ -124,7 +141,7 @@ def _json_line(s):
     msg = pick("msg", "message", "event", "error_message")
     if not msg:
         return None
-    err = pick("error", "err", "exception", "reason")
+    err = pick("error", "err", "exception", "reason") or ", ".join(_err_counts(d))
     lv, lg = pick("level", "lvl", "severity"), pick("logger", "name", "module", "component")
     return " ".join(x for x in (lv, (lg + ":") if lg else "", msg, ("(%s)" % err) if err else "") if x)
 

@@ -166,7 +166,10 @@ def test_signature_and_level():
              ("status fetch failed, keeping provided info", "error"),
              ("2026-11-12T10:00:00Z INF | ERROR: Allow outbound TCP on port 7844. |", None),
              ("2026-11-12T10:00:00Z WRN Serve tunnel error error=\"timeout\"", "warn"),
-             ("2026-11-12T10:00:00Z ERR Request failed error=\"unexpected EOF\"", "error")]
+             ("2026-11-12T10:00:00Z ERR Request failed error=\"unexpected EOF\"", "error"),
+             ("[Doorbell] Socket closed, hadError=false", None), ("[Doorbell] Socket closed, hadError=true", "error"),
+             ("[critical-exit] watching for FATAL on: app, xvfb", None),
+             ("[critical-exit] app entered FATAL, stopping the container", "error")]
     bad = [(l, lv(l), w) for l, w in cases if lv(l) != w]
     chk("levels: the logger's tag wins, then the words; '0 errors' is not an error", not bad, bad)
 
@@ -207,6 +210,8 @@ def test_fragments():
     chk("socketserver's header and dash rules don't split one error into two kinds",
         [x["count"] for x in info["sigs"] if "BrokenPipeError" in x["text"]] == [2], info["sigs"])
     chk("'\"errors\": 0' in a JSON line is not an error", info["benign"] == 1, info["benign"])
+    rp = ED.shape('{"job": "ab12", "http": 200, "timings": {"llm": {"calls": 1238, "errors": 1}}, "event": "result_posted"}')
+    chk("a nonzero nested error count is kept in a JSON line's shape", rp == "result_posted (llm errors N)", rp)
     chk("an exception class line is fetched from Loki and is an error",
         _errish("ConnectionResetError: [Errno 104] Connection reset by peer") and
         ED.level("ConnectionResetError: [Errno 104] Connection reset by peer") == "error")
