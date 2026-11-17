@@ -26,7 +26,7 @@ RULES = [  # (name, regex, replacement)
     ("user-email", re.compile(r"[\w.+-]+@(?:pm\.me|proton\.me|protonmail\.com)\b", re.I), "<email>"),
     ("bearer", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{24,}"), "Bearer <token>"),
     ("long-secret", re.compile(r"(?<![A-Za-z0-9/_-])(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9/_-])"), "<redacted>"),
-    ("site-name", re.compile(r"Halton Place", re.I), "<site-name>"),
+    ("site-name", re.compile(r"<site-name>", re.I), "<site-name>"),
     ("energy-site-id", re.compile(r"\b\d{14,18}\b"), "<site-id>"),
     ("hw-serial", re.compile(r"\b(?:B7S|E4A)[A-Z0-9]{8,}\b"), "<serial>"),
     ("ipv4-cgnat-tailscale", re.compile(r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b"), "<lan-ip>"),
