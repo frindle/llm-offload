@@ -70,6 +70,34 @@ d = tree({"mini_ctx.py": 'S = "bloom_control.py"\n', "bloom_control.py": "pass\n
 check("NOT_SHIPPED names pass", run(d)[0], 0)
 check("every NOT_SHIPPED entry has a reason", all(v.strip() for v in cdf.NOT_SHIPPED.values()), True)
 
+api = ("import json\n\ndef route(h):\n    try:\n        import docsum_proxy\n    except Exception:\n        return 503\n"
+       "    return docsum_proxy.proxy(h)\n")
+d = tree({"api.py": api, "docsum_proxy.py": "pass\n"}, "api.py\n")
+rc, out = run(d)
+check("an unlisted module imported inside a function fails (the 11-17 /docsum 503)", rc, 1)
+check("the miss says which file imports it",
+      [l for l in out.splitlines() if l.startswith("MISSING")], ["MISSING docsum_proxy.py  (imported by api.py)"])
+check("listing the imported module passes", run(tree({"api.py": api, "docsum_proxy.py": "pass\n"},
+                                                     "api.py\ndocsum_proxy.py\n"))[0], 0)
+
+d = tree({"api.py": "from helper import x\nfrom helper2.sub import y\nfrom . import rel\nimport os, pkgmod.deep\n",
+          "helper.py": "x = 1\n", "helper2.py": "y = 1\n", "rel.py": "", "os.txt": ""}, "api.py\n")
+check("`from X import` and dotted names count; relative imports and names with no X.py don't",
+      sorted(l.split()[1] for l in run(d)[1].splitlines() if l.startswith("MISSING")), ["helper.py", "helper2.py"])
+
+d = tree({"api.py": "import linked\n", "real/linked.py": "pass\n"}, "api.py\n")
+(d / "linked.py").symlink_to(d / "real" / "linked.py")
+check("a symlinked module counts (dashboard files are links in ~/bin)", run(d)[0], 1)
+
+d = tree({"mini_ctx.py": "import bloom_control\n", "bloom_control.py": "pass\n"}, "mini_ctx.py\n")
+check("a NOT_SHIPPED module may be imported", run(d)[0], 0)
+
+d = tree({"broken.py": "def f(:\n", "x.py": ""}, "broken.py\n")
+check("a .py file that does not parse is skipped, not a crash", run(d)[0], 0)
+
+d = tree({"run.sh": "python3 -c 'import helper'\n", "helper.py": ""}, "run.sh\n")
+check("only .py files are read for imports", run(d)[0], 0)
+
 d = tree({}, "")
 check("an empty manifest passes", run(d)[0], 0)
 rc = cdf.main(["--base", str(d / "nope")])
