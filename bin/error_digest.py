@@ -33,6 +33,7 @@ $LOKI_TOKEN_FILE / $LOGQ_TOKEN_FILE, or the macOS Keychain item service loki-tok
 printed. Loki already redacts tokens, passwords, API keys and Authorization headers before storing; signatures redact
 again (key=value secrets, emails, URLs with their query strings, IPs).
 """
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -176,6 +177,21 @@ def signature(line):
     return _URL_PATH.sub(r"\1/…", _QUOTED.sub("'<q>'", shape(line)))
 
 
+_DQUOTED = re.compile(r'"[^"\n]{1,160}"')
+_PATH = re.compile(r"(?:(?<![\w.:/~])~?/|\b[A-Za-z]:\\)\S.*$")              # to the end: a folder name can hold spaces
+_DOTTED = re.compile(r"\b\w[\w'()\[\]+-]*(?:\.[\w'()\[\]+-]+){3,}")          # Some.Show.SNEN.Np.WEB-GRP
+
+
+def mail_sample(sample):
+    """A sample line as the daily message may carry it (the message goes through the mail Worker): signature()'s
+    folding (single-quoted names, URL paths), plus double-quoted names, file paths (from the path to the end of the
+    line) and dotted release names taken out. The digest on Unraid keeps the full shape()."""
+    s = _URL_PATH.sub(r"\1/…", _QUOTED.sub("'<q>'", sample or ""))
+    s = _DQUOTED.sub('"<q>"', s)
+    s = _PATH.sub("<path>", s)
+    return _DOTTED.sub("<name>", s)
+
+
 def sig_id(container, sig):
     return hashlib.sha1((container + "\0" + sig).encode()).hexdigest()[:10]
 
@@ -286,10 +302,12 @@ def noise_action(rules, container, line):
 # checked first. A line goes to the first rule that matches it. Rule fields:
 #   route owner|claude, container "<glob>" or [globs], match "<regex on the line>", what "<one line for the message>",
 #   min_count N (default 1: fewer lines that day and it is held back), sustain_min M + gap_min G (lines at most G
-#   minutes apart are one run; held back unless a run lasts M minutes), hold "<why>" (held back whatever the count).
-# Held-back items are listed in the digest (so nothing is hidden) but not sent. New kinds of error that no rule
-# covers go to Claude, never straight to the operator ("for Claude": the operator's Claude sessions read the digest and
-# handle or ask; nothing here restarts or fixes anything).
+#   minutes apart are one run; held back unless a run lasts M minutes; a run that began before midnight is measured
+#   whole on the day it ends), hold "<why>" (held back whatever the count), names true (its lines name a download or
+#   a file: the daily message leaves the example line out; the digest on Unraid keeps it).
+# Held-back items are listed in the digest (so nothing is hidden) but not sent: the message only counts them. New kinds
+# of error that no rule covers go to Claude, never straight to the operator ("for Claude": the operator's Claude
+# sessions read the digest and handle or ask; nothing here restarts or fixes anything).
 NEW_FOR_CLAUDE = 15        # new unrouted kinds listed for Claude per day; the rest are counted
 
 
@@ -312,7 +330,8 @@ def load_alerts(*paths):
                     continue
                 a = {"globs": globs, "rx": re.compile(r["match"], re.I), "route": r["route"], "what": str(r["what"]),
                      "min_count": max(1, int(r.get("min_count", 1))), "sustain_min": float(r.get("sustain_min", 0)),
-                     "gap_min": float(r.get("gap_min", 10)), "hold": str(r.get("hold") or "")}
+                     "gap_min": float(r.get("gap_min", 10)), "hold": str(r.get("hold") or ""),
+                     "names": r.get("names") is True}
                 seen.add(key)
                 out.append(a)
             except (re.error, AttributeError, TypeError, ValueError):
@@ -352,8 +371,10 @@ def runs(ts, gap_ns):
     return out
 
 
-def decide_alerts(acc, arules, containers):
-    """acc {rule index: [(container, hits)]} -> rec["alerts"]: owner, claude, held items and new kinds for Claude."""
+def decide_alerts(acc, arules, containers, before=None):
+    """acc {rule index: [(container, hits)]} -> rec["alerts"]: owner, claude, held items and new kinds for Claude.
+    before {rule index: [ns]}: the rule's lines just before midnight, so a run that began the day before is measured
+    whole (only runs that reach into this day count)."""
     out = {"owner": [], "claude": [], "held": [], "new_for_claude": [], "new_for_claude_more": 0}
     covered = set()
     for i in sorted(acc):
@@ -363,11 +384,14 @@ def decide_alerts(acc, arules, containers):
             covered |= h["sigs"]
         item = {"what": a["what"], "route": a["route"], "containers": sorted(c for c, _ in per), "count": len(ts),
                 "first_ns": ts[0], "last_ns": ts[-1], "sample": _short(per[0][1]["sample"], 200)}
+        if a.get("names"):
+            item["names"] = True
         held = []
         if len(ts) < a["min_count"]:
             held.append("%d× today, %d needed" % (len(ts), a["min_count"]))
         if a["sustain_min"]:
-            rr = runs(ts, a["gap_min"] * 60e9)
+            pre = sorted(t for t in (before or {}).get(i, []) if t < ts[0])
+            rr = [r for r in runs(pre + ts, a["gap_min"] * 60e9) if r[1] >= ts[0]]
             longest = max(r[1] - r[0] for r in rr) / 60e9
             item["longest_min"] = round(longest, 1)
             item["runs"] = [list(r) for r in sorted(rr, key=lambda r: r[0] - r[1])[:3]]
@@ -622,11 +646,35 @@ def build_day(loki, day, ddir, rules, say=print, arules=()):
         say("[error-digest] %s %s: %d lines, %d kinds, %d new%s" % (day, c, info["lines"], len(info["sigs"]),
             sum(1 for s in info["sigs"] if s["new"]), " (capped)" if capped else ""))
     if arules:
-        rec["alerts"] = decide_alerts(acc, list(arules), rec["containers"])
+        rec["alerts"] = decide_alerts(acc, list(arules), rec["containers"],
+                                      before=_before_midnight(loki, start, acc, list(arules), groups))
         prev = alert_history(ddir, day)
         for it in rec["alerts"]["owner"] + rec["alerts"]["held"]:
             it["seen_days"] = prev.get(it["what"], 0)
     return rec
+
+
+def _before_midnight(loki, start, acc, arules, groups):
+    """{rule index: [ns]}: for a sustain rule whose first line today is within its gap of midnight, its lines in the
+    sustain_min minutes before midnight (enough to tell whether the run that crossed midnight lasted that long).
+    A Loki error here only loses the look back, never the digest."""
+    out = {}
+    for i, per in acc.items():
+        a = arules[i]
+        first = min(t for _, h in per for t in h["ts"])
+        if not a["sustain_min"] or first - start * 1e9 > a["gap_min"] * 60e9:
+            continue
+        for c, _ in per:
+            rows = []
+            try:
+                for n in groups.get(c) or [c]:
+                    rows += loki.lines(n, start - a["sustain_min"] * 60, start)[0]
+            except LokiError:
+                continue
+            h = match_alerts(c, sorted(rows, key=lambda x: x[0]), arules).get(i)
+            if h:
+                out.setdefault(i, []).extend(h["ts"])
+    return out
 
 
 def _iso(t):
@@ -778,7 +826,8 @@ def render_extra(extra):
 
 
 def notify_text(rec):
-    """(subject, text) of the daily message to the operator: their items first, held items, then counts only."""
+    """(subject, text) of the daily message to the operator: their items first (example lines through mail_sample(),
+    none for a names rule), the apps' lines and Playback, then counts only (held items too: they are not sent)."""
     al = rec.get("alerts") or {}
     day = rec["day"]
     wd = dt.date.fromisoformat(day).strftime("%a %b %-d")
@@ -796,7 +845,8 @@ def notify_text(rec):
     t = []
     for it in mine:
         t.append("- %s (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
-        t.append("    e.g. %s" % _short(it["sample"], 200).replace("`", "'"))
+        if not it.get("names"):            # a line that names a download or file stays in the digest on Unraid
+            t.append("    e.g. %s" % _short(mail_sample(it["sample"]), 200).replace("`", "'"))
     if not mine:
         t.append("No errors need you today." if extra else "Nothing needs you today.")
     for e in extra:
@@ -809,9 +859,8 @@ def notify_text(rec):
                                                                 for x in plex_playback.notify_lines(rec["playback"])]
         except Exception:  # noqa: BLE001 - the message goes out without it
             pass
-    if held:
-        t += ["", "Held back (you asked not to be sent these yet):"]
-        t += ["- %s: %s" % (it["what"], _when(it)) for it in held]
+    if held:                                # held back means not sent: only counted here, listed in the digest
+        t += ["", "Held back: %d item%s (not sent; listed in the digest)." % (len(held), "" if len(held) == 1 else "s")]
     cs = rec.get("containers") or {}
     n_lines = sum(sc["count"] for i in cs.values() for sc in i["sigs"])
     nc = len(al.get("claude") or []) + len(al.get("new_for_claude") or []) + (al.get("new_for_claude_more") or 0)
@@ -835,9 +884,13 @@ def notify_settings():
     return url, tok
 
 
+NOTIFY_WAITS = (60, 300)    # a send that failed on the network, a 429 or a 5xx is tried again after these many seconds
+
+
 def send_notify(rec):
     """POST {app, ref, subject, text} with the bearer token; -> the rec["notify"] record. Never raises, never prints
-    the token or the URL's query."""
+    the token or the URL's query. The token is never passed on to a redirect's target. A 409 is the mail Worker saying
+    this day was already mailed: recorded as sent."""
     url, tok = notify_settings()
     now = _iso(time.time())
     if not url or not tok:
@@ -847,15 +900,32 @@ def send_notify(rec):
     subj, text = notify_text(rec)
     body = json.dumps({"app": "error-digest", "ref": rec["day"], "subject": subj, "text": text}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json", "Authorization": "Bearer " + tok, "User-Agent": "error-digest"})
+        "Content-Type": "application/json", "User-Agent": "error-digest"})
+    req.add_unredirected_header("Authorization", "Bearer " + tok)
+    out, tries = {}, 0
+    for wait in (0,) + tuple(NOTIFY_WAITS):
+        if wait:
+            time.sleep(wait)
+        tries += 1
+        out = _post_once(req)
+        if not out.pop("retry", False):
+            break
+    return dict(out, at=now, **({"tries": tries} if tries > 1 else {}))
+
+
+def _post_once(req):
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             code = r.status
     except urllib.error.HTTPError as e:
         code = e.code
     except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"status": "failed", "at": now, "why": str(getattr(e, "reason", e))[:200]}
-    return {"status": "sent" if 200 <= code < 300 else "failed", "at": now, "http": code}
+        return {"status": "failed", "why": str(getattr(e, "reason", e))[:200], "retry": True}
+    if 200 <= code < 300:
+        return {"status": "sent", "http": code}
+    if code == 409:
+        return {"status": "sent", "http": code, "why": "already mailed for this day"}
+    return {"status": "failed", "http": code, "retry": code == 429 or code >= 500}
 
 
 def _short(t, n=150):
@@ -990,14 +1060,15 @@ def cmd_run(argv, days=None):
         want_model = bool(model and model_items(rec))
         if want_model:
             rec["model"] = {"status": "pending", "model": model}
-        if rec.get("alerts") and send:
-            prev = _prev_notify(ddir, day)
-            if prev.get("status") == "sent":
-                rec["notify"] = prev                      # one message per day, whatever reruns there are
-            elif day == _yesterday():
-                rec["notify"] = send_notify(rec)
-                print("[error-digest] daily message: %s" % rec["notify"]["status"])
-        out = write_day(ddir, rec)
+        with _notify_lock(ddir, rec.get("alerts") and send):   # two runs at once: the second waits, then sees "sent"
+            if rec.get("alerts") and send:
+                prev = _prev_notify(ddir, day)
+                if prev.get("status") == "sent":
+                    rec["notify"] = prev                      # one message per day, whatever reruns there are
+                elif day == _yesterday():
+                    rec["notify"] = send_notify(rec)
+                    print("[error-digest] daily message: %s" % rec["notify"]["status"])
+            out = write_day(ddir, rec)
         print("[error-digest] wrote %s" % out)
         if want_model:
             # written BEFORE the job is queued and not rewritten after: the job may finish first, its lines must stay
@@ -1008,6 +1079,22 @@ def cmd_run(argv, days=None):
                 rec["model"] = {"status": "failed", "model": model, "why": "not queued"}
                 write_day(ddir, rec)
     return 0
+
+
+@contextlib.contextmanager
+def _notify_lock(ddir, want):
+    """An exclusive lock on <digest dir>/.notify.lock around check, send and write (no-op when nothing is sent)."""
+    if not want:
+        yield
+        return
+    import fcntl
+    Path(ddir).mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(Path(ddir) / ".notify.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _prev_notify(ddir, day):
@@ -1146,8 +1233,12 @@ def fetch_remote(params, timeout=30):
     url = base + "/api/error-digest" + ("?" + urllib.parse.urlencode(params) if params else "")
     hdrs = dict(queue_config.queue_api_headers())
     hdrs["User-Agent"] = "error-digest"
+    auth = hdrs.pop("Authorization", None)
+    req = urllib.request.Request(url, headers=hdrs)
+    if auth:
+        req.add_unredirected_header("Authorization", auth)      # never passed on to a redirect's target
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             obj = json.loads(r.read() or b"{}")
             return r.status, obj if isinstance(obj, dict) else {}
     except urllib.error.HTTPError as e:

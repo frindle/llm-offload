@@ -7,7 +7,8 @@ reads one day of those reports from Loki ({job="files", app="plex"}, Plex Media 
 buffering wait by what came just before it:
 
   start   the first report of a play (or the first after a stop / a different item / a gap)
-  seek    the position jumped (the viewer skipped or scrubbed); the wait that follows is expected
+  seek    the position jumped (the viewer skipped or scrubbed), or the play resumed from a pause (paused just
+          before, wherever the position is); the wait that follows is expected
   stall   the position had been moving on normally and playback stopped to buffer: what a viewer calls "buffering"
           (a wait shorter than MIN_STALL_S, or one starting within SETTLE_S of a start or seek, is not a stall)
 
@@ -52,8 +53,15 @@ STARVED_MS = 10000          # ... in at least this long was starved
 SYSLOG_LOOKBACK_S = 4 * 86400
 
 TIMELINE_Q = '{job="files",app="plex"} |~ "Request: \\\\[[^]]+\\\\] GET /:/timeline\\\\?"'
-LINE_RE = re.compile(r"^(?P<lt>[A-Z][a-z]{2} \d{1,2}, \d{4} \d\d:\d\d:\d\d(?:\.\d+)?)?.*?Request: \[(?P<ip>[0-9a-fA-F.:]+?):\d+"
+LINE_RE = re.compile(r"^(?P<lt>[A-Z][a-z]{2} \d{1,2}, \d{4} \d\d:\d\d:\d\d(?:\.\d+)?)?.*?Request: \[(?P<ip>[0-9a-fA-F.:]+):\d+"
                      r"[^\]]*\] GET /:/timeline\?(?P<q>\S+)")
+
+
+def _ip(s):
+    """An IPv4 client seen through an IPv6 socket (an ::ffff:-mapped address) is that IPv4 address."""
+    return s[7:] if s[:7].lower() == "::ffff:" and "." in s else s
+
+
 SYSLOG_Q = ('{job="syslog"} |~ "md: recovery thread: check|md: recovery thread: exit status|md: sync done|'
             'mdcmd \\\\([0-9]+\\\\): nocheck|mover: started|mover: finished"')
 
@@ -92,7 +100,7 @@ def parse(loki_ns, line):
     except ValueError:
         return None
     key = _param(q, "ratingKey") or _param(q, "key") or ""
-    return {"t": _line_time(m.group("lt"), int(loki_ns) / 1e9), "ip": m.group("ip"), "state": state, "pos": pos,
+    return {"t": _line_time(m.group("lt"), int(loki_ns) / 1e9), "ip": _ip(m.group("ip")), "state": state, "pos": pos,
             "item": hashlib.sha1(key.encode()).hexdigest()[:8]}
 
 
@@ -119,7 +127,9 @@ def waits(events):
             kind = "start"
         else:
             expect = prev["pos"] + (e["t"] - prev["t"] if prev["state"] == "playing" else 0.0)
-            kind = "seek" if abs(e["pos"] - expect) > SEEK_TOL_S else "stall"
+            # a wait right after a pause is the resume's (or a scrub made while paused, which a client may already
+            # report at the new position): never a stall
+            kind = "seek" if prev["state"] == "paused" or abs(e["pos"] - expect) > SEEK_TOL_S else "stall"
             if kind == "stall" and settled and settled[0] == e["item"] and e["t"] - settled[1] <= SETTLE_S:
                 kind = "seek"
         j = i
@@ -217,9 +227,9 @@ def timeline_events(loki, start, end):
     return by_ip, capped
 
 
-PART_RE = re.compile(r"Completed[^\[]*\[(?P<ip>[0-9a-fA-F.:]+?):\d+\] (?P<code>\d{3}) GET "
+PART_RE = re.compile(r"Completed[^\[]*\[(?P<ip>[0-9a-fA-F.:]+):\d+\] (?P<code>\d{3}) GET "
                      r"/library/parts/\d+/\d+/file\.(?P<ext>[A-Za-z0-9]+)\S*.*? (?P<ms>\d+)ms (?P<bytes>\d+) bytes")
-DECISION_RE = re.compile(r"Request: \[(?P<ip>[0-9a-fA-F.:]+?):\d+[^\]]*\] GET /video/:/transcode/universal/"
+DECISION_RE = re.compile(r"Request: \[(?P<ip>[0-9a-fA-F.:]+):\d+[^\]]*\] GET /video/:/transcode/universal/"
                          r"(?P<what>decision|start)\S*")
 
 
@@ -232,7 +242,7 @@ def device_evidence(loki, ip, start, end):
     exts, n, total, starved, failed = {}, 0, 0, 0, 0
     for _, line in parts:
         m = PART_RE.search(line)
-        if not m or m.group("ip") != ip:
+        if not m or _ip(m.group("ip")) != ip:
             continue
         n += 1
         b, ms = int(m.group("bytes")), int(m.group("ms"))
@@ -248,7 +258,7 @@ def device_evidence(loki, ip, start, end):
     mode = None
     for _, line in dec:
         m = DECISION_RE.search(line)
-        if not m or m.group("ip") != ip:
+        if not m or _ip(m.group("ip")) != ip:
             continue
         s = m.group(0)
         dp, ds = _param(s.split("?", 1)[-1], "directPlay"), _param(s.split("?", 1)[-1], "directStream")

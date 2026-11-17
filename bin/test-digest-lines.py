@@ -71,6 +71,8 @@ def t_validate():
         bad("not an object", b"[1]")
         bad("unknown app", body(app="plex"), detail="unknown app")
         bad("bad day", body(day="11/16/2026"))
+        bad("a compact day (fromisoformat takes it; the file name would not match)", body(day="20261116"))
+        bad("a week day", body(day="2026-W47-1"))
         bad("day 3 back", body(day="2026-11-13"))
         bad("day in the future", body(day="2026-11-17"))
         chk("day 2 back ok", post(td, body(day="2026-11-14"))[0] == 200)
@@ -84,6 +86,17 @@ def t_validate():
         bad("an order number", body(lines=["order 1123456 synced"]), want="E_PRIVATE")
         bad("an order number with dashes", body(lines=["112-1234567-7654321"]), want="E_PRIVATE")
         chk("5 digits ok (a count)", post(td, body(lines=["12345 items scanned"]))[0] == 200)
+        bad("an amount with cents", body(lines=["total 12.99"]), want="E_PRIVATE")
+        bad("an amount with a comma", body(lines=["total 12,99"]), want="E_PRIVATE")
+        bad("a currency word", body(lines=["total 12 USD"]), want="E_PRIVATE")
+        bad("dollars", body(lines=["12 dollars"]), want="E_PRIVATE")
+        bad("a euro sign", body(lines=["\u20ac12"]), want="E_PRIVATE")
+        bad("a pound sign", body(lines=["\u00a312"]), want="E_PRIVATE")
+        resell = ["3 new orders (amazon 2, walmart 1).", "1 new order with no card set.",
+                  "Order syncs: 4 runs, 12 orders added or updated.", "2 gift cards submitted to CardCenter.",
+                  "Waiting on tracking: 3 orders, 1 past the ship-by date.", "Unread API errors: 2.",
+                  "1,000 items scanned"]
+        chk("resell's own line shapes and a thousands count still pass", post(td, body(lines=resell))[0] == 200)
         bad("needs_you not a bool", body(needs_you="yes"))
         chk("413 over the body cap", post(td, b" " * (L.MAX_BODY + 1))[0] == 413)
         chk("other path -> 404", post(td, body(), path="/api/digest-lines/x")[0] == 404)
@@ -108,6 +121,12 @@ def t_store():
         chk("another day: nothing", L.read_day("2026-11-15", td) == [])
         (Path(td) / "extra" / "resell-2026-11-15.json").write_text("{broken")
         chk("a broken file is skipped", L.read_day("2026-11-15", td) == [])
+        os.environ["DIGEST_LINES_APPS"] = "resell,bloom-ledger"
+        (Path(td) / "extra" / "resell-2026-11-15.json").write_text("[1, 2]")          # JSON, but not an object
+        (Path(td) / "extra" / "bloom-ledger-2026-11-15.json").write_text(json.dumps({"lines": ["2 runs"]}))
+        r = L.read_day("2026-11-15", td)
+        chk("one app's bad file never drops the next app's lines", [x["app"] for x in r] == ["bloom-ledger"], r)
+        os.environ.pop("DIGEST_LINES_APPS")
         (Path(td) / "extra" / "plex-2026-11-16.json").write_text(json.dumps({"lines": ["x"]}))
         chk("an app not allowed is not read", L.read_day("2026-11-16", td) == [])
         old = Path(td) / "extra" / "resell-2026-10-01.json"
