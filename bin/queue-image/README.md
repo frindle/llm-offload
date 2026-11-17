@@ -48,7 +48,7 @@ Full list with placeholders: `env.example`. Secrets are masked in the Unraid tem
 | `QUEUE_AGENT_URL`, `QUEUE_AGENT_TOKEN` | Mac status service; token also written to `~/.config/ollama-queue/agent-token` |
 | `QUEUE_API_TOKEN` | write-route token (env only) |
 | `CPU_RUNNER_TOKEN` | written to `~/.config/dispatch-cpu-runner/token` |
-| `LOKI_URL`, `LOKI_TOKEN` | nightly container error digest (`error_digest.py`, 05:07); empty = no digest |
+| `LOKI_URL`, `LOKI_TOKEN` | daily container error digest (`error_digest.py tick`, from 05:07); empty = no digest |
 | `ERROR_DIGEST_NOTIFY_URL`, `ERROR_DIGEST_NOTIFY_TOKEN` | the digest's daily message is POSTed here once a day (https); empty = written to `<day>.notify.txt` only |
 | `OBSIDIAN_TOKEN` | written to `~/.config/ollama-worker/obsidian-token` |
 | `TAVILY_API`, `BRAVE_SEARCH_API`, `OLLAMA_WEB_SEARCH` | worker search keys (env only) |
@@ -69,7 +69,7 @@ With `QUEUE_STANDBY=1` the container serves read routes on a copy of the Mac sta
 4. Stop the Mac queue (daemon, API, watchers) and wait until the daemon has exited. Only one machine may own the job list.
 5. Copy the state JSON and the carried keys (`_bundle_next`, `_bundle_accepted`, pinned group `docsum`) into `state/`. Copy `ollama-dispatch` data, including the CPU lane sqlite, with the Mac queue stopped.
 6. Fill in `.env` or the template: IP, MAC, tokens, `DARKBLOOM_*`, `QUEUE_AGENT_*`. Start the container.
-7. Check: `docker ps` shows healthy; `entrypoint.sh` printed no FATAL; `supervisorctl -c /etc/queue/supervisord.conf status` shows 11 programs RUNNING (in standby only queue-api and docsum-ui) (log-rotate waits for 04:17, error-digest for 05:07); the dashboard loads at `http://QUEUE_IP:7684/`.
+7. Check: `docker ps` shows healthy; `entrypoint.sh` printed no FATAL; `supervisorctl -c /etc/queue/supervisord.conf status` shows 11 programs RUNNING (in standby only queue-api and docsum-ui) (log-rotate waits for 04:17; error-digest ticks every 5 min and builds yesterday's digest at the first tick from 05:07); the dashboard loads at `http://QUEUE_IP:7684/`.
 8. Point the CPU runners at the new API URL (the runner container's `CPU_RUNNER_API`); they keep the same token.
 9. Rollback: stop the container, start the Mac jobs again. The state copy on the Mac is untouched until you decide otherwise.
 
