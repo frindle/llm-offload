@@ -14,7 +14,9 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
+import urllib.request
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -374,6 +376,7 @@ class FakeNotify:
             return self.real(req, timeout=timeout)     # Loki
         FakeNotify.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data),
                                  "Authorization" in req.headers))     # req.headers is what a redirect copies
+        FakeNotify.last = req
         if FakeNotify.code >= 300:
             raise urllib.error.HTTPError(req.full_url, FakeNotify.code, "no", {}, io.BytesIO(b"{}"))
 
@@ -420,8 +423,9 @@ def test_notify(base):
         FakeNotify.code = 500
         quiet(ED.main, ["run", "--no-model"])
         r = json.loads((tmp / "digests" / (y + ".json")).read_text())
-        chk("a 500 is tried 3 times, then recorded as failed (and tried again on the next run)",
-            r["notify"] == {**r["notify"], "status": "failed", "http": 500, "tries": 3} and len(FakeNotify.calls) == 3,
+        chk("a 500 is tried 3 times, then recorded as failed and marked for a later resend (see test_tick)",
+            r["notify"] == {**r["notify"], "status": "failed", "http": 500, "tries": 3, "retry_later": True}
+            and len(FakeNotify.calls) == 3,
             (r["notify"], len(FakeNotify.calls)))
         FakeNotify.code, FakeNotify.calls = 400, []
         quiet(ED.main, ["run", "--no-model"])
@@ -437,6 +441,11 @@ def test_notify(base):
             and c[0][2]["app"] == "error-digest" and c[0][2]["ref"] == y and "for you" in c[0][2]["subject"]
             and "Lutron" in c[0][2]["text"], (r.get("notify"), c))
         chk("the bearer is an unredirected header (never passed on to a redirect's target)", c and not c[0][3], c)
+        nxt = urllib.request.HTTPRedirectHandler().redirect_request(FakeNotify.last, None, 302, "Found", {},
+                                                                    "https://elsewhere.test/x")
+        chk("urllib's own redirect of the send carries no bearer", nxt is not None
+            and nxt.full_url == "https://elsewhere.test/x" and not nxt.has_header("Authorization")
+            and FakeNotify.last.has_header("Authorization"), nxt and nxt.header_items())
         chk("the token is never printed", "notify-secret" not in out + err)
         quiet(ED.main, ["run", "--no-model"])
         quiet(ED.main, ["run", "--no-model", "--day", y])
@@ -473,13 +482,188 @@ def test_notify(base):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_tick(base):
+    """The container's tick: one build and send a day, catch-up after a stop or an outage, never a second email."""
+    tmp = Path(tempfile.mkdtemp(prefix="ed-tick-"))
+    y = ED._yesterday()
+    dj, ts = tmp / "digests" / (y + ".json"), tmp / ".tick.json"
+    tf = tmp / "tok"
+    tf.write_text("notify-secret\n")
+    os.environ.update(LOKI_URL=base, LOKI_TOKEN="tok-test", ERROR_DIGEST_DIR=str(tmp),
+                      ERROR_DIGEST_NOTIFY_URL="https://notify.test/send", ERROR_DIGEST_NOTIFY_TOKEN_FILE=str(tf))
+    FakeLoki.logs = {"homebridge": [(ns_at(y, 4), "[Lutron] Failed to re-subscribe to events, error ECONNRESET")]}
+    saved = (ED.urllib.request.urlopen, ED.NOTIFY_WAITS, ED.TICK_AT, ED.RESEND_EVERY_S, ED.BUILD_EVERY_S,
+             ED.send_notify)
+    ED.urllib.request.urlopen = FakeNotify(saved[0])
+    ED.NOTIFY_WAITS = (0,)
+    FakeNotify.code, FakeNotify.calls = 202, []
+
+    def tick():
+        return quiet(ED.main, ["tick", "--no-model"])
+
+    def fresh():
+        dj.unlink(missing_ok=True)
+        ts.unlink(missing_ok=True)
+        FakeNotify.calls = []
+    try:
+        ED.TICK_AT = (24, 0)
+        rc, out, err = tick()
+        chk("tick: before 05:07 nothing is built or sent", rc == 0 and not dj.exists() and not FakeNotify.calls)
+        ED.TICK_AT = (0, 0)
+        rc, out, err = tick()
+        r = json.loads(dj.read_text())
+        chk("tick: the first tick from 05:07 builds yesterday and sends it once", rc == 0
+            and r["notify"]["status"] == "sent" and len(FakeNotify.calls) == 1, (rc, r.get("notify"), err))
+        before = dj.read_text()
+        for _ in range(3):
+            tick()
+        chk("tick: later ticks on a finished day build and send nothing", len(FakeNotify.calls) == 1
+            and dj.read_text() == before and json.loads(ts.read_text()).get("builds") == 1)
+
+        # stopped during the send (supervisord TERM between the send and the write): the digest is already on disk
+        # as pending, and the next tick sends it from there without rebuilding
+        fresh()
+
+        def killed(rec, waits=None):
+            raise KeyboardInterrupt
+        ED.send_notify = killed
+        try:
+            tick()
+        except KeyboardInterrupt:
+            pass
+        ED.send_notify = saved[5]
+        r = json.loads(dj.read_text())
+        chk("a run stopped during its send leaves the digest written, the send pending",
+            r["notify"]["status"] == "pending" and not FakeNotify.calls, r.get("notify"))
+        r["containers"]["marker"] = {"sigs": []}
+        dj.write_text(json.dumps(r))
+        rc, out, err = tick()
+        r = json.loads(dj.read_text())
+        chk("the next tick sends the pending message once, from the stored digest (not rebuilt)",
+            r["notify"]["status"] == "sent" and r["notify"].get("resent") and len(FakeNotify.calls) == 1
+            and "marker" in r["containers"], r.get("notify"))
+        tick()
+        chk("...and not again", len(FakeNotify.calls) == 1)
+
+        # a send that failed for a reason worth retrying is sent again later, one try per tick, until it goes
+        fresh()
+        FakeNotify.code = 500
+        tick()
+        r = json.loads(dj.read_text())
+        chk("a 5xx after the in-run retry: failed, marked retry_later", r["notify"]["status"] == "failed"
+            and r["notify"].get("retry_later") and len(FakeNotify.calls) == 2, (r.get("notify"), FakeNotify.calls))
+        ED.RESEND_EVERY_S = 3600
+        tick()
+        chk("not sent again before RESEND_EVERY_S", len(FakeNotify.calls) == 2)
+        ED.RESEND_EVERY_S = 0
+        tick()
+        chk("sent again after it, one try", len(FakeNotify.calls) == 3)
+        FakeNotify.code = 202
+        tick()
+        tick()
+        r = json.loads(dj.read_text())
+        chk("once the mail service is back: sent, and not again", r["notify"]["status"] == "sent"
+            and len(FakeNotify.calls) == 4, (r.get("notify"), len(FakeNotify.calls)))
+        fresh()
+        FakeNotify.code = 400
+        tick()
+        tick()
+        r = json.loads(dj.read_text())
+        chk("a 400 (the request is wrong) is never resent", r["notify"]["status"] == "failed"
+            and not r["notify"].get("retry_later") and len(FakeNotify.calls) == 1, (r.get("notify"), FakeNotify.calls))
+        FakeNotify.code = 202
+        ED.RESEND_EVERY_S = saved[3]
+
+        # Loki down: the build is tried again every BUILD_EVERY_S, at most TICK_MAX_BUILDS times
+        fresh()
+        os.environ["LOKI_URL"] = "http://127.0.0.1:9"
+        ED.BUILD_EVERY_S = 3600
+        rcs = [tick()[0] for _ in range(3)]
+        chk("Loki down: one try, then nothing until BUILD_EVERY_S", rcs == [1, 0, 0]
+            and json.loads(ts.read_text())["builds"] == 1, (rcs, ts.read_text()))
+        ED.BUILD_EVERY_S = 0
+        rcs = [tick()[0] for _ in range(ED.TICK_MAX_BUILDS + 2)]
+        chk("Loki down: at most TICK_MAX_BUILDS builds a day", rcs.count(1) == ED.TICK_MAX_BUILDS - 1
+            and json.loads(ts.read_text())["builds"] == ED.TICK_MAX_BUILDS and not dj.exists(), (rcs, ts.read_text()))
+        ts.unlink()
+        os.environ["LOKI_URL"] = base
+        tick()
+        chk("Loki back: the next try builds and sends", json.loads(dj.read_text())["notify"]["status"] == "sent"
+            and len(FakeNotify.calls) == 1)
+        fresh()
+        os.environ.pop("LOKI_URL")
+        outs = [tick() for _ in range(3)]
+        chk("no LOKI_URL: one line a day, then quiet", outs[0][0] == 2 and outs[1][0] == 0 and outs[2][0] == 0
+            and not (outs[1][2] + outs[2][2]).strip() and not dj.exists(), outs)
+        os.environ["LOKI_URL"] = base
+
+        # an older image's 05:07 run already sent (or failed without retry_later): the new tick sends nothing
+        fresh()
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads(dj.read_text())
+        r["notify"] = {"status": "failed", "http": 500, "at": r["notify"]["at"]}
+        dj.write_text(json.dumps(r))
+        FakeNotify.calls = []
+        ED.RESEND_EVERY_S = 0
+        tick()
+        chk("a day built before the tick existed is neither rebuilt nor sent again", not FakeNotify.calls
+            and json.loads(dj.read_text())["notify"]["status"] == "failed")
+        chk("the tick state file is private", ts.stat().st_mode & 0o077 == 0)
+    finally:
+        (ED.urllib.request.urlopen, ED.NOTIFY_WAITS, ED.TICK_AT, ED.RESEND_EVERY_S, ED.BUILD_EVERY_S,
+         ED.send_notify) = saved
+        FakeNotify.code = 202
+        for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
+            os.environ.pop(k, None)
+        os.environ["LOKI_URL"] = base
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_notify_lock():
+    """The lock really excludes: a resend waits for a holder (a run mid-send), then sees its result."""
+    import fcntl
+    tmp = Path(tempfile.mkdtemp(prefix="ed-lock-"))
+    (tmp / "digests").mkdir()
+    y = ED._yesterday()
+    dj = tmp / "digests" / (y + ".json")
+    dj.write_text(json.dumps({"day": y, "containers": {}, "alerts": {"owner": [{"what": "x"}], "held": []},
+                              "notify": {"status": "pending"}}))
+    fd = os.open(str(tmp / ".notify.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    calls, done = [], threading.Event()
+    real = ED.send_notify
+    ED.send_notify = lambda rec, waits=None: calls.append(1) or {"status": "sent"}
+    try:
+        th = threading.Thread(target=lambda: (ED._resend(tmp, y), done.set()), daemon=True)
+        th.start()
+        time.sleep(0.4)
+        chk("a resend blocks while another holder has the lock", not done.is_set() and not calls)
+        r = json.loads(dj.read_text())
+        r["notify"] = {"status": "sent"}       # the holder (a run) finished its send
+        dj.write_text(json.dumps(r))
+        os.close(fd)
+        th.join(5)
+        chk("...and once it is released, re-reads under the lock and sends nothing", done.is_set() and not calls)
+    finally:
+        ED.send_notify = real
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_mail_sample():
     cases = [("Import failed for 'A Title (2019)'", "'<q>'", "Title"),
              ('Album "Some Album" not found', '"<q>"', "Some Album"),
              ("could not move /data/media/Some Folder/x.mkv: denied", "move <path>", "Some Folder"),
              ("cannot open C:\\Downloads\\x.mkv", "open <path>", "Downloads"),
              ("grab Some.Show.S01E02.1080p.WEB-GRP failed", "grab <name> failed", "Show"),
-             ("GET https://api.example.test/v2/users/77/orders failed", "https://api.example.test/…", "users")]
+             ("GET https://api.example.test/v2/users/77/orders failed", "https://api.example.test/…", "users"),
+             ("GET http://192.0.2.7:8080/api/v1/items/77 failed, will retry", "<ip>/… failed, will retry", "api"),
+             ('Album "Some \\"Live\\" Album" not found', '"<q>" not found', "Live"),
+             ("could not open:/data/media/Some Folder/x.mkv", "open:<path>", "Some"),
+             ("missing ./media/Some Folder/x.mkv", "missing <path>", "Some"),
+             ("could not move media/Movies/Some Folder/x.mkv: denied", "move <path>", "Movies"),
+             ("cannot open \\\\nas\\media\\Some Folder\\x.mkv", "open <path>", "Some"),
+             ("bad link file:///data/media/Some Folder/x.mkv", "link <path>", "Some"),
+             ("import failed (path=/data/media/Some Folder/x.mkv)", "(path=<path>", "Some")]
     for line, want, gone in cases:
         got = ED.mail_sample(ED.shape(line))
         chk("mail sample folds %r" % want, want in got and gone not in got, got)
@@ -686,7 +870,8 @@ def test_supervisor_and_allowlist():
     q = (BIN / "ollama-queue.py").read_text()
     chk("the runner is allowlisted in the queue", 'str(Path.home() / "bin" / "error-digest-runner.py")' in q)
     sup = (BIN / "queue-image" / "supervisord.conf").read_text()
-    chk("the container runs the digest nightly", "[program:error-digest]" in sup and "error_digest.py run" in sup)
+    chk("the container runs the digest tick (daily build plus catch-up)", "[program:error-digest]" in sup
+        and "every.sh 300 nice -n 10 python3 %(ENV_HOME)s/bin/error_digest.py tick" in sup)
     man = (BIN / "queue-image" / "MANIFEST").read_text().split()
     chk("the image ships the digest files", all(f in man for f in ("error_digest.py", "error-digest-runner.py",
                                                                     "error_digest_noise.json")), man[:5])
@@ -823,6 +1008,8 @@ def main():
         test_noise_local_adds()
         test_alerts()
         test_notify(lbase)
+        test_tick(lbase)
+        test_notify_lock()
         test_mail_sample()
         test_midnight(lbase)
         test_supervisor_and_allowlist()

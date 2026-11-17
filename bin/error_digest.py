@@ -10,6 +10,8 @@ no fix jobs (not approved; ask first).
   error_digest.py backfill --days N [--no-model]                     build the last N days, oldest first
   error_digest.py show [--day YYYY-MM-DD]                            print a digest
   error_digest.py days                                               the last 14 digests with their counts
+  error_digest.py tick                                               the container's daily run (every.sh 300): see
+                                                                     cmd_tick
 On a machine whose queue runs elsewhere (queue_config.queue_is_remote(), e.g. the operator's Mac), show and days read
 the queue API's GET /api/error-digest (the queue token; see api_read) instead of the local digest dir.
   error_digest.py grading --days N                                   one page for the operator to mark the errors worth knowing
@@ -21,7 +23,7 @@ Known noise (error_digest_noise.json, plus noise.json in the digest dir) is fold
 Alert rules (error_digest_alerts.json, plus alerts.json in the digest dir) route kinds "for you" (the daily message)
 or "for Claude" (logged for the operator's Claude sessions), or hold them back; see "alert routing" below. The daily
 message is <day>.notify.txt; when $ERROR_DIGEST_NOTIFY_URL and its token are set, `run` (yesterday only, once per
-day, never backfill) also POSTs it there. Unset: shadow, the file only. The local model only adds one
+day, never backfill) also POSTs it there; `tick` sends it again when a stop or an outage cut that off. Unset: shadow, the file only. The local model only adds one
 "what it probably means" line per new kind: `run` enqueues one queue job (error-digest-runner.py, Unraid lane) that
 fills them in later; when that job fails the digest stays as plain counts.
 A "Plex and Glacier" section is added from plex_glacier_watch.py's samples for that day, when there are any, and a
@@ -177,16 +179,24 @@ def signature(line):
     return _URL_PATH.sub(r"\1/…", _QUOTED.sub("'<q>'", shape(line)))
 
 
-_DQUOTED = re.compile(r'"[^"\n]{1,160}"')
-_PATH = re.compile(r"(?:(?<![\w.:/~])~?/|\b[A-Za-z]:\\)\S.*$")              # to the end: a folder name can hold spaces
+_MAIL_URL = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://(?:<\w+>|[^/\s?\"'<>)])+)[^\s\"'<>)]+")   # an <ip> host too
+_DQUOTED = re.compile(r'"(?:[^"\\\n]|\\.){1,160}"')                                   # "a \"name\"" as one
+# to the end of the line (a folder name can hold spaces): /abs (also after ':', '=', '(' or '.'), ./rel, ../rel, ~/x,
+# C:\x, \\server\share, file:///x, and a relative path of 2+ segments (media/Folder/x); never the // of a URL or a
+# URL's path already cut to /…
+_PATH = re.compile(r"(?:(?<![\w/~])(?:\.\.?/|~?/(?![/…]))|\b[A-Za-z]:\\|\\\\[\w.$-]+\\|(?i:\bfile:/+)"
+                   r"|(?<![\w/~.:<>-])[A-Za-z][\w.-]+/[^\s/]+/)\S.*$")
 _DOTTED = re.compile(r"\b\w[\w'()\[\]+-]*(?:\.[\w'()\[\]+-]+){3,}")          # Some.Show.SNEN.Np.WEB-GRP
 
 
 def mail_sample(sample):
     """A sample line as the daily message may carry it (the message goes through the mail Worker): signature()'s
-    folding (single-quoted names, URL paths), plus double-quoted names, file paths (from the path to the end of the
-    line) and dotted release names taken out. The digest on Unraid keeps the full shape()."""
-    s = _URL_PATH.sub(r"\1/…", _QUOTED.sub("'<q>'", sample or ""))
+    folding (single-quoted names, URL paths, here also after an <ip> host), plus double-quoted names (escaped quotes
+    inside), file paths (from the path to the end of the line) and dotted release names taken out. A backstop for the
+    shapes it can see, not a filter: an unquoted name in plain words still gets through, which is why an owner rule
+    whose lines name a download or file sets "names" (no example line is mailed). The digest on Unraid keeps the full
+    shape()."""
+    s = _MAIL_URL.sub(r"\1/…", _QUOTED.sub("'<q>'", sample or ""))
     s = _DQUOTED.sub('"<q>"', s)
     s = _PATH.sub("<path>", s)
     return _DOTTED.sub("<name>", s)
@@ -884,13 +894,14 @@ def notify_settings():
     return url, tok
 
 
-NOTIFY_WAITS = (60, 300)    # a send that failed on the network, a 429 or a 5xx is tried again after these many seconds
+NOTIFY_WAITS = (30,)        # a send that failed on the network, a 429 or a 5xx is tried again after these many seconds
+                            # (short: a stop during the wait loses the run; longer outages are cmd_tick's resends)
 
 
-def send_notify(rec):
+def send_notify(rec, waits=None):
     """POST {app, ref, subject, text} with the bearer token; -> the rec["notify"] record. Never raises, never prints
     the token or the URL's query. The token is never passed on to a redirect's target. A 409 is the mail Worker saying
-    this day was already mailed: recorded as sent."""
+    this day was already mailed: recorded as sent. A failure worth trying again later is marked retry_later."""
     url, tok = notify_settings()
     now = _iso(time.time())
     if not url or not tok:
@@ -902,15 +913,16 @@ def send_notify(rec):
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "User-Agent": "error-digest"})
     req.add_unredirected_header("Authorization", "Bearer " + tok)
-    out, tries = {}, 0
-    for wait in (0,) + tuple(NOTIFY_WAITS):
+    out, tries, again = {}, 0, False
+    for wait in (0,) + tuple(NOTIFY_WAITS if waits is None else waits):
         if wait:
             time.sleep(wait)
         tries += 1
         out = _post_once(req)
-        if not out.pop("retry", False):
+        again = out.pop("retry", False)
+        if not again:
             break
-    return dict(out, at=now, **({"tries": tries} if tries > 1 else {}))
+    return dict(out, at=now, **({"tries": tries} if tries > 1 else {}), **({"retry_later": True} if again else {}))
 
 
 def _post_once(req):
@@ -1066,6 +1078,8 @@ def cmd_run(argv, days=None):
                 if prev.get("status") == "sent":
                     rec["notify"] = prev                      # one message per day, whatever reruns there are
                 elif day == _yesterday():
+                    rec["notify"] = {"status": "pending", "at": _iso(time.time())}
+                    write_day(ddir, rec)              # a stop during the send keeps the digest; a tick sends it later
                     rec["notify"] = send_notify(rec)
                     print("[error-digest] daily message: %s" % rec["notify"]["status"])
             out = write_day(ddir, rec)
@@ -1079,6 +1093,90 @@ def cmd_run(argv, days=None):
                 rec["model"] = {"status": "failed", "model": model, "why": "not queued"}
                 write_day(ddir, rec)
     return 0
+
+
+TICK_AT = (5, 7)            # cmd_tick builds yesterday on its first tick at or after this local time (hour, minute)
+TICK_MAX_BUILDS = 12        # full builds of one day at most (a run that dies before it writes must not loop all day)
+BUILD_EVERY_S = 900         # ...and a build is tried again only this long after the last try (12 x 15 min: ~3 h of
+                            # Loki outage; after that the day is built by hand: error_digest.py run)
+RESEND_EVERY_S = 1800       # a send that failed for a reason worth retrying is sent again this long after the last try
+
+
+def cmd_tick(argv):
+    """The container's daily run (supervisord: every.sh 300 ... tick). On its first tick at or after TICK_AT it builds
+    and sends yesterday (cmd_run). Later ticks only finish what a stop or an outage left: no digest for yesterday yet
+    (Loki was down, or the run was stopped before it wrote) -> build again BUILD_EVERY_S after the last try, at most
+    TICK_MAX_BUILDS times; a send left pending (the run was stopped during it) -> send from the stored digest; a failed
+    send marked retry_later -> send again every RESEND_EVERY_S until midnight. A digest that exists is never rebuilt (that would drop the model job's
+    lines). A finished day costs two small file reads per tick."""
+    now = dt.datetime.now()
+    if (now.hour, now.minute) < tuple(TICK_AT):
+        return 0
+    ddir, day, rc = digest_dir(), _yesterday(), 0
+    st = _tick_state(ddir, day)
+    if not st.get("done"):
+        if not (Path(ddir) / "digests" / (day + ".json")).exists():
+            if st.get("builds", 0) >= TICK_MAX_BUILDS or time.time() - st.get("last", 0) < BUILD_EVERY_S:
+                return 0
+            st["builds"], st["last"] = st.get("builds", 0) + 1, time.time()
+            _tick_save(ddir, st)
+            rc = cmd_run(argv)
+            if rc == 1:                     # Loki failed part way: the next tick tries again
+                return rc
+        st["done"] = True                   # built, or a settings problem (rc 2) a retry today will not fix
+        _tick_save(ddir, st)
+    return _resend(ddir, day) or rc
+
+
+def _resend(ddir, day):
+    """Send yesterday's stored message again when it is due (see cmd_tick). Under the notify lock, so a run that is
+    sending right now is waited for; a "pending" seen under the lock is a run that died during its send. One try."""
+    if not (Path(ddir) / "digests" / (day + ".json")).exists():
+        return 0
+    with _notify_lock(ddir, True):
+        rec = _read_day(ddir, day)
+        n = rec.get("notify") or {}
+        due = n.get("status") == "pending" or (n.get("status") == "failed" and n.get("retry_later")
+                                                and time.time() - _parse_iso(n.get("at")) >= RESEND_EVERY_S)
+        if not (rec.get("alerts") and rec.get("day") == day and due):
+            return 0
+        sent = dict(send_notify(rec, waits=()), resent=True)
+        rec = _read_day(ddir, day) or rec    # only notify changes: keep anything written during the send
+        rec["notify"] = sent
+        print("[error-digest] daily message (resent): %s" % sent["status"])
+        write_day(ddir, rec)
+    return 0
+
+
+def _read_day(ddir, day):
+    try:
+        rec = json.loads((Path(ddir) / "digests" / (day + ".json")).read_text())
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_iso(t):
+    try:
+        return dt.datetime.fromisoformat(t).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tick_state(ddir, day):
+    try:
+        st = json.loads((Path(ddir) / ".tick.json").read_text())
+        return st if isinstance(st, dict) and st.get("day") == day else {"day": day}
+    except (OSError, ValueError):
+        return {"day": day}
+
+
+def _tick_save(ddir, st):
+    Path(ddir).mkdir(parents=True, exist_ok=True)
+    tmp = Path(ddir) / ".tick.json.tmp"
+    tmp.write_text(json.dumps(st))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, Path(ddir) / ".tick.json")
 
 
 @contextlib.contextmanager
@@ -1297,7 +1395,7 @@ def main(argv=None):
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
     fn = {"run": cmd_run, "backfill": cmd_backfill, "show": cmd_show, "days": cmd_days,
-          "grading": cmd_grading}.get(cmd)
+          "grading": cmd_grading, "tick": cmd_tick}.get(cmd)
     if not fn:
         print(__doc__)
         return 2

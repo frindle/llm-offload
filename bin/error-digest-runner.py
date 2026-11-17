@@ -160,18 +160,22 @@ def main(argv=None):
             continue
         answered += len(got)
         lines.update(got)
-    # re-read: the digest may have been rebuilt while the calls ran; keep only lines whose kinds are still there
-    try:
-        rec = json.loads(day_json.read_text())
-    except (OSError, ValueError):
-        emit("E_TASK: day file vanished")
-        return 2
-    live = {s["id"] for i in (rec.get("containers") or {}).values() for s in i.get("sigs") or []}
-    lines = {k: v for k, v in lines.items() if k in live}
-    ok = bool(lines) or not items or failed < len(items)
-    rec["model"] = {"status": "done" if ok else "failed", "model": a.model, "asked": asked, "answered": len(lines),
-                    "calls_failed": failed, "seconds": round(time.time() - t0, 1), "lines": lines}
-    ED.write_day(ddir, rec)
+    # re-read: the digest may have been rebuilt while the calls ran; keep only lines whose kinds are still there.
+    # Under the digest's notify lock, so a resend of the daily message (error_digest.py tick) and this write never
+    # overwrite each other.
+    with ED._notify_lock(ddir, True):
+        try:
+            rec = json.loads(day_json.read_text())
+        except (OSError, ValueError):
+            emit("E_TASK: day file vanished")
+            return 2
+        live = {s["id"] for i in (rec.get("containers") or {}).values() for s in i.get("sigs") or []}
+        lines = {k: v for k, v in lines.items() if k in live}
+        ok = bool(lines) or not items or failed < len(items)
+        rec["model"] = {"status": "done" if ok else "failed", "model": a.model, "asked": asked,
+                        "answered": len(lines), "calls_failed": failed, "seconds": round(time.time() - t0, 1),
+                        "lines": lines}
+        ED.write_day(ddir, rec)
     emit("%s: %d containers, %d kinds asked, %d explained, %d calls failed, %.0fs" % (
         rec.get("day"), len(items), asked, len(lines), failed, time.time() - t0))
     return 0 if ok else 1
