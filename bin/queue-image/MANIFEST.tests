@@ -292,5 +292,6 @@ test-queue-drain.py
 test-error-digest.py
 test-prompt-jobs.py
 test-plex-glacier-watch.py
+test-plex-playback.py
 test_review_remote_job.py
 test-bundle-infra-wait.py
