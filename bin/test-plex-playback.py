@@ -123,6 +123,12 @@ def test_parse():
     chk("parse: no time= -> ignored", P.parse(ns, line.replace("&time=", "&tim=")) is None)
     e3 = P.parse(ns, line.split(" [1234]", 1)[1])
     chk("parse: no clock text on the line -> Loki's receive time", e3 and abs(e3["t"] - ns / 1e9) < 0.01, e3)
+    for ip6, want in (("2001:db8:0:1::5", "2001:db8:0:1::5"), ("::ffff:" + LAN, LAN)):
+        e6 = P.parse(*tl_line(T0, ip6, "playing", 10))
+        chk("parse: an IPv6 client address is kept whole (%s)" % ip6, e6 and e6["ip"] == want, e6)
+    m = P.DECISION_RE.search("Request: [2001:db8::5:51515 (Allowed Network)] GET /video/:/transcode/universal/start?x")
+    chk("parse: the transcode request regex keeps an IPv6 address whole", m and m.group("ip") == "2001:db8::5",
+        m and m.group("ip"))
     chk("label: a LAN client by address", P.device_label(LAN) == LAN)
     lab = P.device_label(WAN)
     chk("label: anything else hashed, never the address", lab.startswith("remote ") and WAN not in lab, lab)
@@ -152,7 +158,17 @@ def test_waits():
     w = kinds([ev(0, "playing", 100), ev(10, "paused", 110), ev(400, "buffering", 110), ev(405, "playing", 110)])
     chk("waits: after a long gap (paused 6 min) it is a start", [k for k, _ in w] == ["start"], w)
     w = kinds([ev(0, "playing", 100), ev(10, "paused", 110), ev(30, "buffering", 110), ev(36, "playing", 110)])
-    chk("waits: resuming from pause at the same spot and buffering is a stall", w == [("stall", 6.0)], w)
+    chk("waits: resuming from a pause at the same spot and buffering is the resume's wait, not a stall",
+        w == [("seek", 6.0)], w)
+    w = kinds([ev(0, "playing", 100), ev(10, "paused", 110), ev(20, "paused", 900), ev(30, "buffering", 900),
+               ev(34, "playing", 900)])
+    chk("waits: a scrub made while paused (already reported paused at the new spot) is a seek, not a stall",
+        w == [("seek", 4.0)], w)
+    w = kinds([ev(0, "playing", 100), ev(10, "paused", 110), ev(30, "buffering", 110), ev(36, "playing", 110)] +
+              [ev(46 + 10 * k, "playing", 120 + 10 * k) for k in range(6)] +
+              [ev(106, "buffering", 180), ev(120, "playing", 180)])
+    chk("waits: a real stall later in the same play after a resume is still a stall",
+        [k for k, _ in w] == ["seek", "stall"], w)
     w = kinds([ev(0, "playing", 100), ev(10, "buffering", 110), ev(20, "buffering", 110)])
     chk("waits: no report after the buffering -> counted to the last report plus 10 s", w == [("stall", 20.0)], w)
     w = kinds([ev(0, "playing", 100), ev(10, "buffering", 110), ev(500, "playing", 110)])

@@ -331,6 +331,30 @@ def test_alerts():
     al2 = ED.decide_alerts(acc2, ar, {})
     chk("a run of 35 min (lines 5 min apart) passes sustain_min 30", [i["what"] for i in al2["owner"]] == ["Backend"]
         and al2["owner"][0]["longest_min"] == 35.0, al2)
+    start = 1000 * m
+    today = [(start + k * 5 * m, "backend down") for k in range(3)]            # 00:00 to 00:10: 10 min today
+    acc3 = {i: [("web1", h)] for i, h in ED.match_alerts("web1", today, ar).items()}
+    bi = next(iter(acc3))
+    eq("a run that began before midnight: held on its own (10 min today)",
+       [i["what"] for i in ED.decide_alerts(acc3, ar, {})["held"]], ["Backend"])
+    al3 = ED.decide_alerts(acc3, ar, {}, before={bi: [start - k * 5 * m for k in range(5, 0, -1)]})
+    chk("... measured whole with the 25 min before midnight it is 35 min and sent; the count stays today's",
+        [i["what"] for i in al3["owner"]] == ["Backend"] and al3["owner"][0]["longest_min"] == 35.0
+        and al3["owner"][0]["count"] == 3, al3)
+    al4 = ED.decide_alerts(acc3, ar, {}, before={bi: [start - k * 5 * m for k in range(9, 3, -1)]})
+    chk("... lines before midnight that ended more than the gap before it are not joined to today's run",
+        [i["what"] for i in al4["held"]] == ["Backend"], al4)
+    (d / "n.json").write_text(json.dumps([{"route": "owner", "match": "unpack", "what": "Unpack", "names": True},
+                                          {"route": "owner", "match": "other", "what": "Other"}]))
+    an = ED.load_alerts(d / "n.json")
+    accn = {i: [("c", h)] for i, h in ED.match_alerts("c", [(m, "unpack of Secret.Name.Here.x failed"),
+                                                             (2 * m, "other 'Quoted Name' at /data/Some Dir/f")],
+                                                     an).items()}
+    aln = ED.decide_alerts(accn, an, {})
+    _, ntn = ED.notify_text({"day": "2026-11-02", "alerts": aln, "containers": {}})
+    chk("the message leaves out the sample of a names rule, and folds quoted names and paths in the others",
+        "Secret" not in ntn and "Quoted" not in ntn and "Some Dir" not in ntn and "- Unpack (c;" in ntn
+        and "e.g. other '<q>' at <path>" in ntn and [i.get("names") for i in aln["owner"]] == [True, None], ntn)
     md = "".join(ED.render_alerts(al))
     chk("render: owner, held and claude sections",
         "## For you" in md and "**Fatal**" in md and "## Held back" in md and "## For Claude" in md
@@ -348,7 +372,8 @@ class FakeNotify:
     def __call__(self, req, timeout=None):
         if not getattr(req, "full_url", "").startswith(("https://notify.test", "http://notify.test")):
             return self.real(req, timeout=timeout)     # Loki
-        FakeNotify.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data)))
+        FakeNotify.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data),
+                                 "Authorization" in req.headers))     # req.headers is what a redirect copies
         if FakeNotify.code >= 300:
             raise urllib.error.HTTPError(req.full_url, FakeNotify.code, "no", {}, io.BytesIO(b"{}"))
 
@@ -370,8 +395,9 @@ def test_notify(base):
     FakeLoki.logs = {"homebridge": [(ns_at(y, 4), "[Lutron] Failed to re-subscribe to events, error ECONNRESET")],
                      "ollama": [(ns_at(y, 5), "error: CUDA out of memory")],
                      "vaultwarden": [(ns_at(y, 6), "[ERROR] Username or password is incorrect. Try again. IP: 192.0.2.9")]}
-    real = ED.urllib.request.urlopen
+    real, waits = ED.urllib.request.urlopen, ED.NOTIFY_WAITS
     ED.urllib.request.urlopen = FakeNotify(real)
+    ED.NOTIFY_WAITS = (0, 0)
     try:
         for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
             os.environ.pop(k, None)
@@ -380,8 +406,9 @@ def test_notify(base):
         nt = (tmp / "digests" / (y + ".notify.txt")).read_text()
         chk("no notify URL: shadow, nothing sent, the message is written", rc == 0 and r["notify"]["status"] == "shadow"
             and not FakeNotify.calls and nt.startswith("Subject: Unraid ") and "1 thing for you" in nt, (out, err, nt))
-        chk("the message: owner item and its sample; vaultwarden under 3 held back; claude items only counted",
-            "Lutron Pico buttons went silent" in nt and "Failed Vaultwarden logins" in nt and "Held back" in nt
+        chk("the message: owner item and its sample; vaultwarden under 3 held back and only counted; claude items "
+            "only counted", "Lutron Pico buttons went silent" in nt and "e.g. [Lutron] Failed to re-subscribe" in nt
+            and "Held back: 1 item (not sent" in nt and "Vaultwarden" not in nt
             and "CUDA" not in nt and "1 item for Claude" in nt, nt)
         tf = tmp / "tok"
         tf.write_text("notify-secret\n")
@@ -393,7 +420,14 @@ def test_notify(base):
         FakeNotify.code = 500
         quiet(ED.main, ["run", "--no-model"])
         r = json.loads((tmp / "digests" / (y + ".json")).read_text())
-        chk("a 500 is recorded as failed (and tried again on the next run)", r["notify"] == {**r["notify"], "status": "failed", "http": 500})
+        chk("a 500 is tried 3 times, then recorded as failed (and tried again on the next run)",
+            r["notify"] == {**r["notify"], "status": "failed", "http": 500, "tries": 3} and len(FakeNotify.calls) == 3,
+            (r["notify"], len(FakeNotify.calls)))
+        FakeNotify.code, FakeNotify.calls = 400, []
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a 400 is not tried again in the same run", r["notify"]["status"] == "failed" and len(FakeNotify.calls) == 1
+            and "tries" not in r["notify"], (r["notify"], len(FakeNotify.calls)))
         FakeNotify.code, FakeNotify.calls = 202, []
         rc, out, err = quiet(ED.main, ["run", "--no-model"])
         r = json.loads((tmp / "digests" / (y + ".json")).read_text())
@@ -402,6 +436,7 @@ def test_notify(base):
             r["notify"]["status"] == "sent" and len(c) == 1 and c[0][1] == "Bearer notify-secret"
             and c[0][2]["app"] == "error-digest" and c[0][2]["ref"] == y and "for you" in c[0][2]["subject"]
             and "Lutron" in c[0][2]["text"], (r.get("notify"), c))
+        chk("the bearer is an unredirected header (never passed on to a redirect's target)", c and not c[0][3], c)
         chk("the token is never printed", "notify-secret" not in out + err)
         quiet(ED.main, ["run", "--no-model"])
         quiet(ED.main, ["run", "--no-model", "--day", y])
@@ -422,10 +457,57 @@ def test_notify(base):
         old = (dt.date.today() - dt.timedelta(days=3)).isoformat()
         quiet(ED.main, ["run", "--no-model", "--day", old])
         chk("--no-send, backfill and an older --day never send", len(FakeNotify.calls) == 1, FakeNotify.calls[1:])
+        (tmp / "digests" / (y + ".json")).unlink()
+        FakeNotify.code, FakeNotify.calls = 409, []
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a 409 (the mail Worker already mailed this day) is recorded as sent, not tried again",
+            r["notify"]["status"] == "sent" and r["notify"]["http"] == 409 and len(FakeNotify.calls) == 1, r["notify"])
+        chk("the send holds a lock file in the digest dir, private", (tmp / ".notify.lock").exists()
+            and (tmp / ".notify.lock").stat().st_mode & 0o077 == 0)
+        FakeNotify.code = 202
     finally:
-        ED.urllib.request.urlopen = real
+        ED.urllib.request.urlopen, ED.NOTIFY_WAITS = real, waits
         for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
             os.environ.pop(k, None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mail_sample():
+    cases = [("Import failed for 'A Title (2019)'", "'<q>'", "Title"),
+             ('Album "Some Album" not found', '"<q>"', "Some Album"),
+             ("could not move /data/media/Some Folder/x.mkv: denied", "move <path>", "Some Folder"),
+             ("cannot open C:\\Downloads\\x.mkv", "open <path>", "Downloads"),
+             ("grab Some.Show.S01E02.1080p.WEB-GRP failed", "grab <name> failed", "Show"),
+             ("GET https://api.example.test/v2/users/77/orders failed", "https://api.example.test/…", "users")]
+    for line, want, gone in cases:
+        got = ED.mail_sample(ED.shape(line))
+        chk("mail sample folds %r" % want, want in got and gone not in got, got)
+    keep = "[Lutron] Failed to re-subscribe to events, error ECONNRESET; N/N tries"
+    eq("mail sample leaves a plain error line alone", ED.mail_sample(keep), keep)
+
+
+def test_midnight(base):
+    """A Deluge outage from 23:35 to 00:10: the shipped rule (sustain 30) holds it on day 1 (20 min) and sends it on
+    day 2, measured whole (35 min), with Loki asked for the lines before midnight."""
+    tmp = Path(tempfile.mkdtemp(prefix="ed-midnight-"))
+    d1, d2 = "2026-11-05", "2026-11-06"
+    line = "[Warn] Deluge: Unable to connect to Deluge, please check your settings"
+    FakeLoki.logs = {"sonarr": [(ns_at(d1, 23, mm), line) for mm in range(35, 60, 5)] +
+                               [(ns_at(d2, 0, mm), line) for mm in range(0, 15, 5)]}
+    lk, ar = ED.Loki(base, "tok-test"), ED.alert_rules(tmp)
+    r1 = ED.build_day(lk, d1, tmp, ED.noise_rules(tmp), say=lambda *a: None, arules=ar)
+    r2 = ED.build_day(lk, d2, tmp, ED.noise_rules(tmp), say=lambda *a: None, arules=ar)
+    what = "Sonarr/Radarr/Lidarr could not reach Deluge"
+    chk("midnight: day 1 holds the 20 min it saw", [i["what"] for i in r1["alerts"]["held"]] == [what], r1["alerts"])
+    o2 = r2["alerts"]["owner"]
+    chk("midnight: day 2 sends it, the run measured whole (35 min), today's 3 lines counted",
+        [i["what"] for i in o2] == [what] and o2[0]["longest_min"] == 35.0 and o2[0]["count"] == 3, r2["alerts"])
+    FakeLoki.logs = {"sonarr": [(ns_at(d2, 0, 30), line)]}
+    FakeLoki.calls = []
+    ED.build_day(lk, d2, tmp, ED.noise_rules(tmp), say=lambda *a: None, arules=ar)
+    chk("midnight: no look back when the first line is more than the gap after midnight",
+        sum(1 for pth, q in FakeLoki.calls if pth.endswith("query_range")) == 1, FakeLoki.calls)
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -741,6 +823,8 @@ def main():
         test_noise_local_adds()
         test_alerts()
         test_notify(lbase)
+        test_mail_sample()
+        test_midnight(lbase)
         test_supervisor_and_allowlist()
         test_api_read()
         test_remote_show()

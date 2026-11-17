@@ -2,13 +2,15 @@
 
 First user: resell-tracker, once a day after its last sync ("3 orders synced, 1 pending review"). The 05:07
 error-digest run puts each app's lines for that day in their own section of the one daily message, after the
-"for you" items. Counts only: no order numbers, names, emails or amounts (lines that look like those are turned away).
+"for you" items. Counts only: the poster must never put order numbers, names, emails or amounts in a line. The check
+below is a backstop for the shapes it can see (emails, money, long numbers), not a filter: it cannot spot a name.
 
   POST /api/digest-lines   {"app": "resell", "day": "YYYY-MM-DD", "lines": ["...", ...], "needs_you": false}
                            -> 200 {"ok": true, "day", "lines": n}; the last POST for an app + day wins ([] clears it)
 
 Rules: app in DIGEST_LINES_APPS (comma list, default "resell"); day = today or up to 2 days back (container clock);
-at most 10 lines of at most 200 characters; a line with "@", "$" or a run of 6+ digits -> 400 "line N looks private".
+at most 10 lines of at most 200 characters; a line with "@", a currency sign or word (USD, EUR, GBP, dollars), an
+amount with cents (12.99, 12,99) or a run of 6+ digits -> 400 "line N looks private".
 needs_you (optional, default false) makes the email's subject say the app needs the operator.
 Auth: "Authorization: Bearer <QUEUE_DIGEST_TOKEN>" (env, or the file named by QUEUE_DIGEST_TOKEN_FILE); this token
 works on this route only, and the route accepts nothing else. No token configured = 503 (never open).
@@ -30,7 +32,8 @@ MAX_BACK_DAYS = 2
 KEEP_DAYS = 14
 MIN_TOKEN_LEN = 24
 APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-PRIVATE_RE = re.compile(r"[@$]|\d{6,}")
+PRIVATE_RE = re.compile(r"[@$\u00a2-\u00a5\u20ac]|\d{6,}|\b\d+[.,]\d{2}\b|\b(?:usd|eur|gbp|dollars?)\b", re.I)
+DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")      # fromisoformat alone also takes 20261116 and 2026-W47-1
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 TITLES = {"resell": "Resell"}
 
@@ -80,8 +83,10 @@ def _body(raw, today):
     if app not in apps():
         return None, (400, {"error": "E_BODY", "detail": "unknown app"})
     try:
-        dd = dt.date.fromisoformat(day)
+        dd = dt.date.fromisoformat(day) if DAY_RE.match(day) else None
     except ValueError:
+        dd = None
+    if dd is None:
         return None, (400, {"error": "E_BODY", "detail": "day: YYYY-MM-DD"})
     if not (today - dt.timedelta(days=MAX_BACK_DAYS) <= dd <= today):
         return None, (400, {"error": "E_BODY", "detail": "day: today or up to %d days back" % MAX_BACK_DAYS})
@@ -99,7 +104,7 @@ def _body(raw, today):
     needs = d.get("needs_you", False)
     if not isinstance(needs, bool):
         return None, (400, {"error": "E_BODY", "detail": "needs_you: true or false"})
-    return {"app": app, "day": day, "lines": clean, "needs_you": needs}, None
+    return {"app": app, "day": dd.isoformat(), "lines": clean, "needs_you": needs}, None
 
 
 def sweep(base, now=None, keep_days=KEEP_DAYS):
@@ -132,21 +137,22 @@ def save(base, req, now=None):
 
 def read_day(day, ddir=None):
     """[{app, title, lines, needs_you}] for one day, in DIGEST_LINES_APPS order; apps with no lines are left out.
-    Never raises."""
+    Never raises; one app's bad file never costs the others theirs."""
     out = []
     try:
         base = store_dir(ddir)
-        for app in apps():
-            try:
-                d = json.loads((base / ("%s-%s.json" % (app, day))).read_text())
-            except (OSError, ValueError):
-                continue
+        names = apps()
+    except Exception:  # noqa: BLE001 - the digest must go out without them
+        return out
+    for app in names:
+        try:
+            d = json.loads((base / ("%s-%s.json" % (app, day))).read_text())
             lines = [str(x)[:MAX_LINE] for x in (d.get("lines") or [])[:MAX_LINES] if isinstance(x, str) and x.strip()]
             if lines:
                 out.append({"app": app, "title": TITLES.get(app, app), "lines": lines,
                             "needs_you": d.get("needs_you") is True})
-    except Exception:  # noqa: BLE001 - the digest must go out without them
-        return out
+        except Exception:  # noqa: BLE001 - a missing or bad file: that app has no section
+            continue
     return out
 
 
