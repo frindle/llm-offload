@@ -38,6 +38,7 @@ again (key=value secrets, emails, URLs with their query strings, IPs).
 import contextlib
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -181,11 +182,12 @@ def signature(line):
 
 _MAIL_URL = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://(?:<\w+>|[^/\s?\"'<>)])+)[^\s\"'<>)]+")   # an <ip> host too
 _DQUOTED = re.compile(r'"(?:[^"\\\n]|\\.){1,160}"')                                   # "a \"name\"" as one
+_DQUOTED_PLAIN = re.compile(r'"[^"\n]{1,160}"')                                       # "C:\dir\" "a name": two
 # to the end of the line (a folder name can hold spaces): /abs (also after ':', '=', '(' or '.'), ./rel, ../rel, ~/x,
-# C:\x, \\server\share, file:///x, and a relative path of 2+ segments (media/Folder/x); never the // of a URL or a
-# URL's path already cut to /…
-_PATH = re.compile(r"(?:(?<![\w/~])(?:\.\.?/|~?/(?![/…]))|\b[A-Za-z]:\\|\\\\[\w.$-]+\\|(?i:\bfile:/+)"
-                   r"|(?<![\w/~.:<>-])[A-Za-z][\w.-]+/[^\s/]+/)\S.*$")
+# C:\x, \\server\share, //server/share, file:///x, and a relative path of 2+ segments (media/Folder/x); never the // of
+# a URL or a URL's path already cut to /…
+_PATH = re.compile(r"(?:(?<![\w/~])(?:\.\.?/|~?/(?![/…]))|\b[A-Za-z]:\\|\\\\[\w.$-]+\\|(?<![\w:/~])//[\w.$-]+/"
+                   r"|(?i:\bfile:/+)|(?<![\w/~.:<>-])[A-Za-z][\w.-]+/[^\s/]+/)\S.*$")
 _DOTTED = re.compile(r"\b\w[\w'()\[\]+-]*(?:\.[\w'()\[\]+-]+){3,}")          # Some.Show.SNEN.Np.WEB-GRP
 
 
@@ -197,9 +199,28 @@ def mail_sample(sample):
     whose lines name a download or file sets "names" (no example line is mailed). The digest on Unraid keeps the full
     shape()."""
     s = _MAIL_URL.sub(r"\1/…", _QUOTED.sub("'<q>'", sample or ""))
-    s = _DQUOTED.sub('"<q>"', s)
+    s = _fold_dquoted(s)
     s = _PATH.sub("<path>", s)
     return _DOTTED.sub("<name>", s)
+
+
+def _fold_dquoted(s):
+    """Double-quoted strings out, reading a backslash before a quote both ways: as an escape ("a \"name\"") and as
+    a plain character ("C:\\dir\\" then "a name"). What either reading sees as quoted is folded (spans merged)."""
+    spans = sorted(m.span() for rx in (_DQUOTED, _DQUOTED_PLAIN) for m in rx.finditer(s))
+    out, last, cur = [], 0, None
+    for a, b in spans:
+        if cur and a <= cur[1]:
+            cur[1] = max(cur[1], b)
+            continue
+        if cur:
+            out += [s[last:cur[0]], '"<q>"']
+            last = cur[1]
+        cur = [a, b]
+    if cur:
+        out += [s[last:cur[0]], '"<q>"']
+        last = cur[1]
+    return "".join(out) + s[last:]
 
 
 def sig_id(container, sig):
@@ -936,8 +957,10 @@ def _post_once(req):
             code = r.status
     except urllib.error.HTTPError as e:
         code = e.code
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"status": "failed", "why": str(getattr(e, "reason", e))[:200], "retry": True}
+    except (ValueError, http.client.InvalidURL) as e:   # a malformed URL, port or token in the settings: no retry
+        return {"status": "failed", "why": "bad notify settings (%s)" % type(e).__name__}   # fixes it (InvalidURL is
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:   # an HTTPException, so it goes first)
+        return {"status": "failed", "why": str(getattr(e, "reason", e))[:200], "retry": True}   # network: retry later
     if 200 <= code < 300:
         return {"status": "sent", "http": code}
     if code == 409:
@@ -995,7 +1018,31 @@ def enqueue_model_job(ddir, day, model, say=print):
     if r.returncode != 0 or not m:
         say("[error-digest] model job not queued (rc %s); plain counts only" % r.returncode)
         return None
+    try:                                        # the tick's sign that this day's job was queued (_requeue_model)
+        _queued_marker(ddir, day).write_text(m.group(1) + "\n")
+    except OSError:
+        pass
     return m.group(1)
+
+
+def _queued_marker(ddir, day):
+    return Path(ddir) / "jobs" / (day + ".queued")
+
+
+def _queue_model(ddir, day, model, rec, say=print):
+    """Queue the model job for a digest already written with model "pending"; when it cannot be queued, record that
+    (re-read under the notify lock, like every write after the first)."""
+    jid = enqueue_model_job(ddir, day, model, say=say)
+    if jid:
+        say("[error-digest] model job %s queued" % jid)
+        return
+    failed = {"status": "failed", "model": model, "why": "not queued"}
+    with _notify_lock(ddir, True):
+        cur = _read_day(ddir, day) or rec
+        if cur.get("day") == day:
+            cur["model"] = failed
+            write_day(ddir, cur)
+    rec["model"] = failed
 
 
 # ---------------------------------------------------------------------------------------------------- CLI
@@ -1040,8 +1087,9 @@ def cmd_run(argv, days=None):
     model = None if "--no-model" in argv else (_arg(argv, "--model") or os.environ.get("ERROR_DIGEST_MODEL")
                                               or MODEL_DEFAULT)
     send = days is None and "--no-send" not in argv      # never from backfill
+    yday = _yesterday()            # fixed at the start: a build that runs past midnight still sends the day it built
     if days is None:
-        days = [_arg(argv, "--day") or _yesterday()]
+        days = [_arg(argv, "--day") or yday]
     for day in days:
         try:
             dt.date.fromisoformat(day)
@@ -1077,27 +1125,38 @@ def cmd_run(argv, days=None):
         want_model = bool(model and model_items(rec))
         if want_model:
             rec["model"] = {"status": "pending", "model": model}
-        with _notify_lock(ddir, rec.get("alerts") and send):   # two runs at once: the second waits, then sees "sent"
+        sending = False
+        with _notify_lock(ddir, rec.get("alerts") and send):   # two runs at once: one sends, the other sees "sent"
             if rec.get("alerts") and send:
                 prev = _prev_notify(ddir, day)
                 if prev.get("status") == "sent":
                     rec["notify"] = prev                      # one message per day, whatever reruns there are
-                elif day == _yesterday():
+                elif day == yday:
                     rec["notify"] = {"status": "pending", "at": _iso(time.time())}
-                    write_day(ddir, rec)              # a stop during the send keeps the digest; a tick sends it later
-                    rec["notify"] = send_notify(rec)
-                    print("[error-digest] daily message: %s" % rec["notify"]["status"])
+                    sending = True
+            # the first write: a stop after it keeps the digest, and a tick finishes the rest (the model job, the send)
             out = write_day(ddir, rec)
         print("[error-digest] wrote %s" % out)
         if want_model:
-            # written BEFORE the job is queued and not rewritten after: the job may finish first, its lines must stay
-            jid = enqueue_model_job(ddir, day, model)
-            if jid:
-                print("[error-digest] model job %s queued" % jid)
-            else:
-                rec["model"] = {"status": "failed", "model": model, "why": "not queued"}
-                write_day(ddir, rec)
+            # queued before the send, so a stop during the send leaves only the send to finish. From here on the digest
+            # is only rewritten re-read, under the notify lock: the job may finish first, its lines must stay
+            _queue_model(ddir, day, model, rec)
+        if sending:
+            with _notify_lock(ddir, True):
+                cur = _read_day(ddir, day)
+                if (cur.get("notify") or {}).get("status") == "pending":   # else a tick or another run sent it meanwhile
+                    st = _store_sent(ddir, day, cur, send_notify(cur))
+                    print("[error-digest] daily message: %s" % st)
     return 0
+
+
+def _store_sent(ddir, day, rec, sent):
+    """Write a send's result into the stored day, re-read first so only notify changes (the model job may have written
+    its lines during the send). Call under the notify lock. -> the status."""
+    rec = _read_day(ddir, day) or rec
+    rec["notify"] = sent
+    write_day(ddir, rec)
+    return sent["status"]
 
 
 TICK_AT = (5, 7)            # cmd_tick builds yesterday on its first tick at or after this local time (hour, minute)
@@ -1112,8 +1171,9 @@ def cmd_tick(argv):
     and sends yesterday (cmd_run). Later ticks only finish what a stop or an outage left: no digest for yesterday yet
     (Loki was down, or the run was stopped before it wrote) -> build again BUILD_EVERY_S after the last try, at most
     TICK_MAX_BUILDS times; a send left pending (the run was stopped during it) -> send from the stored digest; a failed
-    send marked retry_later -> send again every RESEND_EVERY_S until midnight. A digest that exists is never rebuilt (that would drop the model job's
-    lines). A finished day costs two small file reads per tick."""
+    send marked retry_later -> send again every RESEND_EVERY_S until midnight; a run of this tick stopped before it
+    queued its model job -> queued once. A digest that exists is never rebuilt (that would drop the model job's lines).
+    A finished day costs a few small file reads per tick."""
     now = dt.datetime.now()
     if (now.hour, now.minute) < tuple(TICK_AT):
         return 0
@@ -1130,7 +1190,22 @@ def cmd_tick(argv):
                 return rc
         st["done"] = True                   # built, or a settings problem (rc 2) a retry today will not fix
         _tick_save(ddir, st)
+    _requeue_model(ddir, day, st)
     return _resend(ddir, day) or rc
+
+
+def _requeue_model(ddir, day, st):
+    """A day this tick built whose run was stopped after its first write but before its model job was queued (the
+    digest says "pending", no queued marker): queue the job, once. Days built otherwise (an older image's 05:07 run,
+    a run by hand) are left alone: their job may well be queued."""
+    if not st.get("builds") or st.get("model_requeued") or _queued_marker(ddir, day).exists():
+        return
+    m = _read_day(ddir, day).get("model") or {}
+    if m.get("status") != "pending" or not m.get("model"):
+        return
+    st["model_requeued"] = True
+    _tick_save(ddir, st)
+    _queue_model(ddir, day, m["model"], {})
 
 
 def _resend(ddir, day):
@@ -1145,11 +1220,8 @@ def _resend(ddir, day):
                                                 and time.time() - _parse_iso(n.get("at")) >= RESEND_EVERY_S)
         if not (rec.get("alerts") and rec.get("day") == day and due):
             return 0
-        sent = dict(send_notify(rec, waits=()), resent=True)
-        rec = _read_day(ddir, day) or rec    # only notify changes: keep anything written during the send
-        rec["notify"] = sent
-        print("[error-digest] daily message (resent): %s" % sent["status"])
-        write_day(ddir, rec)
+        st = _store_sent(ddir, day, rec, dict(send_notify(rec, waits=()), resent=True))
+        print("[error-digest] daily message (resent): %s" % st)
     return 0
 
 

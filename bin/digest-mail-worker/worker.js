@@ -60,17 +60,27 @@ export default {
     const key = ref ? `${app}:${ref}` : "";
     if (key && env.SENT && (await env.SENT.get(key))) return reply(409, { ok: false, error: "already sent" });
 
+    let r;
     try {
-      const r = await env.EMAIL.send({
+      r = await env.EMAIL.send({
         from: { email: env.FROM, name: "Unraid digest" },
         to: env.TO,
         subject,
         text,
       });
-      if (key && env.SENT) await env.SENT.put(key, new Date().toISOString(), { expirationTtl: 3 * 86400 });
-      return reply(200, { ok: true, id: r && r.messageId });
     } catch (e) {
       return reply(502, { ok: false, code: e && e.code, error: String((e && e.message) || e).slice(0, 200) });
     }
+    // The mail is gone: from here on the answer is 200 whatever happens. A KV write that fails must not turn a sent
+    // mail into a 502, which the sender retries (a second mail); it only loses the dedupe for this one key.
+    let noted = true;
+    if (key && env.SENT) {
+      try {
+        await env.SENT.put(key, new Date().toISOString(), { expirationTtl: 3 * 86400 });
+      } catch (e) {
+        noted = false;
+      }
+    }
+    return reply(200, { ok: true, id: r && r.messageId, ...(noted ? {} : { deduped: false }) });
   },
 };

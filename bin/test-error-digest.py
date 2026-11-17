@@ -6,6 +6,7 @@ Fake Loki and fake Ollama on 127.0.0.1 (http.server threads); synthetic log line
 """
 import contextlib
 import datetime as dt
+import http.client
 import http.server
 import io
 import json
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.parse
 import urllib.request
 from importlib.machinery import SourceFileLoader
@@ -124,6 +126,15 @@ def quiet(fn, *a, **k):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = fn(*a, **k)
     return rc, out.getvalue(), err.getvalue()
+
+
+def guarded(fn, *a, **k):
+    """quiet(), but an exception (other than a test's own KeyboardInterrupt) comes back as the rc: a check fails
+    instead of the whole run stopping."""
+    try:
+        return quiet(fn, *a, **k)
+    except Exception as e:  # noqa: BLE001
+        return "raised %s" % type(e).__name__, "", ""
 
 
 # ------------------------------------------------------------------------------------------------ tests
@@ -394,6 +405,7 @@ def test_alerts():
 class FakeNotify:
     calls = []
     code = 202
+    exc = None              # raised (after the call is recorded) instead of answering
 
     def __init__(self, real):
         self.real = real
@@ -404,6 +416,8 @@ class FakeNotify:
         FakeNotify.calls.append((req.full_url, req.get_header("Authorization"), json.loads(req.data),
                                  "Authorization" in req.headers))     # req.headers is what a redirect copies
         FakeNotify.last = req
+        if FakeNotify.exc is not None:
+            raise FakeNotify.exc
         if FakeNotify.code >= 300:
             raise urllib.error.HTTPError(req.full_url, FakeNotify.code, "no", {}, io.BytesIO(b"{}"))
 
@@ -501,8 +515,30 @@ def test_notify(base):
             r["notify"]["status"] == "sent" and r["notify"]["http"] == 409 and len(FakeNotify.calls) == 1, r["notify"])
         chk("the send holds a lock file in the digest dir, private", (tmp / ".notify.lock").exists()
             and (tmp / ".notify.lock").stat().st_mode & 0o077 == 0)
-        FakeNotify.code = 202
+        (tmp / "digests" / (y + ".json")).unlink()
+        FakeNotify.code, FakeNotify.calls, FakeNotify.exc = 202, [], http.client.InvalidURL("nonnumeric port")
+        rc, out, err = guarded(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a bad notify setting (a malformed port: http.client.InvalidURL) is tried once and never marked for a resend",
+            rc == 0 and r["notify"]["status"] == "failed" and not r["notify"].get("retry_later")
+            and len(FakeNotify.calls) == 1, (rc, r["notify"], len(FakeNotify.calls)))
+        (tmp / "digests" / (y + ".json")).unlink()
+        FakeNotify.calls, FakeNotify.exc = [], ValueError("unknown url type")
+        rc, out, err = guarded(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a bad notify setting (a ValueError: an unknown URL type) is tried once and never marked for a resend",
+            rc == 0 and r["notify"]["status"] == "failed" and not r["notify"].get("retry_later")
+            and len(FakeNotify.calls) == 1, (rc, r["notify"], len(FakeNotify.calls)))
+        (tmp / "digests" / (y + ".json")).unlink()
+        FakeNotify.calls, FakeNotify.exc = [], http.client.BadStatusLine("garbled")
+        rc, out, err = guarded(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a garbled HTTP answer (an http.client error) is retried like a network error, not a crash", rc == 0
+            and r["notify"]["status"] == "failed" and r["notify"].get("retry_later") and len(FakeNotify.calls) == 3,
+            (rc, r.get("notify"), len(FakeNotify.calls)))
+        FakeNotify.code, FakeNotify.exc = 202, None
     finally:
+        FakeNotify.exc = None
         ED.urllib.request.urlopen, ED.NOTIFY_WAITS = real, waits
         for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
             os.environ.pop(k, None)
@@ -646,6 +682,171 @@ def test_tick(base):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_send_past_midnight(base):
+    """A run started before midnight whose build finishes after it still sends the day it built (round 4 F3)."""
+    tmp = Path(tempfile.mkdtemp(prefix="ed-pastmid-"))
+    y = ED._yesterday()
+    nxt = (dt.date.fromisoformat(y) + dt.timedelta(days=1)).isoformat()
+    tf = tmp / "tok"
+    tf.write_text("notify-secret\n")
+    os.environ.update(LOKI_URL=base, LOKI_TOKEN="tok-test", ERROR_DIGEST_DIR=str(tmp),
+                      ERROR_DIGEST_NOTIFY_URL="https://notify.test/send", ERROR_DIGEST_NOTIFY_TOKEN_FILE=str(tf))
+    FakeLoki.logs = {"homebridge": [(ns_at(y, 4), "[Lutron] Failed to re-subscribe to events, error ECONNRESET")]}
+    seq = [y]
+    saved = (ED._yesterday, ED.urllib.request.urlopen, ED.NOTIFY_WAITS)
+    ED._yesterday = lambda: seq.pop(0) if seq else nxt      # the first look is before midnight, every later one after
+    ED.urllib.request.urlopen = FakeNotify(saved[1])
+    ED.NOTIFY_WAITS = (0,)
+    FakeNotify.code, FakeNotify.calls = 202, []
+    try:
+        rc, out, err = guarded(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        chk("a run that crosses midnight while it builds still sends the day it built", rc == 0
+            and (r.get("notify") or {}).get("status") == "sent" and len(FakeNotify.calls) == 1
+            and FakeNotify.calls[0][2]["ref"] == y, (rc, r.get("notify"), len(FakeNotify.calls)))
+    finally:
+        ED._yesterday, ED.urllib.request.urlopen, ED.NOTIFY_WAITS = saved
+        for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
+            os.environ.pop(k, None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_model_order(base):
+    """The model job is queued before the daily message is sent, and wherever a run is stopped, a tick finishes what
+    is left: the job at most once, the message once (round 4 F6). The queue is faked at error_digest's subprocess."""
+    tmp = Path(tempfile.mkdtemp(prefix="ed-order-"))
+    y = ED._yesterday()
+    dj, ts, mk = tmp / "digests" / (y + ".json"), tmp / ".tick.json", tmp / "jobs" / (y + ".queued")
+    tf = tmp / "tok"
+    tf.write_text("notify-secret\n")
+    os.environ.update(LOKI_URL=base, LOKI_TOKEN="tok-test", ERROR_DIGEST_DIR=str(tmp),
+                      ERROR_DIGEST_NOTIFY_URL="https://notify.test/send", ERROR_DIGEST_NOTIFY_TOKEN_FILE=str(tf))
+    FakeLoki.logs = {"homebridge": [(ns_at(y, 4), "[Lutron] Failed to re-subscribe to events, error ECONNRESET")]}
+    yy = (dt.date.fromisoformat(y) - dt.timedelta(days=1)).isoformat()
+    (tmp / "digests").mkdir(parents=True, exist_ok=True)     # a day before: the line is a NEW kind (no baseline), so
+    (tmp / "digests" / (yy + ".json")).write_text(json.dumps({"day": yy, "containers": {}}))   # the model is asked
+    order, stop_send = [], [False]
+
+    class Sub:                    # ollama-queue.py enqueue: ok | fail (rc 1) | stop (TERM while it runs) | instant
+        SubprocessError = ED.subprocess.SubprocessError
+        mode, calls = "ok", 0
+
+        @staticmethod
+        def run(cmd, **kw):
+            Sub.calls += 1
+            order.append("queue")
+            if Sub.mode == "stop":
+                raise KeyboardInterrupt
+            if Sub.mode == "instant":           # the job runs at once and the runner writes its lines
+                rec = json.loads(dj.read_text())
+                rec["model"] = {"status": "done", "model": "m-test", "lines": {"k": "probably fine"}}
+                ED.write_day(tmp, rec)
+            ok = Sub.mode != "fail"
+            return types.SimpleNamespace(returncode=0 if ok else 1, stdout="enqueued 0123456789ab\n" if ok else "",
+                                         stderr="")
+
+    saved = (ED.subprocess, ED.urllib.request.urlopen, ED.NOTIFY_WAITS, ED.TICK_AT, ED.send_notify)
+
+    def send(rec, waits=None):
+        order.append("send")
+        if stop_send[0]:
+            raise KeyboardInterrupt
+        return saved[4](rec, waits=waits)
+    ED.subprocess, ED.send_notify = Sub, send
+    ED.urllib.request.urlopen = FakeNotify(saved[1])
+    ED.NOTIFY_WAITS, ED.TICK_AT = (0,), (0, 0)
+
+    def fresh():
+        for f in (dj, ts, mk):
+            f.unlink(missing_ok=True)
+        order.clear()
+        Sub.mode, Sub.calls, stop_send[0] = "ok", 0, False
+        FakeNotify.code, FakeNotify.calls = 202, []
+
+    def stopped(argv):
+        try:
+            return guarded(ED.main, argv)
+        except KeyboardInterrupt:
+            return "stopped"
+
+    def tick():
+        return guarded(ED.main, ["tick", "--model", "m-test"])
+    try:
+        fresh()
+        rc, out, err = guarded(ED.main, ["run", "--model", "m-test"])
+        r = json.loads(dj.read_text())
+        chk("model order: the job is queued before the daily message is sent", rc == 0 and order == ["queue", "send"]
+            and (r.get("notify") or {}).get("status") == "sent" and (r.get("model") or {}).get("status") == "pending" and mk.exists(),
+            (rc, order, r.get("notify"), r.get("model")))
+
+        fresh()
+        stop_send[0] = True
+        res = stopped(["tick", "--model", "m-test"])
+        stop_send[0] = False
+        r = json.loads(dj.read_text())
+        chk("model order: a tick's run stopped during its send has already queued the job", res == "stopped"
+            and Sub.calls == 1 and mk.exists() and (r.get("notify") or {}).get("status") == "pending", (res, order, r.get("notify")))
+        tick()
+        tick()
+        r = json.loads(dj.read_text())
+        chk("...the next tick sends the message once and queues no second job", Sub.calls == 1
+            and len(FakeNotify.calls) == 1 and (r.get("notify") or {}).get("status") == "sent", (order, r.get("notify")))
+
+        fresh()
+        Sub.mode = "stop"
+        res = stopped(["tick", "--model", "m-test"])
+        Sub.mode = "ok"
+        r = json.loads(dj.read_text())
+        chk("model order: a run stopped while it queues the job has sent nothing; the digest says both are to do",
+            res == "stopped" and not mk.exists() and (r.get("model") or {}).get("status") == "pending"
+            and (r.get("notify") or {}).get("status") == "pending" and not FakeNotify.calls, (res, order, r.get("notify")))
+        for _ in range(3):
+            tick()
+        r = json.loads(dj.read_text())
+        chk("...the next tick queues the job once, then sends the message once", Sub.calls == 2 and mk.exists()
+            and order[-2:] == ["queue", "send"] and len(FakeNotify.calls) == 1 and (r.get("notify") or {}).get("status") == "sent"
+            and json.loads(ts.read_text()).get("model_requeued"), (order, r.get("notify")))
+
+        fresh()
+        Sub.mode = "stop"
+        stopped(["tick", "--model", "m-test"])
+        Sub.mode = "fail"
+        tick()
+        tick()
+        r = json.loads(dj.read_text())
+        chk("...a requeue that fails is recorded (model failed), tried once, and the message still goes",
+            Sub.calls == 2 and (r.get("model") or {}).get("status") == "failed" and (r.get("notify") or {}).get("status") == "sent", (order, r))
+
+        fresh()
+        Sub.mode = "stop"
+        stopped(["run", "--model", "m-test"])
+        Sub.mode = "ok"
+        tick()
+        chk("model order: a stopped run the tick did not start is not requeued (its job may be queued elsewhere)",
+            Sub.calls == 1 and not mk.exists(), order)
+
+        fresh()
+        Sub.mode = "fail"
+        guarded(ED.main, ["run", "--model", "m-test"])
+        r = json.loads(dj.read_text())
+        chk("model order: a job that cannot be queued is recorded as failed, and the message still goes",
+            (r.get("model") or {}).get("status") == "failed" and (r.get("notify") or {}).get("status") == "sent" and not mk.exists(),
+            (r.get("model"), r.get("notify")))
+
+        fresh()
+        Sub.mode = "instant"
+        guarded(ED.main, ["run", "--model", "m-test"])
+        r = json.loads(dj.read_text())
+        chk("model order: lines the job writes before the send are kept by the send's write",
+            (r.get("model") or {}).get("status") == "done" and (r.get("notify") or {}).get("status") == "sent", (r.get("model"), r.get("notify")))
+    finally:
+        ED.subprocess, ED.urllib.request.urlopen, ED.NOTIFY_WAITS, ED.TICK_AT, ED.send_notify = saved
+        FakeNotify.code = 202
+        for k in ("ERROR_DIGEST_NOTIFY_URL", "ERROR_DIGEST_NOTIFY_TOKEN_FILE"):
+            os.environ.pop(k, None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_notify_lock():
     """The lock really excludes: a resend waits for a holder (a run mid-send), then sees its result."""
     import fcntl
@@ -690,7 +891,10 @@ def test_mail_sample():
              ("could not move media/Movies/Some Folder/x.mkv: denied", "move <path>", "Movies"),
              ("cannot open \\\\nas\\media\\Some Folder\\x.mkv", "open <path>", "Some"),
              ("bad link file:///data/media/Some Folder/x.mkv", "link <path>", "Some"),
-             ("import failed (path=/data/media/Some Folder/x.mkv)", "(path=<path>", "Some")]
+             ("import failed (path=/data/media/Some Folder/x.mkv)", "(path=<path>", "Some"),
+             ('copy "C:\\dir\\" "Some Name" failed', '"<q>" failed', "Some"),
+             ("cannot open //nas/media/Some Folder/x.mkv", "open <path>", "Some"),
+             ('cannot map "One Name" to "Two Name"', '"<q>" to "<q>"', "Name")]
     for line, want, gone in cases:
         got = ED.mail_sample(ED.shape(line))
         chk("mail sample folds %r" % want, want in got and gone not in got, got)
@@ -1036,6 +1240,8 @@ def main():
         test_alerts()
         test_notify(lbase)
         test_tick(lbase)
+        test_send_past_midnight(lbase)
+        test_model_order(lbase)
         test_notify_lock()
         test_mail_sample()
         test_midnight(lbase)
