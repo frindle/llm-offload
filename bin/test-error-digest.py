@@ -300,6 +300,8 @@ def test_alerts():
              ("unpackerr", "Extraction Failed: /dl/x: crc error", "owner"),
              ("homebridge", "[11/7/2026, 4:00:10 AM] [Lutron] Failed to re-subscribe to events", "owner"),
              ("ollama", "error: out of memory", "claude"),
+             ("ollama", 'time=2026-11-17T11:54:28.000Z level=WARN source=llama_server.go:1406 msg="client connection '
+                        'closed before llama-server finished loading, aborting load"', "claude"),
              ("vault", "committer: git push timed out", "claude"),
              ("radarr", "[Warn] Unable to send notification to Webhook", "claude"),
              ("binhex-jackett", "Error: Login failed", "owner"),
@@ -331,6 +333,27 @@ def test_alerts():
         and ED.noise_action(nz, "nominatim", "UTC [88] nominatim@nominatim FATAL:  terminating connection due to administrator command") == "routine"
         and ED.noise_action(nz, "ollama-queue", "WARN exited: queue-daemon (exit status 1; not expected)") is None
         and ED.noise_action(nz, "nominatim", "UTC [90] nominatim@nominatim FATAL:  the database system is in recovery mode") is None)
+    # 11-17 review of the 11-16 digest: an aborted model load is its own item, not "GPU memory, crashes"; the runner
+    # losing the queue while it restarts and Loki's cancelled queries are routine
+    ab = 'time=2026-11-17T11:54:28.000Z level=WARN msg="client connection closed before llama-server finished loading, aborting load"'
+    hit = ED.match_alerts("ollama", [(1, ab)], rules)
+    chk("an aborted Ollama model load is its own Claude item",
+        bool(hit) and rules[next(iter(hit))]["what"].startswith("A client gave up"), hit)
+    oom = ED.match_alerts("ollama", [(1, "time=x level=ERROR msg=\"out of memory\"")], rules)
+    chk("other Ollama errors stay under the catch-all", bool(oom) and rules[next(iter(oom))]["rx"].pattern == ".", oom)
+    chk("the runner's lost-queue lines and Loki's cancelled queries are routine; other errors are not",
+        ED.noise_action(nz, "dispatch-cpu-runner",
+                        '{"error": "<urlopen error [Errno 111] Connection refused>", "ts": 1.5, "event": "claim_error"}') == "routine"
+        and ED.noise_action(nz, "dispatch-cpu-runner",
+                            '{"error": "<urlopen error [Errno 113] No route to host>", "ts": 1.5, "event": "config_pull_failed"}') == "routine"
+        and ED.noise_action(nz, "dispatch-cpu-runner", '{"api": "http://h:1", "error": "<urlopen error [Errno 111] Connection '
+                            'refused>", "hint": "check CPU_RUNNER_API", "ts": 1.5, "event": "api_unreachable"}') == "routine"
+        and ED.noise_action(nz, "dispatch-cpu-runner",
+                            '{"error": "HTTP Error 500: Internal Server Error", "ts": 1.5, "event": "claim_error"}') is None
+        and ED.noise_action(nz, "dispatch-cpu-runner", '{"error": "timed out", "ts": 1.5, "event": "job_failed"}') is None
+        and ED.noise_action(nz, "logstack", 'level=error caller=scheduler_processor.go:304 component=querier msg="error health '
+                            'checking" err="rpc error: code = Canceled desc = context canceled"') == "routine"
+        and ED.noise_action(nz, "logstack", 'level=error msg="error running query" err="out of memory"') is None)
 
     d = Path(tempfile.mkdtemp())
     (d / "a.json").write_text(json.dumps([
