@@ -67,12 +67,16 @@ check("supervisord has 11 programs incl. docsum-ui, error-digest and plex-glacie
       and "program:docsum-ui" in progs and "program:error-digest" in progs and "program:plex-glacier-watch" in progs)
 d = c["program:docsum-ui"]
 check("docsum-ui autostarts in standby and binds loopback", d["autostart"] == "true" and "--host 127.0.0.1" in d["command"])
-sys.path.insert(0, os.path.join(HERE, "..", "qd-standby-dash", "src"))
+# docsum_proxy comes from bin itself (a link into the dashboard repo, as the image ships it). This used to read a
+# sibling worktree and skip on ImportError, so it passed while the image lacked the file (/docsum answered 503, 11-17).
+man = open(os.path.join(HERE, "queue-image", "MANIFEST")).read().split("\n")
+check("the image MANIFEST lists docsum_proxy.py", any(l.split("#", 1)[0].strip() == "docsum_proxy.py" for l in man))
 try:
     import docsum_proxy
+except ImportError as e:
+    check("docsum_proxy imports from bin (%s)" % type(e).__name__, False)
+else:
     os.environ.pop("QUEUE_DOCSUM_UPSTREAM", None)
     check("proxy default upstream is the in-container docsum-ui", docsum_proxy.current_upstream() == ("127.0.0.1", 7690))
-except ImportError:
-    pass
 print("%d failed" % bad)
 sys.exit(1 if bad else 0)

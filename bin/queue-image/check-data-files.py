@@ -9,9 +9,14 @@ was left out, and nothing earlier notices: the 11-14 back-test found mini-swe-ru
 missing, so every Darkbloom mini job would have stopped at its first step.
 
 For each listed code file (.py, .sh, or no extension), every quoted string that names a file under DIR (after
-dropping a leading "~/bin/" or "bin/"; absolute paths are skipped) must be listed in MANIFEST or in NOT_SHIPPED below. Prints each miss
-as `MISSING <path>  (named in <file>)` and exits 1 if there is one, else 0.
+dropping a leading "~/bin/" or "bin/"; absolute paths are skipped) must be listed in MANIFEST or in NOT_SHIPPED below.
+Each listed .py file's absolute imports (nested ones too) are checked the same way: a module X with X.py in DIR (a
+symlink counts: the dashboard files are links in ~/bin) must be listed. The 11-17 miss: ollama-queue-api.py imports
+docsum_proxy inside its /docsum route, the file was never listed, and /docsum answered 503 in the container.
+Prints each miss as `MISSING <path>  (named in <file>)` or `MISSING <path>  (imported by <file>)` and exits 1 if
+there is one, else 0.
 """
+import ast
 import re
 import sys
 from pathlib import Path
@@ -47,7 +52,23 @@ def norm(s):
     return s
 
 
+def imported(text):
+    """Top-level names of the modules a Python source imports absolutely, including imports inside functions."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            out.update(a.name.split(".")[0] for a in n.names)
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            out.add(n.module.split(".")[0])
+    return out
+
+
 def misses(base, files):
+    """{path: (how, listed file)} for each unlisted file a listed code file names by path or imports."""
     have = set(files)
     found = {}
     for rel in files:
@@ -64,7 +85,12 @@ def misses(base, files):
                 continue
             t = base / s
             if t.is_file() and not t.is_symlink():
-                found.setdefault(s, rel)
+                found.setdefault(s, ("named in", rel))
+        if p.suffix == ".py":
+            for mod in sorted(imported(text)):
+                s = mod + ".py"
+                if s not in have and s not in NOT_SHIPPED and (base / s).is_file():
+                    found.setdefault(s, ("imported by", rel))
     return found
 
 
@@ -75,8 +101,8 @@ def main(argv):
         return 2
     man = Path(argv[argv.index("--list") + 1]) if "--list" in argv else Path(__file__).resolve().parent / "MANIFEST"
     found = misses(base, listed(man))
-    for s, rel in sorted(found.items()):
-        print("MISSING %s  (named in %s)" % (s, rel))
+    for s, (how, rel) in sorted(found.items()):
+        print("MISSING %s  (%s %s)" % (s, how, rel))
     print("check-data-files: %d missing" % len(found))
     return 1 if found else 0
 

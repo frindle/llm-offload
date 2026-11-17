@@ -22,5 +22,9 @@
   {"container": "ollama-queue", "match": "\\bstopped: [\\w-]+ \\((?:terminated by SIGTERM|exit status \\d+)\\)|received SIGTERM indicating exit request|'unix_http_server' running without any HTTP authentication", "action": "routine",
    "why": "supervisord's own lines when the container stops or starts (deploys, the weekly Appdata Backup); a crash logs 'exited: ... not expected'"},
   {"container": "nominatim", "match": "FATAL:\\s*terminating connection due to administrator command", "action": "routine",
-   "why": "Postgres closing its connections on a planned stop: every night at 00:02 and when the Appdata Backup stops it"}
+   "why": "Postgres closing its connections on a planned stop: every night at 00:02 and when the Appdata Backup stops it"},
+  {"container": "dispatch-cpu-runner", "match": "(?:Connection refused|No route to host|timed out|Remote end closed connection|reset by peer).*\"event\": \"(?:claim_error|config_pull_failed|api_unreachable)\"", "action": "routine",
+   "why": "the runner cannot reach the queue while the queue restarts (nightly, deploys, the weekly Appdata Backup) and retries; other runner errors stay counted"},
+  {"container": "logstack", "match": "msg=\"error health checking\".*context canceled", "action": "routine",
+   "why": "Loki logs this when a client cancels a query (a log search from a Claude session or the digest)"}
 ]

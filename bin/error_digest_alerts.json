@@ -31,6 +31,9 @@
   {"route": "owner", "container": "ev-dashboard-ev-dashboard-1", "match": "\\[rivian-charge\\].*BAD_REQUEST",
    "what": "Rivian refused a charging schedule change"},
 
+  {"route": "claude", "container": "ollama", "counted_only": true,
+   "match": "client connection closed before llama-server finished loading",
+   "what": "A client gave up before Ollama finished loading a model, so the load was aborted (repeats keep reloading the GPU; the client is in the GIN 499 lines)"},
   {"route": "claude", "container": "ollama", "match": ".", "counted_only": true, "what": "Unraid Ollama errors (GPU memory, crashes)"},
   {"route": "claude", "container": "ollama-queue", "counted_only": true,
    "match": "^(?!.*(?:\\bstopped: [\\w-]+ \\((?:terminated by SIGTERM|exit status \\d+)\\)|received SIGTERM indicating exit request|'unix_http_server' running without any HTTP authentication))",
