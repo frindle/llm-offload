@@ -18,5 +18,9 @@
   {"container": "radarr", "match": "HealthCheck|Unable to parse media info|No available indexers|Indexers? .*unavailable|Download clients? .*unavailable|root folder|IndexerStatusCheck|DownloadClientCheck|RootFolderCheck|IndexerRssCheck|IndexerSearchCheck", "action": "skip",
    "why": "already alerted by plex-automation arr_health.py"},
   {"container": "scrypted", "match": "EHOSTUNREACH|ETIMEDOUT|Unable to gather device information", "action": "routine",
-   "why": "operator, 2026-11-16: cameras come and go with Unraid docker restarts and already notify"}
+   "why": "operator, 2026-11-16: cameras come and go with Unraid docker restarts and already notify"},
+  {"container": "ollama-queue", "match": "\\bstopped: [\\w-]+ \\((?:terminated by SIGTERM|exit status \\d+)\\)|received SIGTERM indicating exit request|'unix_http_server' running without any HTTP authentication", "action": "routine",
+   "why": "supervisord's own lines when the container stops or starts (deploys, the weekly Appdata Backup); a crash logs 'exited: ... not expected'"},
+  {"container": "nominatim", "match": "FATAL:\\s*terminating connection due to administrator command", "action": "routine",
+   "why": "Postgres closing its connections on a planned stop: every night at 00:02 and when the Appdata Backup stops it"}
 ]

@@ -8338,6 +8338,9 @@ def _mirror_escalations(base=None):
 # {"hold": false, "lane": X}. Only a RUNNING row holds: a pending one has no GPU yet and the runner frees the card
 # when it ends. Read-only and lock-free (the daemon replaces the state file by atomic rename). Unreadable state or
 # standby (a copied state says nothing about this host's GPU): 503, which the caller treats as no hold (fails open).
+# Plex too (2026-11-17): while Plex is playing on a lane that shares its GPU (q.plex_gpu_wait: the fresh plex-busy
+# flag, PLEX_GPU_LANES), the answer is {"hold": true, "cause": "plex", "lane": X}, so an outside caller yields the card
+# to Plex the way the queue's own launches do. A running gpu-exclusive job is reported first (it names the job).
 GPU_HOLD_DEFAULT_LANE = "unraid"
 
 
@@ -8372,7 +8375,10 @@ def _gpu_hold_now(lane=GPU_HOLD_DEFAULT_LANE):
         return 503, {"error": "queue state unreadable"}
     if not isinstance(jobs, list):
         return 503, {"error": "queue state unreadable"}
-    return 200, _gpu_hold(jobs, lane)
+    held = _gpu_hold(jobs, lane)
+    if not held["hold"] and q.plex_gpu_wait(lane):
+        held = {"hold": True, "cause": "plex", "lane": lane}
+    return 200, held
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

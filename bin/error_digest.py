@@ -314,7 +314,9 @@ def noise_action(rules, container, line):
 #   min_count N (default 1: fewer lines that day and it is held back), sustain_min M + gap_min G (lines at most G
 #   minutes apart are one run; held back unless a run lasts M minutes; a run that began before midnight is measured
 #   whole on the day it ends), hold "<why>" (held back whatever the count), names true (its lines name a download or
-#   a file: the daily message leaves the example line out; the digest on Unraid keeps it).
+#   a file: the daily message leaves the example line out; the digest on Unraid keeps it), counted_only true (only
+#   lines the digest counts as errors or warnings, see level(): for a catch-all rule, so an INFO line that merely
+#   mentions "error", such as supervisord naming the error-digest program, does not match).
 # Held-back items are listed in the digest (so nothing is hidden) but not sent: the message only counts them. New kinds
 # of error that no rule covers go to Claude, never straight to the operator ("for Claude": the operator's Claude
 # sessions read the digest and handle or ask; nothing here restarts or fixes anything).
@@ -341,7 +343,7 @@ def load_alerts(*paths):
                 a = {"globs": globs, "rx": re.compile(r["match"], re.I), "route": r["route"], "what": str(r["what"]),
                      "min_count": max(1, int(r.get("min_count", 1))), "sustain_min": float(r.get("sustain_min", 0)),
                      "gap_min": float(r.get("gap_min", 10)), "hold": str(r.get("hold") or ""),
-                     "names": r.get("names") is True}
+                     "names": r.get("names") is True, "counted_only": r.get("counted_only") is True}
                 seen.add(key)
                 out.append(a)
             except (re.error, AttributeError, TypeError, ValueError):
@@ -358,7 +360,10 @@ def match_alerts(container, rows, arules):
         return hits
     for ns, raw in rows:
         line = unglue(clean(raw))
+        lv = level(line) if any(a["counted_only"] for _, a in mine) else None
         for i, a in mine:
+            if a["counted_only"] and lv is None:
+                continue
             if a["rx"].search(line):
                 h = hits.get(i)
                 if h is None:

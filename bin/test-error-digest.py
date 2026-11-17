@@ -10,6 +10,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -290,9 +291,35 @@ def test_alerts():
              ("ollama", "error: out of memory", "claude"),
              ("vault", "committer: git push timed out", "claude"),
              ("radarr", "[Warn] Unable to send notification to Webhook", "claude"),
-             ("binhex-jackett", "Error: Login failed", "owner")]
+             ("binhex-jackett", "Error: Login failed", "owner"),
+             # planned stops are not for Claude: supervisord's stop/start lines, Postgres closing on shutdown
+             ("ollama-queue", "WARN stopped: queue-api (terminated by SIGTERM)", None),
+             ("ollama-queue", "WARN stopped: queue-daemon (exit status 143)", None),
+             ("ollama-queue", "WARN received SIGTERM indicating exit request", None),
+             ("ollama-queue", "CRIT Server 'unix_http_server' running without any HTTP authentication checking", None),
+             ("ollama-queue", "WARN exited: queue-daemon (exit status 1; not expected)", "claude"),
+             ("ollama-queue", "[queue] ERROR: dispatch failed: database is locked", "claude"),
+             # a catch-all rule sees only the lines the digest counts (supervisord names the error-digest program)
+             ("ollama-queue", "2026-11-16 00:03:18,984 INFO spawned: 'error-digest' with pid 74", None),
+             ("ollama-queue", "2026-11-16 00:01:47,658 INFO waiting for cpu-prefetch, error-digest, queue-api to die", None),
+             ("ollama", "time=2026-11-16T05:07:00.000Z level=INFO msg=\"no errors\"", None),
+             ("nominatim", "UTC [88] nominatim@nominatim FATAL:  terminating connection due to administrator command", None),
+             ("nominatim", "UTC [90] nominatim@nominatim FATAL:  the database system is in recovery mode", "claude")]
     bad = [(c, l, route(c, l), want) for c, l, want in cases if route(c, l) != want]
     chk("shipped rules route sample lines as graded", not bad, bad)
+    chk("the catch-all Claude rules only see counted lines", all(r["counted_only"] for r in rules if r["rx"].pattern == "."),
+        [r["globs"] for r in rules if r["rx"].pattern == "." and not r["counted_only"]])
+    loose = ED.load_alerts(BIN / "error_digest_alerts.json")
+    loose[0] = dict(loose[0], globs=["autobrr"], rx=re.compile("banned", re.I))
+    chk("a rule without counted_only still matches an INFO-tagged line",
+        bool(ED.match_alerts("autobrr", [(1, "INF irc: banned from network")], loose[:1])))
+    nz = ED.load_noise(BIN / "error_digest_noise.json")
+    chk("planned-stop lines count as routine, a crash does not",
+        ED.noise_action(nz, "ollama-queue", "WARN stopped: queue-api (terminated by SIGTERM)") == "routine"
+        and ED.noise_action(nz, "ollama-queue", "CRIT Server 'unix_http_server' running without any HTTP authentication checking") == "routine"
+        and ED.noise_action(nz, "nominatim", "UTC [88] nominatim@nominatim FATAL:  terminating connection due to administrator command") == "routine"
+        and ED.noise_action(nz, "ollama-queue", "WARN exited: queue-daemon (exit status 1; not expected)") is None
+        and ED.noise_action(nz, "nominatim", "UTC [90] nominatim@nominatim FATAL:  the database system is in recovery mode") is None)
 
     d = Path(tempfile.mkdtemp())
     (d / "a.json").write_text(json.dumps([
