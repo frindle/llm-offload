@@ -273,6 +273,23 @@ def test_day():
     chk("day: a parity check that ended before the spell does not count",
         s["busy"] == [] and s["verdict"].startswith("not clear: the file requests were answered normally"), s)
 
+    # the Mover Tuning plugin (this server's mover) running through the spell -> server busy
+    mv = [(int((T0 + 2 * 3600) * 1e9), "Nov 14 15:30:02 tower move: Starting Mover tuning plugin ..."),
+          (int((T0 + 5 * 3600) * 1e9), "Nov 14 18:40:57 tower move: Mover tuning plugin done!")]
+    sm = P.day_summary(FakeLoki(timeline=tl3, syslog=mv,
+                                parts=[part_line(T0 + 3 * 3600 + 30, LAN2, 206, 9_000_000, 300)]), DAY)
+    s = sm["spells"][0]
+    chk("day: the Mover Tuning plugin running through the spell -> server busy (mover)",
+        s["busy"] == ["mover"] and s["verdict"] == "server busy: the mover was running", s)
+    sm = P.day_summary(FakeLoki(timeline=tl3, syslog=[
+        (int((T0 + 600) * 1e9), "Nov 14 13:10:00 tower move: Starting Mover tuning plugin ..."),
+        (int((T0 + 1800) * 1e9), "Nov 14 13:30:00 tower move: Mover tuning plugin done!")],
+        parts=[part_line(T0 + 3 * 3600 + 30, LAN2, 206, 9_000_000, 300)]), DAY)
+    chk("day: a Mover Tuning run that ended before the spell does not count", sm["spells"][0]["busy"] == [],
+        sm["spells"][0])
+    chk("the syslog query asks Loki for the Mover Tuning markers",
+        all(m in P.SYSLOG_Q for m in P.MOVER_START + P.MOVER_DONE), P.SYSLOG_Q)
+
     # evidence query fails -> the spell is still reported
     sm = P.day_summary(FakeLoki(timeline=tl3, fail_on="parts"), DAY)
     chk("day: an evidence query failing keeps the spell, says so",

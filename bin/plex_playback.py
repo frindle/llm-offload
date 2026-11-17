@@ -62,8 +62,13 @@ def _ip(s):
     return s[7:] if s[:7].lower() == "::ffff:" and "." in s else s
 
 
+# the stock mover logs "mover: started/finished"; the Mover Tuning plugin, which replaces it on this server, logs
+# "move: Starting Mover tuning plugin ..." and "move: Mover tuning plugin done!"
 SYSLOG_Q = ('{job="syslog"} |~ "md: recovery thread: check|md: recovery thread: exit status|md: sync done|'
-            'mdcmd \\\\([0-9]+\\\\): nocheck|mover: started|mover: finished"')
+            'mdcmd \\\\([0-9]+\\\\): nocheck|mover: started|mover: finished|'
+            'move: Starting Mover tuning plugin|move: Mover tuning plugin done"')
+MOVER_START = ("mover: started", "move: Starting Mover tuning plugin")
+MOVER_DONE = ("mover: finished", "move: Mover tuning plugin done")
 
 
 # ---------------------------------------------------------------------------------------------------- parsing
@@ -280,9 +285,9 @@ def server_intervals(loki, start, end):
         elif ("sync done" in line or "exit status" in line or "nocheck" in line) and open_["parity"]:
             out["parity"].append((open_["parity"], t))
             open_["parity"] = None
-        elif "mover: started" in line:
+        elif any(m in line for m in MOVER_START):
             open_["mover"] = open_["mover"] or t
-        elif "mover: finished" in line and open_["mover"]:
+        elif any(m in line for m in MOVER_DONE) and open_["mover"]:
             out["mover"].append((open_["mover"], t))
             open_["mover"] = None
     for k, a in open_.items():
