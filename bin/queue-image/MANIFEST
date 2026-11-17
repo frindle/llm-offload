@@ -154,6 +154,7 @@ prompt_jobs.py
 digest_lines.py
 prompt-json-runner.py
 plex_glacier_watch.py
+plex_playback.py
 docsum_server.py
 docsum_ui_guard.py
 docsum_ui_jobs.py

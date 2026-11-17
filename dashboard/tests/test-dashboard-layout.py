@@ -17,7 +17,7 @@ Chrome loads it, runs the page's own JS, and dumps the DOM. We then assert:
   * the page never scrolls sideways at 1280px or at phone width;
   * rendering fires no POST/DELETE (looking never acts).
 
-Needs Google Chrome (CHROME=/path overrides). --shots DIR also saves screenshots.
+Needs Google Chrome or Chromium (CHROME=/path overrides; else the Mac app, else one on PATH). --shots DIR also saves screenshots.
 Run: python3 tests/test-dashboard-layout.py [--shots DIR]
 """
 import html.parser
@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,14 @@ from pathlib import Path
 
 SRC_DIR = Path(os.environ.get("DASHBOARD_SRC") or Path(__file__).resolve().parent.parent / "src")
 PIPELINE_BIN = Path(os.environ.get("OLLAMA_PIPELINE_BIN") or Path.home() / "bin")
-CHROME = os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# CHROME=/path wins; else the Mac app; else a Chrome/Chromium on PATH (the Linux test sandbox has Debian's chromium).
+CHROME = (os.environ.get("CHROME") or (MAC_CHROME if os.path.exists(MAC_CHROME) else None)
+          or next(filter(None, map(shutil.which, ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"))),
+                  MAC_CHROME))
+# Linux test sandbox: a container without namespace rights, where Chromium's own sandbox cannot start. The page it
+# loads is this test's fixture page on 127.0.0.1 only, so running it unsandboxed there is acceptable.
+LINUX_EXTRA = ("--no-sandbox",) if sys.platform.startswith("linux") else ()
 FAILS = []
 # load_api() points HOME at a sandbox for the API import; Chrome must keep the real one
 # (with a fake HOME it never finishes starting on macOS).
@@ -225,7 +233,7 @@ def chrome(url, width, height, extra=()):
     # No --user-data-dir: with a fresh profile dir headless Chrome on macOS stalls for
     # 30s+ at startup; headless already runs on its own throwaway profile.
     r = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars",
-                        "--no-first-run", "--no-default-browser-check", "--use-mock-keychain",
+                        "--no-first-run", "--no-default-browser-check", "--use-mock-keychain", *LINUX_EXTRA,
                         f"--window-size={width},{height}", "--virtual-time-budget=6000",
                         *extra, url], capture_output=True, text=True, timeout=120,
                        stdin=subprocess.DEVNULL, env=REAL_ENV)
@@ -273,7 +281,7 @@ def main():
         shots = Path(sys.argv[sys.argv.index("--shots") + 1])
         shots.mkdir(parents=True, exist_ok=True)
     if not Path(CHROME).exists():
-        print(f"FAIL: Google Chrome not found at {CHROME} (set CHROME=...)")
+        print(f"FAIL: no Chrome or Chromium found (tried {CHROME}; set CHROME=...)")
         return 2
     api = load_api()
     fe = api.FRONTEND_HTML

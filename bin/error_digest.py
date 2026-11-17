@@ -24,7 +24,9 @@ message is <day>.notify.txt; when $ERROR_DIGEST_NOTIFY_URL and its token are set
 day, never backfill) also POSTs it there. Unset: shadow, the file only. The local model only adds one
 "what it probably means" line per new kind: `run` enqueues one queue job (error-digest-runner.py, Unraid lane) that
 fills them in later; when that job fails the digest stays as plain counts.
-A "Plex and Glacier" section is added from plex_glacier_watch.py's samples for that day, when there are any.
+A "Plex and Glacier" section is added from plex_glacier_watch.py's samples for that day, when there are any, and a
+"Playback" section from plex_playback.py (real stalls per Plex client, skips and starts left out, with evidence and a
+one-line pointer per buffering spell); spells also go into the daily message.
 
 Loki: $LOKI_URL (or $LOGQ_URL, or queue config logs.loki_url) and a bearer token from $LOKI_TOKEN, the file
 $LOKI_TOKEN_FILE / $LOGQ_TOKEN_FILE, or the macOS Keychain item service loki-token account loki. The token is never
@@ -695,6 +697,12 @@ def render(rec, top=5):
             out += plex_glacier_watch.render_section(rec["plex_glacier"])
         except Exception:  # noqa: BLE001 - the error part of the digest must not depend on the Plex section
             pass
+    if rec.get("playback"):
+        try:
+            import plex_playback
+            out += plex_playback.render_section(rec["playback"])
+        except Exception:  # noqa: BLE001 - as above
+            pass
     out += ["## By container", "", "| Container | Lines | Kinds | New | Most frequent |", "|---|---|---|---|---|"]
     for c, i in sorted(cs.items(), key=lambda kv: -sum(s["count"] for s in kv[1]["sigs"])):
         lines = sum(s["count"] for s in i["sigs"])
@@ -794,6 +802,13 @@ def notify_text(rec):
     for e in extra:
         t += ["", "%s%s:" % (e["title"], " (needs you)" if e.get("needs_you") else "")]
         t += ["- %s" % _short(x, 200) for x in e["lines"]]
+    if (rec.get("playback") or {}).get("spells"):
+        try:
+            import plex_playback
+            t += ["", "Plex buffering (stalls, not skips):"] + ["- %s" % _short(x, 240)
+                                                                for x in plex_playback.notify_lines(rec["playback"])]
+        except Exception:  # noqa: BLE001 - the message goes out without it
+            pass
     if held:
         t += ["", "Held back (you asked not to be sent these yet):"]
         t += ["- %s: %s" % (it["what"], _when(it)) for it in held]
@@ -958,6 +973,13 @@ def cmd_run(argv, days=None):
                 rec["plex_glacier"] = pg
         except Exception:  # noqa: BLE001 - see render()
             pass
+        try:
+            import plex_playback
+            pb = plex_playback.day_summary(loki, day)
+            if pb:
+                rec["playback"] = pb
+        except Exception as e:  # noqa: BLE001 - the digest goes out without it
+            rec["playback_error"] = type(e).__name__
         try:
             import digest_lines
             ex = digest_lines.read_day(day, ddir)
