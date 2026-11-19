@@ -340,6 +340,112 @@ def main():
         api.subprocess.run = real_run
     check("cli: a timeout -> JSON 504", (st, body.get("ok")), (504, False))
 
+    # ---- Cloudflare Access JWT (third way in) ------------------------------------------------------------------------------
+    import base64, time
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    TEAM, AUD = "team.example.cloudflareaccess.com", "aud-tag-1"
+    k1 = rsa.generate_private_key(65537, 2048)
+    k2 = rsa.generate_private_key(65537, 2048)
+
+    def jwk(key, kid):
+        n = key.public_key().public_numbers()
+        return {"kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+                "n": b64(n.n.to_bytes(256, "big")), "e": b64(n.e.to_bytes(3, "big"))}
+
+    fetches = []
+    api._access_jwks_fetcher = lambda url: (fetches.append(url), {"keys": [jwk(k1, "k1")]})[1]
+    api._ACCESS_REFETCH_MIN_S = 0
+    api._ACCESS_REFETCH_EMPTY_S = 0     # the backoff gets its own checks below
+
+    def mk(key=k1, kid="k1", alg="RS256", sign=True, **over):
+        now = int(time.time())
+        claims = {"iss": "https://" + TEAM, "aud": [AUD], "exp": now + 300, "nbf": now - 5, "email": "x@example.com"}
+        claims.update(over)
+        h = b64(json.dumps({"alg": alg, "kid": kid}).encode()) + "." + b64(json.dumps(claims).encode())
+        sig = key.sign(h.encode(), padding.PKCS1v15(), hashes.SHA256()) if sign else b""
+        return h + "." + b64(sig)
+
+    jw = lambda t: {"Cf-Access-Jwt-Assertion": t}
+    for e in ("QUEUE_ACCESS_TEAM_DOMAIN", "QUEUE_ACCESS_AUD"):
+        os.environ.pop(e, None)
+    check("jwt env unset: valid JWT ignored -> 401", call(lan, *POST, headers=jw(mk()))[0], 401)
+    os.environ["QUEUE_ACCESS_TEAM_DOMAIN"] = TEAM
+    check("jwt only TEAM set: JWT ignored -> 401", call(lan, *POST, headers=jw(mk()))[0], 401)
+    os.environ["QUEUE_ACCESS_AUD"] = "other-aud, " + AUD
+    check("jwt: valid on LAN POST -> served", call(lan, *POST, headers=jw(mk()))[0], 400)
+    check("jwt: valid on kill -> past the gate", call(lan, *KILL, headers=jw(mk()))[0] != 401, True)
+    check("jwt: valid on docsum POST -> past the gate", call(lan, "POST", "/docsum/api/x", {}, headers=jw(mk()))[0] != 401, True)
+    check("jwt: valid + loopback + Cf-Ray -> served", call(lo, *POST, headers={"Cf-Ray": "a", **jw(mk())})[0], 400)
+    check("jwt: aud as plain string ok", call(lan, *POST, headers=jw(mk(aud=AUD)))[0], 400)
+    check("jwt: wrong aud -> 401", call(lan, *POST, headers=jw(mk(aud=["nope"])))[0], 401)
+    check("jwt: wrong iss -> 401", call(lan, *POST, headers=jw(mk(iss="https://evil.example.com")))[0], 401)
+    check("jwt: expired -> 401", call(lan, *POST, headers=jw(mk(exp=int(time.time()) - 600)))[0], 401)
+    check("jwt: not yet valid -> 401", call(lan, *POST, headers=jw(mk(nbf=int(time.time()) + 600)))[0], 401)
+    check("jwt: missing exp -> 401", call(lan, *POST, headers=jw(mk(exp=None)))[0], 401)
+    check("jwt: signed by another key (bad signature) -> 401", call(lan, *POST, headers=jw(mk(key=k2)))[0], 401)
+    t = mk()
+    check("jwt: tampered payload -> 401", call(lan, *POST, headers=jw(t.split(".")[0] + "." + b64(b'{"aud":["aud-tag-1"],"iss":"https://' + TEAM.encode() + b'","exp":9999999999}') + "." + t.split(".")[2]))[0], 401)
+    check("jwt: unknown kid (refetched, still unknown) -> 401", call(lan, *POST, headers=jw(mk(kid="zz")))[0], 401)
+    check("jwt: alg none -> 401", call(lan, *POST, headers=jw(mk(alg="none", sign=False)))[0], 401)
+    check("jwt: alg HS256 -> 401", call(lan, *POST, headers=jw(mk(alg="HS256")))[0], 401)
+    check("jwt: garbage -> 401", call(lan, *POST, headers=jw("not.a.jwt"))[0], 401)
+    check("jwt: CF_Authorization cookie alone is not read -> 401", call(lan, *POST, headers={"Cookie": "CF_Authorization=" + mk()})[0], 401)
+    # key rotation: a new kid appears in the JWKS, picked up by the unknown-kid refetch
+    api._access_jwks_fetcher = lambda url: {"keys": [jwk(k1, "k1"), jwk(k2, "k2")]}
+    check("jwt: rotated-in kid fetched on demand -> served", call(lan, *POST, headers=jw(mk(key=k2, kid="k2")))[0], 400)
+    # unreachable JWKS fails closed (fresh cache)
+    api._access_jwks_cache.update(keys={}, at=0.0, tried=0.0)
+    def down(url):
+        raise OSError("unreachable")
+    api._access_jwks_fetcher = down
+    check("jwt: JWKS unreachable -> 401 (fail closed)", call(lan, *POST, headers=jw(mk()))[0], 401)
+    api._access_jwks_fetcher = lambda url: {"keys": [jwk(k1, "k1")]}
+    check("jwt: JWKS back -> served again", call(lan, *POST, headers=jw(mk()))[0], 400)
+    # stale keys and a JWKS that comes back empty: the old keys are dropped, not trusted on
+    api._access_jwks_cache.update(at=0.0, tried=0.0)
+    api._access_jwks_fetcher = lambda url: {"keys": []}
+    check("jwt: stale keys + empty JWKS -> 401 (old keys dropped)", call(lan, *POST, headers=jw(mk()))[0], 401)
+    # no keys and the certs URL down: requests share one fetch per backoff window instead of each paying a 5 s fetch
+    api._ACCESS_REFETCH_EMPTY_S = 10
+    api._access_jwks_cache.update(keys={}, at=0.0, tried=0.0)
+    down_calls = []
+    def down2(url):
+        down_calls.append(url)
+        raise OSError("unreachable")
+    api._access_jwks_fetcher = down2
+    for _ in range(5):
+        call(lan, *POST, headers=jw(mk()))
+    check("jwt: JWKS down, empty cache -> 1 fetch for 5 requests", len(down_calls), 1)
+    api._ACCESS_REFETCH_EMPTY_S = 0
+    api._access_jwks_cache.update(keys={}, at=0.0, tried=0.0)
+    api._access_jwks_fetcher = lambda url: {"keys": [jwk(k1, "k1")]}
+    check("jwt: JWKS back after backoff -> served", call(lan, *POST, headers=jw(mk()))[0], 400)
+    # boot: concurrent first requests wait for the one in-flight fetch instead of getting 401
+    api._access_jwks_cache.update(keys={}, at=0.0, tried=0.0)
+    slow_calls = []
+    def slow(url):
+        slow_calls.append(url)
+        time.sleep(0.5)
+        return {"keys": [jwk(k1, "k1")]}
+    api._access_jwks_fetcher = slow
+    codes = []
+    ts = [threading.Thread(target=lambda: codes.append(call(lan, *POST, headers=jw(mk()))[0])) for _ in range(5)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join()
+    check("jwt: 5 concurrent first requests after boot -> all served", sorted(codes), [400] * 5)
+    check("jwt: ... sharing one JWKS fetch", len(slow_calls), 1)
+    api._access_jwks_fetcher = lambda url: {"keys": [jwk(k1, "k1")]}
+    check("jwt: bearer path unchanged (right bearer, no JWT)", call(lan, *POST, headers=bearer)[0], 400)
+    check("jwt: wrong bearer + no JWT -> 401", call(lan, *POST, headers={"Authorization": "Bearer wrong"})[0], 401)
+    check("jwt: no creds -> 401", call(lan, *POST)[0], 401)
+    check("jwt: loopback without proxy header still open", call(lo, *POST)[0], 400)
+    for e in ("QUEUE_ACCESS_TEAM_DOMAIN", "QUEUE_ACCESS_AUD"):
+        os.environ.pop(e, None)
+
     # the token never appears in a response
     check("token never echoed", TOK in json.dumps(call(lan, *POST)[1]), False)
     for s in (lo, lan):

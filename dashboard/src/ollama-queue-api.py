@@ -8198,8 +8198,18 @@ def _lr_handle(method, path, headers, body):
 #   do_GET    no GET changes state today; the GETs that need the token are the two mirror routes
 #             (/api/mirror/events, /api/mirror/escalations), /api/gpu-hold, /api/state, /api/results and
 #             /api/error-digest. Re-check this list when a GET route is added.
+# Third way in (browser behind a Cloudflare Tunnel + Cloudflare Access): a valid Access JWT in the Cf-Access-Jwt-Assertion
+# header (Access adds it to every request it lets through; the CF_Authorization cookie is NOT read). Needs env
+# QUEUE_ACCESS_TEAM_DOMAIN (e.g. <team>.cloudflareaccess.com) AND QUEUE_ACCESS_AUD (Access application AUD tag,
+# comma-separated for several); either unset = this path is off, behaviour exactly as above. Checked: RS256 signature
+# against https://<team>/cdn-cgi/access/certs (cached, refetched on an unknown kid, fail closed when unreachable), aud
+# contains a configured tag, iss == https://<team>, exp/nbf with 60 s leeway. Valid JWT = same as a right bearer, for any
+# peer (the loopback-with-proxy-header exemption stays cancelled). The JWT, the token and the email claim are never logged.
+# Only pass requests through the tunnel hostname that Access protects; a LAN peer has no valid JWT so still needs the bearer.
 # The token and the Authorization header are never logged or echoed.
+import base64 as _b64
 import hmac as _hmac
+import time as _time
 
 QUEUE_API_TOKEN_FILE = Path.home() / ".config" / "ollama-queue" / "queue-api-token"
 _AUTH_PROXY_HEADERS = ("cf-ray", "cf-connecting-ip", "cf-visitor", "cf-ipcountry", "cf-access-jwt-assertion",
@@ -8240,9 +8250,108 @@ def _is_digest_lines_path(path):
     return str(path or "").split("?", 1)[0].rstrip("/") == "/api/digest-lines"
 
 
+_ACCESS_JWKS_TTL_S = 3600
+_ACCESS_REFETCH_MIN_S = 60          # at most one forced refetch per minute (a flood of unknown kids must not hammer Cloudflare)
+_ACCESS_REFETCH_EMPTY_S = 10        # no keys yet (boot, or the certs URL is down): retry at most every 10 s, never per request
+_ACCESS_LEEWAY_S = 60
+_access_jwks_fetcher = None         # tests inject fn(url) -> dict; default does an HTTPS GET
+_access_jwks_cache = {"keys": {}, "at": 0.0, "tried": 0.0}
+_access_jwks_lock = threading.Lock()  # one fetch at a time; other threads use the cache meanwhile instead of queueing
+
+
+def _access_config():
+    team = (os.environ.get("QUEUE_ACCESS_TEAM_DOMAIN") or "").strip().lower()
+    team = team.replace("https://", "").rstrip("/")
+    auds = [a.strip() for a in (os.environ.get("QUEUE_ACCESS_AUD") or "").split(",") if a.strip()]
+    return (team, auds) if team and auds else (None, None)
+
+
+def _access_fetch_jwks(team):
+    url = "https://%s/cdn-cgi/access/certs" % team
+    if _access_jwks_fetcher is not None:
+        return _access_jwks_fetcher(url)
+    import urllib.request
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "queue-api"}), timeout=5) as r:
+        return json.loads(r.read(1 << 20))
+
+
+def _access_key(team, kid):
+    """RSA public key for `kid` (cached; one forced refetch for an unknown kid), or None. Fails closed."""
+    now = _time.time()
+    c = _access_jwks_cache
+    if c.get("team") != team:
+        c.update(keys={}, at=0.0, tried=0.0, team=team)
+    stale = now - c["at"] > _ACCESS_JWKS_TTL_S
+    wait = _ACCESS_REFETCH_MIN_S if c["keys"] else _ACCESS_REFETCH_EMPTY_S
+    if (stale or kid not in c["keys"]) and now - c["tried"] >= wait \
+            and _access_jwks_lock.acquire(blocking=False):
+        try:
+            c["tried"] = now
+            from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+            keys = {}
+            for k in (_access_fetch_jwks(team) or {}).get("keys", []):
+                if k.get("kty") == "RSA" and k.get("kid") and k.get("n") and k.get("e"):
+                    keys[k["kid"]] = RSAPublicNumbers(int.from_bytes(_b64url(k["e"]), "big"),
+                                                      int.from_bytes(_b64url(k["n"]), "big")).public_key()
+            if keys:
+                c["keys"], c["at"] = keys, now
+            elif stale:
+                c["keys"] = {}          # too old and the refresh brought no keys: do not keep trusting it
+        except Exception:
+            if stale:
+                c["keys"] = {}          # too old and cannot refresh: do not keep trusting it
+        finally:
+            _access_jwks_lock.release()
+    elif not c["keys"] and _access_jwks_lock.acquire(timeout=6):
+        # No keys yet and another request is fetching them (boot): wait for that fetch
+        # (bounded; the fetch itself times out at 5 s), then read what it cached.
+        _access_jwks_lock.release()
+    return c["keys"].get(kid)
+
+
+def _b64url(s):
+    return _b64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _access_jwt_ok(headers):
+    """True for a valid Cloudflare Access JWT in Cf-Access-Jwt-Assertion; False for anything else (never raises)."""
+    team, auds = _access_config()
+    tok = (headers.get("Cf-Access-Jwt-Assertion") or "").strip()
+    if not team or not tok:
+        return False
+    try:
+        h64, p64, s64 = tok.split(".")
+        hdr = json.loads(_b64url(h64))
+        if hdr.get("alg") != "RS256":
+            return False
+        key = _access_key(team, hdr.get("kid"))
+        if key is None:
+            return False
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        key.verify(_b64url(s64), (h64 + "." + p64).encode("ascii"), padding.PKCS1v15(), hashes.SHA256())
+        c = json.loads(_b64url(p64))
+        if c.get("iss") != "https://" + team:
+            return False
+        aud = c.get("aud")
+        aud = [aud] if isinstance(aud, str) else aud
+        if not isinstance(aud, list) or not any(a in auds for a in aud):
+            return False
+        now = _time.time()
+        exp = c.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or now > exp + _ACCESS_LEEWAY_S:
+            return False
+        nbf = c.get("nbf")
+        if nbf is not None and (isinstance(nbf, bool) or not isinstance(nbf, (int, float)) or now < nbf - _ACCESS_LEEWAY_S):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _write_auth_ok(peer_ip, headers, token=None):
     """True when the request may proceed: no token configured, or a loopback peer with no proxy header, or the
-    correct Bearer token. `headers` is any mapping with a case-insensitive .get (an http.client message)."""
+    correct Bearer token, or a valid Cloudflare Access JWT. `headers` is any mapping with a case-insensitive .get (an http.client message)."""
     token = _queue_api_token() if token is None else token
     if not token:
         return True
@@ -8250,8 +8359,10 @@ def _write_auth_ok(peer_ip, headers, token=None):
         return True
     got = headers.get("Authorization") or ""
     if got[:7].lower() != "bearer ":
-        return False
-    return _hmac.compare_digest(got[7:].strip().encode("utf-8"), token.encode("utf-8"))
+        return _access_jwt_ok(headers)
+    if _hmac.compare_digest(got[7:].strip().encode("utf-8"), token.encode("utf-8")):
+        return True
+    return _access_jwt_ok(headers)
 
 
 # Mirror (the Mac pulls these files from the container; see queue-agent.md). Same files the hooks read today.
@@ -12489,6 +12600,13 @@ if __name__ == "__main__":
             cpu_lane.start_reaper()
     except Exception as _e:  # noqa: BLE001
         print(f"[queue-api] cpu lane disabled: {_e!r}", flush=True)
+    if _access_config()[0]:
+        try:
+            import cryptography.hazmat.primitives.asymmetric.rsa  # noqa: F401
+        except ImportError:
+            # Every Access JWT would fail closed (401), so the browser path silently never works. Say it once at boot.
+            print("[queue-api] ERROR: QUEUE_ACCESS_* is set but the cryptography package is missing: "
+                  "Cloudflare Access logins will all be refused", flush=True)
     srv = ThreadingServer((BIND_ADDR, PORT), Handler)
     threading.Thread(target=_prime_caches, args=(PORT,), name="prime-caches", daemon=True).start()
     # flush=True: under launchd stdout is a file, so it is block-buffered and

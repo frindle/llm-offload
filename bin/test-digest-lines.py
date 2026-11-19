@@ -177,7 +177,7 @@ def t_api_wiring():
     chk("POST route after the drain gate", post_src.index("self._drain_gate()") < post_src.index("_is_digest_lines_path"))
     ns = {}
     start = src.index("def _is_digest_lines_path(")
-    exec(src[start:src.index("\ndef ", start + 10)], ns)
+    exec(src[start:src.index("\n\n\n", start)], ns)   # just the function: module globals may follow it
     f = ns["_is_digest_lines_path"]
     chk("path match", f("/api/digest-lines") and f("/api/digest-lines/") and f("/api/digest-lines?x=1"))
     chk("no prefix match", not f("/api/digest-linesX") and not f("/api/digest-lines/abc") and not f("/api/jobs"))
