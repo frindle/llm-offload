@@ -2458,10 +2458,12 @@ def worktree_cleanup_daily(run=subprocess.run, now=None, stamp=None, tool=None):
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) + "\n")
         os.utime(stamp, (now, now))
-        r = run([sys.executable, str(tool), "sweep", "--auto"], capture_output=True, text=True,
-                timeout=1800)
-        n = sum(1 for l in (r.stdout or "").splitlines() if l.startswith(("REMOVED", "WOULD REMOVE")))
-        print("  worktree-cleanup: rc=%s %d removable/removed" % (r.returncode, n))
+        r = run([sys.executable, str(tool), "sweep", "--auto", "--branches"], capture_output=True,
+                text=True, timeout=3600)
+        lines = (r.stdout or "").splitlines()
+        n = sum(1 for l in lines if l.startswith(("REMOVED", "ARCHIVED", "WOULD REMOVE", "WOULD ARCHIVE")))
+        b = sum(1 for l in lines if l.startswith(("DELETED", "WOULD DELETE")))
+        print("  worktree-cleanup: rc=%s %d worktrees, %d branches removable/removed" % (r.returncode, n, b))
         return True
     except Exception as exc:
         print("  worktree-cleanup error: %s" % exc)

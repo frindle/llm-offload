@@ -22,7 +22,15 @@ Anything it cannot prove (unreadable gitdir, git error) is KEPT, with the reason
 
   worktree_cleanup.py sweep [--apply] [--grace-hours H] [--root DIR]...   # dry-run default
   worktree_cleanup.py job --job-id ID | --bundle B | --path P [--apply]   # terminal-state hook
+  worktree_cleanup.py branches [--apply|--auto] [--no-remote] [--repo DIR]... # merged branches
   worktree_cleanup.py status                                              # enabled? last run
+
+Default sweep roots also cover each project repo's .claude/worktrees (one per real path: the
+.nosync names are symlinks to the same repos). A squash/rebase-merged PR whose final head is the
+worktree's HEAD counts as landed (GitHub deletes the branch, so no remote ref holds it).
+`branches` deletes local branches (and, for REMOTE_OWNERS repos, origin branches with no open PR)
+whose tip is in the default branch or is a merged PR's final head, untouched for GRACE_SECONDS.
+`sweep --branches` runs it after the worktree pass (the daily automatic run does).
 
 Automatic runs (qctl close/retire, escalation-watcher daily sweep) only APPLY when the
 enable flag exists: ~/.ollama-dispatch/worktree-cleanup.enabled. Without it they dry-run
@@ -42,6 +50,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 
 HOME = os.path.expanduser("~")
@@ -58,6 +68,22 @@ PROTECTED_NAMES = {"node_modules-cache"}
 PROTECTED_BRANCHES = ("main", "master")
 BRANCH_PREFIXES = ("dispatch/", "slice/", "fix/", "wt-", "draft/", "refine/", "auto/")
 ENABLE_FLAG = os.path.join(HOME, ".ollama-dispatch", "worktree-cleanup.enabled")
+PROJECTS_DIR = os.environ.get("WORKTREE_CLEANUP_PROJECTS",
+                              os.path.join(HOME, "Desktop", "GitHub Projects.nosync"))
+SKIP_REPOS = {"homelab-database"}  # pull-only repo: its branches are never touched
+REMOTE_OWNERS = ("frindle",)       # origin branches are deleted only in these owners' repos
+_GIT_ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+# Stale leftovers in the dispatch roots (never the project repos' own .claude/worktrees) that are
+# dirty or hold unlanded commits are archived, then removed: changes.patch (tracked edits),
+# untracked/ (non-build files up to ARCHIVE_MAX_FILE), commits.bundle (commits no remote or landed
+# ref has) and meta.json, in ARCHIVE_DIR/<name>-<ts>.tar.gz, kept ARCHIVE_KEEP_SECONDS.
+ARCHIVE_AFTER_SECONDS = 14 * 86400
+ARCHIVE_KEEP_SECONDS = 90 * 86400
+ARCHIVE_MAX_FILE = 20 * 1024 * 1024
+ARCHIVE_ROOTS = list(ROOTS)
+ARCHIVE_DIR = os.environ.get("WORKTREE_ARCHIVE_DIR") or (
+    "/Volumes/NVMe-Models/worktree-archive" if os.path.isdir("/Volumes/NVMe-Models")
+    else os.path.join(HOME, ".ollama-dispatch", "worktree-archive"))  # a dry run must not refresh the index (resets grace)
 LOG_PATH = os.path.join(HOME, ".ollama-dispatch", "worktree-cleanup.log.jsonl")
 QUEUE_STATE = os.path.join(str(queue_config.state_dir()), "ollama-queue-state.json")
 QUEUE_LOGS = os.path.join(str(queue_config.state_dir()), "ollama-queue-logs")
@@ -76,7 +102,7 @@ def _reaper():
 
 
 def git(args, cwd):
-    return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, env=_GIT_ENV)
 
 
 def real(p):
@@ -92,7 +118,7 @@ def under(path, root):
 def discover(roots):
     """Candidate dirs: those containing a .git entry, at most MAX_DEPTH below a root.
     Dirs without .git are reported by the caller as not-a-worktree (listed, not removed)."""
-    out = []
+    out, seen = [], set()
     for root in roots:
         if not os.path.isdir(root):
             continue
@@ -107,11 +133,67 @@ def discover(roots):
                 if os.path.islink(p) or not os.path.isdir(p):
                     continue
                 if os.path.lexists(os.path.join(p, ".git")) or depth >= MAX_DEPTH:
-                    out.append(p)
+                    if real(p) not in seen:
+                        seen.add(real(p))
+                        out.append(p)
                 else:
                     walk(p, depth + 1)
         walk(root, 1)
     return out
+
+
+def project_repos(projects_dir=None):
+    """Primary checkouts directly under the projects dir, one per real path."""
+    d = projects_dir or PROJECTS_DIR
+    out, seen = [], set()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for n in names:
+        r = real(os.path.join(d, n))
+        if r not in seen and os.path.isdir(os.path.join(r, ".git")):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def default_roots(projects_dir=None):
+    return ROOTS + [os.path.join(r, ".claude", "worktrees") for r in project_repos(projects_dir)
+                    if os.path.isdir(os.path.join(r, ".claude", "worktrees"))]
+
+
+# --- GitHub PRs (squash merges leave HEAD off main's history) ----------------------
+
+_PR_CACHE = {}
+
+
+def gh_slug(wt):
+    u = git(["remote", "get-url", "origin"], wt).stdout.strip()
+    m = re.match(r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+)/(.+?)(?:\.git)?/?$", u)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def repo_prs(slug):
+    """slug -> [{number, state, headRefName, headRefOid}], or None when gh cannot answer."""
+    if slug not in _PR_CACHE:
+        try:
+            r = subprocess.run(["gh", "pr", "list", "--repo", slug, "--state", "all", "--limit", "1000",
+                                "--json", "number,state,headRefName,headRefOid"],
+                               capture_output=True, text=True, timeout=90)
+            _PR_CACHE[slug] = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            _PR_CACHE[slug] = None
+    return _PR_CACHE[slug]
+
+
+def merged_pr_for(wt, sha):
+    """Number of a merged PR whose final head is exactly `sha`, else None."""
+    slug = gh_slug(wt)
+    for p in (repo_prs(slug) if slug else None) or []:
+        if p.get("state") == "MERGED" and p.get("headRefOid") == sha:
+            return p.get("number")
+    return None
 
 
 # --- git facts ---------------------------------------------------------------------
@@ -318,7 +400,11 @@ def _evaluate(wt, now, grace, live, procs, rp, roots):
         else:
             dirty.append(path)
     # a rename's second token shows up as its own bare entry; any non-?? is dirty anyway
+    stale = age >= ARCHIVE_AFTER_SECONDS and any(under(w, real(r)) and w != real(r) for r in ARCHIVE_ROOTS)
     if dirty:
+        if stale:
+            return "archive", f"stale ({age / 86400:.0f}d) and dirty: {len(dirty)} path(s)", \
+                {"branch": branch, "kind": kind, "head": _head(wt), "dirty": True}
         return "keep", f"dirty: {len(dirty)} path(s), e.g. {dirty[0]}", {}
     # landed?
     head = git(["rev-parse", "-q", "--verify", "HEAD"], wt)
@@ -336,13 +422,23 @@ def _evaluate(wt, now, grace, live, procs, rp, roots):
         if remotes:
             landed = remotes[0]
     if landed is None:
+        n = merged_pr_for(wt, sha)
+        if n:
+            landed = f"merged PR #{n}"
+    if landed is None:
         n = git(["rev-list", "--count", sha, "--not", "--remotes"] +
                 [f"--branches=main", "--branches=master"], wt)
+        if stale:
+            return "archive", f"stale ({age / 86400:.0f}d) with {n.stdout.strip() or '?'} unlanded commit(s)", \
+                {"branch": branch, "kind": kind, "head": sha[:10]}
         return "keep", f"unlanded commits: HEAD {sha[:10]} not on any landed ref or remote" \
                        f" ({n.stdout.strip() or '?'} unique)", {}
     if kind == "clone":
         lost = clone_loses(wt, roots)
         if lost:
+            if stale:
+                return "archive", f"stale ({age / 86400:.0f}d) clone: {lost}"[:300], \
+                    {"branch": branch, "kind": kind, "head": sha[:10]}
             return "keep", lost, {}
     info = {"branch": branch, "landed_on": landed, "kind": kind, "head": sha[:10]}
     return "remove", f"clean, HEAD {sha[:10]} landed on {landed}, idle {age / 3600:.0f}h", info
@@ -361,6 +457,91 @@ def _log(entry, log_path):
         pass
 
 
+def _head(wt):
+    return git(["rev-parse", "-q", "--verify", "HEAD"], wt).stdout.strip()[:10]
+
+
+def archive(wt, info, *, rp, reason=""):
+    """Write ARCHIVE_DIR/<name>-<ts>.tar.gz holding everything removal would lose. -> its path.
+    Raises on any failure, so the caller keeps the worktree."""
+    kind, gitdir, common = gitdir_of(wt)
+    tmp = tempfile.mkdtemp(prefix="wtc-arch-")
+    dest = None
+    try:
+        d = subprocess.run(["git", "diff", "HEAD", "--binary"], cwd=wt, capture_output=True, env=_GIT_ENV)
+        if d.returncode != 0:
+            raise RuntimeError("git diff failed: " + d.stderr.decode(errors="replace")[:120])
+        with open(os.path.join(tmp, "changes.patch"), "wb") as fh:
+            fh.write(d.stdout)
+        refs = ["--all"] if kind == "clone" else ["HEAD"]
+        excl = ["--not", "--remotes"] + landed_refs(wt, common)
+        bundle = os.path.join(tmp, "commits.bundle")
+        b = git(["bundle", "create", "-q", bundle] + refs + excl, wt)
+        if b.returncode != 0 and "empty bundle" not in b.stderr.lower():
+            raise RuntimeError("git bundle failed: " + b.stderr.strip()[:120])
+        if os.path.exists(bundle) and git(["bundle", "verify", "-q", bundle], wt).returncode != 0:
+            raise RuntimeError("bundle does not verify")
+        skipped = []
+        unt = subprocess.run(["git", "ls-files", "-z", "--others", "--exclude-standard"], cwd=wt,
+                             capture_output=True, env=_GIT_ENV)
+        if unt.returncode != 0:
+            raise RuntimeError("git ls-files failed")
+        files = []
+        for rel in filter(None, unt.stdout.decode(errors="surrogateescape").split("\0")):
+            full = os.path.join(wt, rel)
+            if rp.is_artefact(rel) or os.path.islink(full) or not os.path.isfile(full):
+                continue
+            if os.path.getsize(full) > ARCHIVE_MAX_FILE:
+                skipped.append(rel)
+                continue
+            files.append(rel)
+        meta = {"path": wt, "kind": kind, "branch": info.get("branch"), "head": _head(wt),
+                "origin": git(["remote", "get-url", "origin"], wt).stdout.strip(), "reason": reason,
+                "archived": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "untracked_skipped_over_limit": skipped,
+                "restore": "git worktree add <dir> <head> (or git fetch commits.bundle), git apply changes.patch, copy untracked/"}
+        with open(os.path.join(tmp, "meta.json"), "w") as fh:
+            json.dump(meta, fh, indent=1)
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(wt.rstrip("/")))[:80]
+        dest = os.path.join(ARCHIVE_DIR, f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz")
+        with tarfile.open(dest + ".part", "w:gz") as tf:
+            for n in sorted(os.listdir(tmp)):
+                tf.add(os.path.join(tmp, n), arcname=n)
+            for rel in files:
+                tf.add(os.path.join(wt, rel), arcname="untracked/" + rel, recursive=False)
+        with tarfile.open(dest + ".part", "r:gz") as tf:  # readable end to end before anything goes
+            names = set(tf.getnames())
+        if "changes.patch" not in names or "meta.json" not in names:
+            raise RuntimeError("archive incomplete")
+        os.replace(dest + ".part", dest)
+        return dest
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if dest and os.path.exists(dest + ".part"):
+            os.remove(dest + ".part")
+
+
+def prune_archives(now=None, out=sys.stdout):
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(ARCHIVE_DIR)
+    except OSError:
+        return 0
+    n = 0
+    for f in names:
+        p = os.path.join(ARCHIVE_DIR, f)
+        try:
+            if f.endswith(".tar.gz") and now - os.path.getmtime(p) > ARCHIVE_KEEP_SECONDS:
+                os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    if n:
+        print(f"pruned {n} archive(s) older than {ARCHIVE_KEEP_SECONDS // 86400}d", file=out)
+    return n
+
+
 def remove(wt, info, *, apply):
     """Remove one worktree/clone already judged removable. -> (ok, detail)."""
     if not apply:
@@ -373,7 +554,7 @@ def remove(wt, info, *, apply):
             return False, r.stderr.strip()[:200]
         detail = "worktree removed"
         br = info.get("branch") or ""
-        if br.startswith(BRANCH_PREFIXES) and br not in PROTECTED_BRANCHES:
+        if br and br not in PROTECTED_BRANCHES:
             tip = git(["rev-parse", "-q", "--verify", f"refs/heads/{br}"], owner).stdout.strip()
             if tip.startswith(info.get("head", "?")):  # branch still at the verified HEAD
                 d = git(["branch", "-D", br], owner)
@@ -397,7 +578,7 @@ def run(paths, *, apply, grace=GRACE_SECONDS, roots=None, now=None, live=None, p
     """Evaluate (and optionally remove) `paths`. Returns list of result dicts."""
     rp = _reaper()
     now = time.time() if now is None else now
-    roots = roots or ROOTS
+    roots = roots or default_roots()
     if live is None:
         live = rp.collect_live(rp.Sources())
         hard = [e for e in live.errors if "API unreachable" not in e]
@@ -413,7 +594,19 @@ def run(paths, *, apply, grace=GRACE_SECONDS, roots=None, now=None, live=None, p
         res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "path": wt,
                "action": action, "reason": reason, "mode": "apply" if apply else "dry-run",
                "trigger": tag}
-        if action == "remove":
+        if action == "archive":
+            try:
+                if apply:
+                    res["archive"] = archive(wt, info, rp=rp, reason=reason)
+                ok, detail = remove(wt, info, apply=apply)
+            except Exception as e:  # noqa: BLE001
+                ok, detail = False, str(e)[:200]
+            res["removed"] = bool(ok and apply)
+            res["detail"] = detail
+            if not ok:
+                res["action"] = "keep"
+                res["reason"] = f"archive/remove failed: {detail}"
+        elif action == "remove":
             try:
                 ok, detail = remove(wt, info, apply=apply)
             except Exception as e:  # noqa: BLE001
@@ -423,10 +616,111 @@ def run(paths, *, apply, grace=GRACE_SECONDS, roots=None, now=None, live=None, p
             if not ok:
                 res["action"] = "keep"
                 res["reason"] = f"remove failed: {detail}"
-        print(("WOULD REMOVE " if res["action"] == "remove" and not apply else
-               "REMOVED " if res.get("removed") else "SKIP ") + f"{wt}: {res['reason']}", file=out)
+        verb = "ARCHIVE+REMOVE" if res["action"] == "archive" else "REMOVE"
+        print((f"WOULD {verb} " if res["action"] in ("remove", "archive") and not apply else
+               ("ARCHIVED+REMOVED " if res["action"] == "archive" else "REMOVED ") if res.get("removed")
+               else "SKIP ") + f"{wt}: {res['reason']}", file=out)
         _log(res, log_path)
         results.append(res)
+    return results
+
+
+def _ref_age(repo, ref, tip, now):
+    """Seconds since the ref last moved (newest reflog entry), else since the tip's commit date."""
+    r = git(["reflog", "show", "-n1", "--date=unix", "--format=%gd", ref], repo)
+    m = re.search(r"@\{(\d+)\}", r.stdout) if r.returncode == 0 else None
+    ts = m.group(1) if m else git(["show", "-s", "--format=%ct", tip], repo).stdout.strip()
+    try:
+        return now - int(ts)
+    except ValueError:
+        return 0  # unknown age: treat as fresh (kept)
+
+
+def _commit_age(repo, tip, now):
+    try:
+        return now - int(git(["show", "-s", "--format=%ct", tip], repo).stdout.strip())
+    except ValueError:
+        return 0
+
+
+def prune_branches(repo, *, apply, remote=True, fetch=True, grace=GRACE_SECONDS, now=None,
+                   log_path=LOG_PATH, out=sys.stdout):
+    """Delete branches whose work is already in the default branch or a merged PR. -> results.
+    Local: not main/master, not checked out in any worktree, tip an ancestor of a landed ref or a
+    merged PR's final head, ref unmoved for `grace`. Remote (REMOTE_OWNERS repos only, gh must
+    answer): same, against origin's default branch only, and no open PR uses the branch."""
+    now = time.time() if now is None else now
+    results = []
+    if os.path.basename(repo) in SKIP_REPOS:
+        return results
+    has_origin = git(["remote", "get-url", "origin"], repo).returncode == 0
+    if fetch and has_origin:
+        git(["fetch", "--prune", "--quiet", "origin"], repo)
+    refs = landed_refs(repo, os.path.join(repo, ".git"))
+    busy = {l[len("branch refs/heads/"):] for l in git(["worktree", "list", "--porcelain"], repo).stdout.splitlines()
+            if l.startswith("branch refs/heads/")}
+    slug = gh_slug(repo) if has_origin else None
+    prs = repo_prs(slug) if slug else None
+    merged = {p["headRefOid"]: p["number"] for p in prs or [] if p.get("state") == "MERGED"}
+    open_heads = {p["headRefName"] for p in prs or [] if p.get("state") == "OPEN"}
+
+    def landed_in(tip, among):
+        for ref in among:
+            if git(["merge-base", "--is-ancestor", tip, ref], repo).returncode == 0:
+                return ref
+        return f"merged PR #{merged[tip]}" if tip in merged else None
+
+    def record(where, br, action, reason):
+        res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "path": repo, "branch": br,
+               "where": where, "action": action, "reason": reason, "mode": "apply" if apply else "dry-run",
+               "trigger": "branches"}
+        if action == "delete" and apply:
+            d = git(["branch", "-D", br], repo) if where == "local" else \
+                git(["push", "--quiet", "origin", "--delete", br], repo)
+            res["removed"] = d.returncode == 0
+            if not res["removed"]:
+                res["action"], res["reason"] = "keep", f"delete failed: {d.stderr.strip()[:160]}"
+        tag = ("WOULD DELETE " if res["action"] == "delete" and not apply else
+               "DELETED " if res.get("removed") else "KEEP ")
+        print(f"{tag}{where} {os.path.basename(repo)}:{br}: {res['reason']}", file=out)
+        _log(res, log_path)
+        results.append(res)
+
+    for line in git(["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"], repo).stdout.splitlines():
+        br, tip = line.rsplit(" ", 1)
+        if br in PROTECTED_BRANCHES or br in busy:
+            continue
+        where = landed_in(tip, refs)
+        if not where:
+            record("local", br, "keep", "unlanded")
+        elif _ref_age(repo, f"refs/heads/{br}", tip, now) < grace:
+            record("local", br, "keep", f"landed on {where}, but moved within grace")
+        else:
+            record("local", br, "delete", f"landed on {where}")
+
+    if not (remote and slug and prs is not None and slug.split("/")[0] in REMOTE_OWNERS):
+        return results
+    head = git(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo).stdout.strip()
+    base = [r for r in [head, "origin/main", "origin/master"] if r and
+            git(["rev-parse", "-q", "--verify", r + "^{commit}"], repo).returncode == 0][:1]
+    if not base:
+        return results
+    for line in git(["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/remotes/origin"],
+                    repo).stdout.splitlines():
+        ref, tip = line.rsplit(" ", 1)
+        br = ref[len("origin/"):]
+        if not ref.startswith("origin/") or br in ("HEAD", "") or ref == base[0] or br in PROTECTED_BRANCHES:
+            continue
+        if br in open_heads:
+            record("remote", br, "keep", "open PR")
+            continue
+        where = landed_in(tip, base)
+        if not where:
+            record("remote", br, "keep", "unlanded")
+        elif _commit_age(repo, tip, now) < grace:
+            record("remote", br, "keep", f"landed on {where}, but new within grace")
+        else:
+            record("remote", br, "delete", f"landed on {where}")
     return results
 
 
@@ -481,6 +775,13 @@ def main(argv=None):
     s.add_argument("--auto", action="store_true", help="apply only if the enable flag exists")
     s.add_argument("--grace-hours", type=float, default=GRACE_SECONDS / 3600)
     s.add_argument("--root", action="append")
+    s.add_argument("--branches", action="store_true", help="then prune merged branches in project repos")
+    b = sub.add_parser("branches")
+    b.add_argument("--apply", action="store_true")
+    b.add_argument("--auto", action="store_true")
+    b.add_argument("--no-remote", action="store_true")
+    b.add_argument("--repo", action="append")
+    b.add_argument("--grace-hours", type=float, default=GRACE_SECONDS / 3600)
     j = sub.add_parser("job")
     j.add_argument("--job-id")
     j.add_argument("--bundle")
@@ -497,8 +798,16 @@ def main(argv=None):
     apply = a.apply or (a.auto and automatic_apply())
     grace = a.grace_hours * 3600
     if a.cmd == "sweep":
-        roots = a.root or ROOTS
+        roots = a.root or default_roots()
         run(discover(roots), apply=apply, grace=grace, roots=roots, tag="sweep")
+        if apply:
+            prune_archives()
+        if a.branches:
+            for repo in project_repos():
+                prune_branches(repo, apply=apply, grace=grace)
+    elif a.cmd == "branches":
+        for repo in [real(r) for r in a.repo] if a.repo else project_repos():
+            prune_branches(repo, apply=apply, remote=not a.no_remote, grace=grace)
     else:
         ps = list(a.path or []) + paths_for_job(a.job_id, a.bundle)
         if not ps:
