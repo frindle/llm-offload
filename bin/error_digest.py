@@ -1037,10 +1037,12 @@ def send_notify(rec, waits=None):
         body["html"] = notify_html(rec)
     except Exception:  # noqa: BLE001 - the plain text goes out without its HTML twin
         pass
-    body = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json", "User-Agent": "error-digest"})
-    req.add_unredirected_header("Authorization", "Bearer " + tok)
+    def _req(b):
+        r = urllib.request.Request(url, data=json.dumps(b).encode(), method="POST", headers={
+            "Content-Type": "application/json", "User-Agent": "error-digest"})
+        r.add_unredirected_header("Authorization", "Bearer " + tok)
+        return r
+    req = _req(body)
     out, tries, again = {}, 0, False
     for wait in (0,) + tuple(NOTIFY_WAITS if waits is None else waits):
         if wait:
@@ -1050,6 +1052,13 @@ def send_notify(rec, waits=None):
         again = out.pop("retry", False)
         if not again:
             break
+    if out.get("status") == "failed" and out.get("http") == 502 and "html" in body:
+        # Cloudflare refused the send itself: try once more as plain text, so a bad HTML twin never costs the day's mail.
+        tries += 1
+        plain = _post_once(_req({k: v for k, v in body.items() if k != "html"}))
+        plain.pop("retry", None)
+        if plain.get("status") == "sent":
+            out, again = dict(plain, why="sent as plain text (the HTML send was refused)"), False
     return dict(out, at=now, **({"tries": tries} if tries > 1 else {}), **({"retry_later": True} if again else {}))
 
 

@@ -429,6 +429,7 @@ class FakeNotify:
     calls = []
     code = 202
     exc = None              # raised (after the call is recorded) instead of answering
+    refuse_html = False     # answer 502 to a body that carries html (Cloudflare refusing the HTML send)
 
     def __init__(self, real):
         self.real = real
@@ -441,8 +442,9 @@ class FakeNotify:
         FakeNotify.last = req
         if FakeNotify.exc is not None:
             raise FakeNotify.exc
-        if FakeNotify.code >= 300:
-            raise urllib.error.HTTPError(req.full_url, FakeNotify.code, "no", {}, io.BytesIO(b"{}"))
+        code = 502 if FakeNotify.refuse_html and "html" in json.loads(req.data) else FakeNotify.code
+        if code >= 300:
+            raise urllib.error.HTTPError(req.full_url, code, "no", {}, io.BytesIO(b"{}"))
 
         class R:
             status = FakeNotify.code
@@ -509,7 +511,16 @@ def test_notify(base):
         r = json.loads((tmp / "digests" / (y + ".json")).read_text())
         chk("a 400 is not tried again in the same run", r["notify"]["status"] == "failed" and len(FakeNotify.calls) == 1
             and "tries" not in r["notify"], (r["notify"], len(FakeNotify.calls)))
-        FakeNotify.code, FakeNotify.calls = 202, []
+        FakeNotify.code, FakeNotify.calls, FakeNotify.refuse_html = 202, [], True
+        quiet(ED.main, ["run", "--no-model"])
+        r = json.loads((tmp / "digests" / (y + ".json")).read_text())
+        c = FakeNotify.calls
+        chk("a refused HTML send (502 every try) goes out once more as plain text and counts as sent",
+            r["notify"]["status"] == "sent" and "plain text" in r["notify"].get("why", "") and len(c) == 4
+            and all("html" in x[2] for x in c[:3]) and "html" not in c[3][2] and c[3][2]["text"] == c[0][2]["text"]
+            and "retry_later" not in r["notify"], (r["notify"], len(c)))
+        FakeNotify.code, FakeNotify.calls, FakeNotify.refuse_html = 202, [], False
+        (tmp / "digests" / (y + ".json")).unlink()       # forget that day's send, so the next case sends again
         rc, out, err = quiet(ED.main, ["run", "--no-model"])
         r = json.loads((tmp / "digests" / (y + ".json")).read_text())
         c = FakeNotify.calls
