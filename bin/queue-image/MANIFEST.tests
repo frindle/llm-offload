@@ -10,6 +10,7 @@ test-bundle-park-dedupe.py
 test-bundle-retired-queue.py
 test-bundle-verdicts.py
 test-cause-owners.py
+test-code-review-spill-check.py
 test-conformance-log.py
 test-cpu-lane-api.py
 test-cpu-lane-local.py
