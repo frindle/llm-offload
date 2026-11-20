@@ -40,21 +40,20 @@ def diff_lines(diff):
 
 
 def locate(finding, dl):
-    """(path, line) for a finding, or (path, None) when its quote cannot be placed."""
+    """(path, line) for a finding, or (path, None) when its quote cannot be placed. A bare file name (the harness often
+    reports just `route.ts`) is tried against every changed file whose path ends with it; the first that holds the quote wins."""
     path = finding.get("path") or ""
-    rows = dl.get(path)
-    if rows is None:
-        cand = [p for p in dl if p.endswith(path) or path.endswith(p)] if path else []
-        rows, path = (dl[cand[0]], cand[0]) if cand else (None, path)
     q = next((x.strip() for x in (finding.get("quote") or "").splitlines() if x.strip()), "")
     q = q[1:].strip() if q[:1] in "+-" and q[1:2] == " " else q
-    if rows is None or not q:
-        return path, None
-    for kinds in ("+", "-", " "):
-        for n, k, t in rows:
-            if k == kinds and t == q:
-                return path, n
-    return path, None
+    cands = [p for p in dl if p == path] or [p for p in dl if path and (p.endswith("/" + path) or path.endswith("/" + p))]
+    if not q or not cands:
+        return (cands[0] if cands else path), None
+    for p in cands:
+        for kinds in ("+", "-", " "):
+            for n, k, t in dl[p]:
+                if k == kinds and t == q:
+                    return p, n
+    return cands[0], None
 
 
 def hit(path, line, keys, w, file_only=False):
