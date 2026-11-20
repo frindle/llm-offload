@@ -11,6 +11,7 @@ changes. A missing or unreadable file is not an error (the defaults apply). Stdl
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -202,12 +203,50 @@ def _env_nonempty(name):
     return v.strip() if v and v.strip() else None
 
 
-def darkbloom_apply_env(rec, v1=False):
-    """A local.json-shaped record with DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY laid over it. With neither
-    variable set the record comes back unchanged (the same object), which keeps the Mac path as it was.
+# The Mac status service's /v1/darkbloom-endpoint answer ({"api_key": ..., "base_url": ...} when the Mac relays
+# Darkbloom on its LAN address), cached so the lane chooser never waits on the network per lookup. Only used when
+# QUEUE_AGENT_URL is set (the queue runs in the container); on the Mac it is never asked.
+DARKBLOOM_REMOTE_TTL_S = 30.0       # a good answer is reused this long
+DARKBLOOM_REMOTE_RETRY_S = 10.0     # after a failed ask, ask again no sooner than this
+DARKBLOOM_REMOTE_STALE_S = 120.0    # a failing agent keeps its last good answer this long, then env decides
+_DB_REMOTE = {"rec": {}, "at": None, "tried": None, "agent": None}
+
+
+def darkbloom_remote_record(refresh=True, now=None):
+    """{"api_key": str, "base_url": str} (either may be missing) from the Mac status service, or {} when the agent
+    is unset, silent, or has no key. Cached; refresh=False never touches the network (callers that hold the state
+    lock). The key is never logged."""
+    base = agent_url()
+    c = _DB_REMOTE
+    if not base:
+        return {}
+    now = time.monotonic() if now is None else now
+    if c["agent"] != base:                       # another agent: forget the old answer
+        c.update(rec={}, at=None, tried=None, agent=base)
+    fresh = c["at"] is not None and now - c["at"] < DARKBLOOM_REMOTE_TTL_S
+    recent_try = c["tried"] is not None and 0 <= now - c["tried"] < DARKBLOOM_REMOTE_RETRY_S
+    if refresh and not fresh and not recent_try:
+        c["tried"] = now
+        doc = agent_get("/v1/darkbloom-endpoint", timeout=2.0)
+        if isinstance(doc, dict):
+            rec = {k: doc[k].strip() for k in ("api_key", "base_url")
+                   if isinstance(doc.get(k), str) and doc[k].strip()}
+            c["rec"], c["at"] = rec, now
+    if c["at"] is not None and now - c["at"] >= DARKBLOOM_REMOTE_TTL_S + DARKBLOOM_REMOTE_STALE_S:
+        c["rec"] = {}
+    return dict(c["rec"])
+
+
+def darkbloom_apply_env(rec, v1=False, refresh=True):
+    """A local.json-shaped record with the endpoint layers laid over it. Base: DARKBLOOM_BASE_URL, then the Mac
+    status service's relay address. Key: the Mac status service's current key (it follows the provider), then
+    DARKBLOOM_API_KEY. With neither the variables nor the agent set the record comes back unchanged (the same
+    object), which keeps the Mac path as it was.
     v1=True: callers that use base_url as an OpenAI API root (the real local.json carries ".../v1") get "/v1"
-    added to an environment base that lacks it."""
-    base, key = _env_nonempty("DARKBLOOM_BASE_URL"), _env_nonempty("DARKBLOOM_API_KEY")
+    added to a base that lacks it. refresh=False: use the cached agent answer only (no network)."""
+    remote = darkbloom_remote_record(refresh)
+    base = _env_nonempty("DARKBLOOM_BASE_URL") or remote.get("base_url")
+    key = remote.get("api_key") or _env_nonempty("DARKBLOOM_API_KEY")
     if not base and not key:
         return rec
     out = dict(rec) if isinstance(rec, dict) else {}
@@ -229,11 +268,12 @@ def darkbloom_default_base():
 
 def darkbloom_endpoint():
     """(base_url, api_key) of the Darkbloom local API. Each part is taken from the first layer that has it:
-    environment, then ~/.darkbloom/local.json (base_url / api_key), then config darkbloom.base_url (base
+    environment (key: the Mac status service's current key first), then ~/.darkbloom/local.json (base_url / api_key), then config darkbloom.base_url (base
     only), then the default http://127.0.0.1:8000 (key None). Base has no trailing slash."""
     rec = darkbloom_local_record()
-    base = _env_nonempty("DARKBLOOM_BASE_URL") or (str(rec.get("base_url") or "").strip() or None)
-    key = _env_nonempty("DARKBLOOM_API_KEY")
+    remote = darkbloom_remote_record()
+    base = _env_nonempty("DARKBLOOM_BASE_URL") or remote.get("base_url") or (str(rec.get("base_url") or "").strip() or None)
+    key = remote.get("api_key") or _env_nonempty("DARKBLOOM_API_KEY")
     if not key and isinstance(rec.get("api_key"), str) and rec["api_key"]:
         key = rec["api_key"]
     if not base:

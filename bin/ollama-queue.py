@@ -5368,7 +5368,9 @@ def _darkbloom_record():
         rec = rec if isinstance(rec, dict) else {}
     except (OSError, ValueError):
         rec = {}
-    return queue_config.darkbloom_apply_env(rec)      # unchanged unless DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY is set
+    # Unchanged unless DARKBLOOM_BASE_URL / DARKBLOOM_API_KEY is set or QUEUE_AGENT_URL names a Mac status service
+    # (container). No network under the state lock: there the cached agent answer stands.
+    return queue_config.darkbloom_apply_env(rec, refresh=_STATE_LOCK_DEPTH <= 0)
 
 
 # Darkbloom 0.9.17 rewrites local.json with ONLY `api_key` (no `base_url`); this

@@ -81,9 +81,7 @@ ARCHIVE_AFTER_SECONDS = 14 * 86400
 ARCHIVE_KEEP_SECONDS = 90 * 86400
 ARCHIVE_MAX_FILE = 20 * 1024 * 1024
 ARCHIVE_ROOTS = list(ROOTS)
-ARCHIVE_DIR = os.environ.get("WORKTREE_ARCHIVE_DIR") or (
-    "/Volumes/NVMe-Models/worktree-archive" if os.path.isdir("/Volumes/NVMe-Models")
-    else os.path.join(HOME, ".ollama-dispatch", "worktree-archive"))  # a dry run must not refresh the index (resets grace)
+ARCHIVE_DIR = os.environ.get("WORKTREE_ARCHIVE_DIR") or os.path.join(HOME, ".ollama-dispatch", "worktree-archive")  # a dry run must not refresh the index (resets grace)
 LOG_PATH = os.path.join(HOME, ".ollama-dispatch", "worktree-cleanup.log.jsonl")
 QUEUE_STATE = os.path.join(str(queue_config.state_dir()), "ollama-queue-state.json")
 QUEUE_LOGS = os.path.join(str(queue_config.state_dir()), "ollama-queue-logs")

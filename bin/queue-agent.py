@@ -10,6 +10,9 @@ routes the mirror needs: queue-agent.md.
   GET  /v1/hold          Darkbloom add-on hold: the queue's own darkbloom_view() plus inputs and ages
   GET  /v1/mac           screen locked, memory (vm_stat/sysctl), load average
   GET  /v1/lane-plan     lane_plan's vendor-file and pid facts (no keys)
+  GET  /v1/darkbloom-endpoint  Darkbloom's current local key (+ the relay address when the relay runs); with the relay
+                         on, only the relay's allow-listed peers get it. The queue container reads it so it needs no
+                         DARKBLOOM_API_KEY of its own.
   POST /v1/notify        notify-operator.py with validated, rate-limited input
   POST /v1/bloomgauge-tick  run the queue's BloomGauge control step here (the app is on this Mac's loopback)
   GET  /v1/bloomgauge-tick  that step's mode, last run and alerts not yet taken
@@ -394,6 +397,24 @@ def darkbloom_status_payload(now=None, run=None):
                 txt = ""
             _status_cache.update(at=now, text=str(txt or ""))
         return {"generated_at": now, "text": _status_cache["text"], "cached_s": round(now - _status_cache["at"], 1)}
+
+
+# ------------------------------------------------------------------ /v1/darkbloom-endpoint
+def darkbloom_endpoint_payload(relay=None, local_json=None):
+    """The current local endpoint record: {"api_key": ...} straight from ~/.darkbloom/local.json (Darkbloom rewrites
+    it on provider restarts), plus {"base_url": "http://<relay bind>:<port>"} when the relay runs (local.json names
+    the loopback address, which is no use to the container). Keys that are not there are left out."""
+    p = Path(local_json or os.environ.get("DARKBLOOM_LOCAL_JSON") or Path.home() / ".darkbloom" / "local.json")
+    try:
+        rec = json.loads(p.read_text())
+    except (OSError, ValueError):
+        rec = {}
+    out = {"generated_at": _now()}
+    if isinstance(rec, dict) and isinstance(rec.get("api_key"), str) and rec["api_key"].strip():
+        out["api_key"] = rec["api_key"].strip()
+    if relay is not None:
+        out["base_url"] = f"http://{relay.listen[0]}:{relay.listen[1]}"
+    return out
 
 
 # ------------------------------------------------------------------ /v1/darkbloom-model-configs
@@ -957,7 +978,7 @@ class Ctx:
     """What the handler needs. Tests build their own."""
 
     def __init__(self, token=None, notify_limiter=None, notify=None, mirror=None, hold=None, mac=None, lane=None,
-                 dbstatus=None, ledger=None, bgtick=None, dbconfigs=None, relay=None):
+                 dbstatus=None, ledger=None, bgtick=None, dbconfigs=None, relay=None, dbendpoint=None):
         self.token = token
         self.relay = relay
         self.limiter = notify_limiter or RateLimiter()
@@ -968,6 +989,7 @@ class Ctx:
         self.lane = lane or lane_plan_payload
         self.dbstatus = dbstatus or darkbloom_status_payload
         self.dbconfigs = dbconfigs or darkbloom_model_configs_payload
+        self.dbendpoint = dbendpoint or (lambda: darkbloom_endpoint_payload(self.relay))
         self.ledger = ledger or bloomgauge_ledger_payload
         self.bgtick = bgtick or BloomTick(notify=notify)
 
@@ -1017,6 +1039,11 @@ def make_handler(ctx):
                     return self._send(200, ctx.lane())
                 if u.path == "/v1/darkbloom-status":
                     return self._send(200, ctx.dbstatus())
+                if u.path == "/v1/darkbloom-endpoint":
+                    # the key leaves this Mac only to the peers that may use the relay anyway
+                    if ctx.relay is not None and self.client_address[0] not in ctx.relay.allow:
+                        return self._err(403, "peer not allowed")
+                    return self._send(200, ctx.dbendpoint())
                 if u.path == "/v1/darkbloom-model-configs":
                     return self._send(200, ctx.dbconfigs())
                 if u.path == "/v1/bloomgauge-ledger":
