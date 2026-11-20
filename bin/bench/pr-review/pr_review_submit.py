@@ -128,17 +128,12 @@ def cmd_fetch(a):
     got = miss = 0
     for j in jobs:
         dest = rd / "results" / j["job_id"]
-        if (dest / "run.json").exists() or (dest / "report.md").exists() or (dest / "skipped.json").exists():
+        if (dest / "done.json").exists():
             got += 1
             continue
         try:
             QR.fetch_result(base, headers, j["job_id"], dest)
-            fin = any((dest / n).exists() for n in ("run.json", "report.md", "skipped.json"))
-            try:
-                st = json.loads((dest / "job.json").read_text()).get("status")
-            except (OSError, ValueError):
-                st = None
-            if fin or st in ("failed", "error", "cancelled"):
+            if (dest / "done.json").exists():    # the queue writes done.json when the job has finished (any outcome)
                 got += 1
             else:
                 miss += 1

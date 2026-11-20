@@ -84,6 +84,7 @@ def load(run_dirs, corpus):
     for rd in run_dirs:
         for j in json.loads((rd / "jobs.json").read_text()):
             res = rd / "results" / str(j.get("job_id"))
+            res = res / "work" if (res / "work").is_dir() else res      # the queue puts the runner's output under work/
             rj = res / "run.json"
             row = {"item": j["item"], "model": j["model"], "repeat": j["repeat"], "job": j.get("job_id"), "state": "missing"}
             if rj.exists():
@@ -95,6 +96,8 @@ def load(run_dirs, corpus):
                 row["run"] = {"findings": [], "elapsed_s": 0}; row["state"] = "ok"   # all-generated PASS report
             elif (res / "skipped.json").exists():
                 row["state"] = "skipped"
+            elif (res.parent / "done.json").exists():
+                row["state"] = "failed"          # finished but produced no report: counted as a parse/crash failure
             rows.append(row)
     return items, keys, rows
 
@@ -129,7 +132,7 @@ def aggregate(rows, keys, corpus, w=5, flag=FLAG):
              "false_alarm_per_clean": round(sum(r["score"]["n_flag"] for r in cln) / len(cln), 3) if cln else None,
              "clean_flagged_pct": pct(sum(1 for r in cln if r["score"]["n_flag"]), len(cln)),
              "precision": pct(sum(r["score"]["n_hit"] for r in ok), sum(r["score"]["n_flag"] for r in ok)),
-             "parse_fail_pct": pct(sum(1 for r in ok if r["pf"]) + sum(1 for r in rs if r["state"] == "parse_fail"), len(rs))}
+             "parse_fail_pct": pct(sum(1 for r in ok if r["pf"]) + sum(1 for r in rs if r["state"] in ("parse_fail", "failed")), len(rs))}
         for dim in ("class", "lang", "size"):
             g = defaultdict(list)
             for r in reg:
