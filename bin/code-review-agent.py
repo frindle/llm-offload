@@ -100,6 +100,12 @@ def clamp_num_predict(num_predict: int, num_ctx: int, system: str, user: str,
     return max(min(int(num_predict), room), min(int(num_predict), MIN_NUM_PREDICT))
 
 
+def _ollama_name(name: str) -> str:
+    """Ollama model name as /api/ps reports it: an untagged name means :latest."""
+    name = (name or "").strip()
+    return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+
+
 class Model:
     def __init__(self, host: str, model: str, num_ctx: int, timeout: int = 1200,
                  think: bool = False):
@@ -115,6 +121,45 @@ class Model:
         # Per-call token accounting, persisted to run.json as `call_usage`, so a
         # prompt that overflows num_ctx is visible instead of silently truncated.
         self.usage: list[dict] = []
+        self.spill_checked = False
+
+    def _ensure_no_spill(self):
+        """Load the model at this run's num_ctx and abort if ANY of it lands off-GPU.
+
+        Rule (2026-11-20): no CPU spillover on the GPU host, at all, no exceptions.
+        ollama-worker.py already aborts on spill after its warmup; this runner had no
+        check, so the PR-review bench ran qwen3:14b at num_ctx 16384 with ~2.7GB on
+        the CPU. Checked once per run, before the first real call: an empty-prompt
+        /api/generate loads the model with these options, then /api/ps must show
+        size_vram == size. If the check itself cannot be made, the run aborts too.
+        """
+        if self.spill_checked:
+            return
+        load = {"model": self.model, "prompt": "", "keep_alive": "30m",
+                "options": {"num_ctx": self.num_ctx}}
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{self.host}/api/generate", data=json.dumps(load).encode(),
+                headers={"Content-Type": "application/json"}), timeout=self.timeout).read()
+            with urllib.request.urlopen(f"{self.host}/api/ps", timeout=30) as resp:
+                ps = json.loads(resp.read())
+        except Exception as e:
+            raise RuntimeError(f"spill check: could not load {self.model} or read "
+                               f"{self.host}/api/ps ({e}); aborting rather than risk "
+                               f"running with CPU spillover") from None
+        entry = next((m for m in ps.get("models", [])
+                      if _ollama_name(m.get("name") or m.get("model") or "") == _ollama_name(self.model)), None)
+        if entry is None:
+            raise RuntimeError(f"spill check: {self.model} is not in {self.host}/api/ps "
+                               f"right after loading it; aborting")
+        total, vram = int(entry.get("size") or 0), int(entry.get("size_vram") or 0)
+        if total > 0 and vram < total:
+            raise RuntimeError(
+                f"SPILLOVER: {self.model} at num_ctx {self.num_ctx} loaded with "
+                f"{(total - vram)/1e9:.2f}GB of {total/1e9:.2f}GB off-GPU. No CPU spillover "
+                f"is allowed; rerun with a smaller num_ctx.")
+        log(f"  [model] {self.model} at num_ctx {self.num_ctx}: {vram/1e9:.2f}GB, all on GPU")
+        self.spill_checked = True
 
     def _note_usage(self, prompt_tokens, completion_tokens, num_predict, finish):
         p, c = int(prompt_tokens or 0), int(completion_tokens or 0)
@@ -179,6 +224,7 @@ class Model:
         # answer then makes Ollama context-shift, silently dropping the START of the
         # prompt (system rules + diff header) mid-generation. Clamping makes it stop
         # with done_reason=length instead -- counted and logged as truncation below.
+        self._ensure_no_spill()
         _asked = num_predict
         num_predict = clamp_num_predict(num_predict, self.num_ctx, system, user, schema)
         if num_predict < _asked:

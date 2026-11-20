@@ -35,7 +35,7 @@ APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 PRIVATE_RE = re.compile(r"[@$\u00a2-\u00a5\u20ac]|\d{6,}|\b\d+[.,]\d{2}\b|\b(?:usd|eur|gbp|dollars?)\b", re.I)
 DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")      # fromisoformat alone also takes 20261116 and 2026-W47-1
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
-TITLES = {"resell": "Resell"}
+TITLES = {"resell": "Resell", "claude": "Handled by Claude"}
 
 
 def token():
@@ -51,7 +51,7 @@ def token():
 
 
 def apps():
-    return [a.strip() for a in (os.environ.get("DIGEST_LINES_APPS") or "resell").split(",") if APP_RE.match(a.strip())]
+    return [a.strip() for a in (os.environ.get("DIGEST_LINES_APPS") or "resell,claude").split(",") if APP_RE.match(a.strip())]
 
 
 def store_dir(ddir=None):

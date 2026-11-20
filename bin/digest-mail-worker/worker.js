@@ -1,6 +1,6 @@
 // digest-mail: the error digest's one daily message -> one email (Cloudflare Worker, 2026-11-16).
 //
-// POST /send  {app, ref, subject, text}  with  Authorization: Bearer <token>
+// POST /send  {app, ref, subject, text, html?}  with  Authorization: Bearer <token>
 //   200 {ok: true, id}      sent
 //   400 / 401 / 404         bad body / wrong token / anything else
 //   409 {ok: false}         this app + ref was already sent (the digest retries are harmless)
@@ -54,6 +54,7 @@ export default {
     const ref = String(b.ref || "").slice(0, 64);
     const subject = String(b.subject || "").replace(/[\r\n\t]+/g, " ").trim().slice(0, 200);
     const text = String(b.text || "").slice(0, 200000);
+    const html = typeof b.html === "string" ? b.html.slice(0, 200000) : "";
     if (!apps.includes(app)) return reply(400, { ok: false, error: "unknown app" });
     if (!subject || !text.trim()) return reply(400, { ok: false, error: "subject and text are required" });
 
@@ -67,6 +68,7 @@ export default {
         to: env.TO,
         subject,
         text,
+        ...(html.trim() ? { html } : {}),
       });
     } catch (e) {
       return reply(502, { ok: false, code: e && e.code, error: String((e && e.message) || e).slice(0, 200) });

@@ -9,6 +9,7 @@ import http.client
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -921,6 +922,66 @@ class RelayTests(unittest.TestCase):
         self.assertEqual((rel["listening"], rel["port"]), (True, port))
         self.assertNotIn("allow", rel)
         self.assertNotIn("127.0.0.1", json.dumps(rel))
+
+
+class EndpointRouteTests(unittest.TestCase):
+    """GET /v1/darkbloom-endpoint: the container reads Darkbloom's current key (and the relay address) from here."""
+    KEY = "db-key-not-real-0001"
+
+    def serve(self, **kw):
+        srv, _ = qa.build_server({"bind": "127.0.0.1", "port": 0}, TOKEN, **kw)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        return srv.server_address[1]
+
+    def get(self, port, token=TOKEN):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/v1/darkbloom-endpoint", headers={"Authorization": f"Bearer {token}"} if token else {})
+        r = c.getresponse()
+        body = json.loads(r.read())
+        c.close()
+        return r.status, body
+
+    def local_json(self, rec):
+        d = tempfile.mkdtemp(prefix="qa-ep-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = Path(d) / "local.json"
+        if rec is not None:
+            p.write_text(rec if isinstance(rec, str) else json.dumps(rec))
+        return p
+
+    def test_payload_has_key_and_relay_base(self):
+        class R:
+            listen = ("192.0.2.20", 8000)
+        p = self.local_json({"api_key": self.KEY, "base_url": "http://127.0.0.1:8000/v1", "port": 8000})
+        out = qa.darkbloom_endpoint_payload(R(), local_json=p)
+        self.assertEqual((out["api_key"], out["base_url"]), (self.KEY, "http://192.0.2.20:8000"))
+        out = qa.darkbloom_endpoint_payload(None, local_json=p)
+        self.assertEqual(out["api_key"], self.KEY)
+        self.assertNotIn("base_url", out)          # loopback address of local.json is no use to the container
+
+    def test_payload_missing_or_torn_file_has_no_key(self):
+        for rec in (None, "", "{not json", "[1]", {"base_url": "x"}, {"api_key": "  "}):
+            out = qa.darkbloom_endpoint_payload(None, local_json=self.local_json(rec))
+            self.assertNotIn("api_key", out, rec)
+
+    def test_route_needs_the_agent_token(self):
+        port = self.serve(dbendpoint=lambda: {"api_key": self.KEY})
+        self.assertEqual(self.get(port, token=None)[0], 401)
+        self.assertEqual(self.get(port, token="wrong")[0], 401)
+        st, body = self.get(port)
+        self.assertEqual((st, body["api_key"]), (200, self.KEY))
+
+    def test_with_relay_only_allowed_peers_get_the_key(self):
+        class R:
+            listen = ("192.0.2.20", 8000)
+            allow = frozenset({"192.0.2.99"})
+        port = self.serve(relay=R(), dbendpoint=lambda: {"api_key": self.KEY})
+        st, body = self.get(port)                    # we connect from 127.0.0.1: not on the list
+        self.assertEqual(st, 403)
+        self.assertNotIn(self.KEY, json.dumps(body))
+        R.allow = frozenset({"127.0.0.1"})
+        self.assertEqual(self.get(port)[0], 200)
 
 
 if __name__ == "__main__":

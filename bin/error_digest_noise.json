@@ -26,5 +26,11 @@
   {"container": "dispatch-cpu-runner", "match": "(?:Connection refused|No route to host|timed out|Remote end closed connection|reset by peer).*\"event\": \"(?:claim_error|config_pull_failed|api_unreachable)\"", "action": "routine",
    "why": "the runner cannot reach the queue while the queue restarts (nightly, deploys, the weekly Appdata Backup) and retries; other runner errors stay counted"},
   {"container": "logstack", "match": "msg=\"error health checking\".*context canceled", "action": "routine",
-   "why": "Loki logs this when a client cancels a query (a log search from a Claude session or the digest)"}
+   "why": "Loki logs this when a client cancels a query (a log search from a Claude session or the digest)"},
+  {"container": "Plex-Media-Server", "match": "^\\s*configuration: --", "action": "routine",
+   "why": "ffmpeg prints its build flags on every transcode error; the real error line is listed on its own"},
+  {"container": "CloudflaredTunnel", "match": "AccessJWTValidator: oidc: token .* expired", "action": "routine",
+   "why": "a browser tab with an expired Access login; the visitor is sent to log in again"},
+  {"container": "logstack", "match": "failed mapping AST.*context canceled", "action": "routine",
+   "why": "Loki logs this when a query is cancelled (a digest query timing out, a closed dashboard tab)"}
 ]

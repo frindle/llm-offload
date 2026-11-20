@@ -29,8 +29,21 @@ def chk(name, got, want):
 
 
 class H(http.server.BaseHTTPRequestHandler):
+    def _send(self, out):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_GET(self):
+        # the runner's zero-spill check reads /api/ps once per Model: report the stub fully on GPU
+        self._send(json.dumps({"models": [{"name": "stub:latest", "size": 1, "size_vram": 1}]}).encode())
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/generate":        # the spill check's load-only call, not a review call
+            return self._send(json.dumps({"done": True, "done_reason": "load"}).encode())
         SEEN.append(body)
         out = json.dumps({"message": {"content": "{}"}, "done_reason": "stop",
                           "prompt_eval_count": 10, "eval_count": 5}).encode()
