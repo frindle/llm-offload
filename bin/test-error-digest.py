@@ -473,10 +473,23 @@ def test_notify(base):
         nt = (tmp / "digests" / (y + ".notify.txt")).read_text()
         chk("no notify URL: shadow, nothing sent, the message is written", rc == 0 and r["notify"]["status"] == "shadow"
             and not FakeNotify.calls and nt.startswith("Subject: Unraid ") and "1 thing for you" in nt, (out, err, nt))
-        chk("the message: owner item and its sample; vaultwarden under 3 held back and only counted; claude items "
-            "only counted", "Lutron Pico buttons went silent" in nt and "e.g. [Lutron] Failed to re-subscribe" in nt
-            and "Held back: 1 item (not sent" in nt and "Vaultwarden" not in nt
-            and "CUDA" not in nt and "1 item for Claude" in nt, nt)
+        chk("the message: owner item and its sample; vaultwarden under 3 held back: named with its reason, no example "
+            "line; claude items only counted", "Lutron Pico buttons went silent" in nt
+            and "e.g. [Lutron] Failed to re-subscribe" in nt and "Below the bar (no action needed):" in nt
+            and "Failed Vaultwarden logins" in nt and "3 needed" in nt and "incorrect" not in nt
+            and "192.0.2.9" not in nt and "CUDA" not in nt and "1 item for Claude" in nt, nt)
+        hrec = dict(r)
+        hrec["alerts"] = dict(r["alerts"], owner=[dict(r["alerts"]["owner"][0], do="Restart <the> bridge")])
+        hrec["extra"] = [{"app": "resell", "title": "Resell", "lines": ["2 new <orders>"], "needs_you": False}]
+        hm = ED.notify_html(hrec)
+        _, ht = ED.notify_text(hrec)
+        chk("the HTML twin: the verdict, the item, its escaped do line and app lines; held named without its line; "
+            "nothing from a claude item", "1 thing needs you" in hm and "Lutron Pico buttons went silent" in hm
+            and "<b>Do this:</b> Restart &lt;the&gt; bridge" in hm and "2 new &lt;orders&gt;" in hm
+            and "Failed Vaultwarden logins" in hm and "incorrect" not in hm and "192.0.2.9" not in hm
+            and "CUDA" not in hm and hm.startswith("<!doctype html>") and "    Do: Restart <the> bridge" in ht, hm)
+        chk("the HTML twin of a quiet day says nothing needs you", "Nothing needs you" in ED.notify_html(
+            {"day": y, "alerts": {"owner": [], "held": []}, "containers": {}}))
         tf = tmp / "tok"
         tf.write_text("notify-secret\n")
         os.environ.update(ERROR_DIGEST_NOTIFY_URL="http://notify.test/send", ERROR_DIGEST_NOTIFY_TOKEN_FILE=str(tf))
@@ -503,6 +516,7 @@ def test_notify(base):
         chk("sent once with the bearer token from the file; subject and text in the body",
             r["notify"]["status"] == "sent" and len(c) == 1 and c[0][1] == "Bearer notify-secret"
             and c[0][2]["app"] == "error-digest" and c[0][2]["ref"] == y and "for you" in c[0][2]["subject"]
+            and c[0][2].get("html", "").startswith("<!doctype html>")
             and "Lutron" in c[0][2]["text"], (r.get("notify"), c))
         chk("the bearer is an unredirected header (never passed on to a redirect's target)", c and not c[0][3], c)
         nxt = urllib.request.HTTPRedirectHandler().redirect_request(FakeNotify.last, None, 302, "Found", {},

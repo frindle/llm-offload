@@ -38,6 +38,7 @@ again (key=value secrets, emails, URLs with their query strings, IPs).
 import contextlib
 import datetime as dt
 import hashlib
+import html
 import http.client
 import json
 import os
@@ -338,7 +339,8 @@ def noise_action(rules, container, line):
 #   a file: the daily message leaves the example line out; the digest on Unraid keeps it), counted_only true (only
 #   lines the digest counts as errors or warnings, see level(): for a catch-all rule, so an INFO line that merely
 #   mentions "error", such as supervisord naming the error-digest program, does not match).
-# Held-back items are listed in the digest (so nothing is hidden) but not sent: the message only counts them. New kinds
+# do "<one line>" (owner rules: what the operator should do, shown under the item in the daily message).
+# Held-back items are listed in the digest and named with their reason in the message, without an example line. New kinds
 # of error that no rule covers go to Claude, never straight to the operator ("for Claude": the operator's Claude
 # sessions read the digest and handle or ask; nothing here restarts or fixes anything).
 NEW_FOR_CLAUDE = 15        # new unrouted kinds listed for Claude per day; the rest are counted
@@ -364,7 +366,8 @@ def load_alerts(*paths):
                 a = {"globs": globs, "rx": re.compile(r["match"], re.I), "route": r["route"], "what": str(r["what"]),
                      "min_count": max(1, int(r.get("min_count", 1))), "sustain_min": float(r.get("sustain_min", 0)),
                      "gap_min": float(r.get("gap_min", 10)), "hold": str(r.get("hold") or ""),
-                     "names": r.get("names") is True, "counted_only": r.get("counted_only") is True}
+                     "names": r.get("names") is True, "counted_only": r.get("counted_only") is True,
+                     "do": str(r.get("do") or "")[:200]}
                 seen.add(key)
                 out.append(a)
             except (re.error, AttributeError, TypeError, ValueError):
@@ -422,6 +425,8 @@ def decide_alerts(acc, arules, containers, before=None):
                 "first_ns": ts[0], "last_ns": ts[-1], "sample": _short(per[0][1]["sample"], 200)}
         if a.get("names"):
             item["names"] = True
+        if a.get("do"):
+            item["do"] = a["do"]
         held = []
         if len(ts) < a["min_count"]:
             held.append("%d× today, %d needed" % (len(ts), a["min_count"]))
@@ -883,6 +888,8 @@ def notify_text(rec):
         t.append("- %s (%s; %s)" % (it["what"], ", ".join(it["containers"]), _when(it)))
         if not it.get("names"):            # a line that names a download or file stays in the digest on Unraid
             t.append("    e.g. %s" % _short(mail_sample(it["sample"]), 200).replace("`", "'"))
+        if it.get("do"):
+            t.append("    Do: %s" % it["do"])
     if not mine:
         t.append("No errors need you today." if extra else "Nothing needs you today.")
     for e in extra:
@@ -895,15 +902,105 @@ def notify_text(rec):
                                                                 for x in plex_playback.notify_lines(rec["playback"])]
         except Exception:  # noqa: BLE001 - the message goes out without it
             pass
-    if held:                                # held back means not sent: only counted here, listed in the digest
-        t += ["", "Held back: %d item%s (not sent; listed in the digest)." % (len(held), "" if len(held) == 1 else "s")]
+    if held:                                # below the bar its rule sets: named with the reason, no example line
+        t += ["", "Below the bar (no action needed):"]
+        t += ["- %s (%s): %s" % (it["what"], _when(it), it["held"]) for it in held]
     cs = rec.get("containers") or {}
     n_lines = sum(sc["count"] for i in cs.values() for sc in i["sigs"])
     nc = len(al.get("claude") or []) + len(al.get("new_for_claude") or []) + (al.get("new_for_claude_more") or 0)
-    t += ["", "Also logged: %s error/warning lines from %d containers; %d item%s for Claude to look at (not for you)." % (
-        f"{n_lines:,}", len(cs), nc, "" if nc == 1 else "s")]
+    t += ["", "Also logged: %s error/warning lines from %d container%s; %d item%s for Claude to look at (not for you)." % (
+        f"{n_lines:,}", len(cs), "" if len(cs) == 1 else "s", nc, "" if nc == 1 else "s")]
     t.append("Full digest: error-digest/digests/%s.md on Unraid." % day)
     return subj, "\n".join(t) + "\n"
+
+
+# The HTML twin of notify_text: the same facts in the same order. Tables and inline styles only (mail clients drop
+# <style> rules often enough); the few classes are for the dark-mode block, which clients that honour it apply.
+_C = {"ink": "#1d2733", "soft": "#5b6875", "ground": "#eef1f4", "paper": "#ffffff", "rule": "#d9dfe5",
+      "act": "#b25e00", "act_bg": "#fff6e9", "calm": "#2f6b4f"}
+_FONT = "-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
+
+
+def _e(s):
+    return html.escape(str(s), quote=True)
+
+
+def notify_html(rec):
+    """The daily message as HTML (the mail Worker sends it next to the plain text; a Worker that does not know the
+    field sends the text alone). Same rules as notify_text: no example line for a names rule, held items named with
+    their reason, no container log text beyond mail_sample()."""
+    al = rec.get("alerts") or {}
+    wd = dt.date.fromisoformat(rec["day"]).strftime("%A, %B %-d")
+    mine = sorted(al.get("owner") or [], key=lambda i: bool(i.get("seen_days")))
+    held, extra = al.get("held") or [], rec.get("extra") or []
+    asks = [e["title"] for e in extra if e.get("needs_you")]
+    n = len(mine) + len(asks)
+    verdict = "Nothing needs you" if not n else "%d thing%s need%s you" % (n, "" if n == 1 else "s", "s" if n == 1 else "")
+    bar = _C["act"] if n else _C["calm"]
+    o = ['<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">'
+         '<meta name="viewport" content="width=device-width,initial-scale=1"><style>'
+         '@media (prefers-color-scheme:dark){.g{background:#12181f!important}.p{background:#1a222c!important}'
+         '.i{color:#e6ebf0!important}.s{color:#9aa7b4!important}.a{background:#2b2113!important}'
+         '.r{border-color:#2c3743!important}}</style></head>',
+         '<body class="g" style="margin:0;padding:0;background:%s">' % _C["ground"],
+         '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" class="g" style="background:%s">'
+         '<tr><td align="center" style="padding:20px 12px">' % _C["ground"],
+         '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" class="p" style="max-width:600px;'
+         'background:%s;border-top:6px solid %s;font-family:%s">' % (_C["paper"], bar, _FONT),
+         '<tr><td style="padding:26px 28px 8px"><div class="s" style="font-size:14px;color:%s">Unraid, %s</div>'
+         '<div class="i" style="font-size:30px;line-height:1.2;font-weight:700;color:%s;padding-top:4px">%s</div>'
+         '</td></tr>' % (_C["soft"], _e(wd), _C["ink"], _e(verdict))]
+
+    def section(title):
+        o.append('<tr><td style="padding:22px 28px 0"><div class="i r" style="font-size:16px;font-weight:700;color:%s;'
+                 'border-bottom:1px solid %s;padding-bottom:6px">%s</div></td></tr>' % (_C["ink"], _C["rule"], _e(title)))
+
+    def lines(items, pad="8px 28px 0"):
+        o.append('<tr><td class="i" style="padding:%s;font-size:15px;line-height:1.5;color:%s">%s</td></tr>' % (
+            pad, _C["ink"], "".join('<div style="padding:3px 0">%s</div>' % x for x in items)))
+
+    for it in mine:
+        where = "%s, %s" % (", ".join(it["containers"]), _when(it))
+        body = ['<div class="i" style="font-size:17px;font-weight:700;color:%s">%s</div>' % (_C["ink"], _e(it["what"])),
+                '<div class="s" style="font-size:13px;color:%s;padding-top:2px">%s</div>' % (_C["soft"], _e(where))]
+        if it.get("do"):
+            body.append('<div class="i" style="font-size:15px;color:%s;padding-top:8px"><b>Do this:</b> %s</div>' % (
+                _C["ink"], _e(it["do"])))
+        if not it.get("names"):
+            body.append('<div class="s" style="font-size:12px;color:%s;padding-top:8px;font-family:Menlo,Consolas,'
+                        'monospace;word-break:break-word">%s</div>' % (
+                            _C["soft"], _e(_short(mail_sample(it["sample"]), 200))))
+        o.append('<tr><td style="padding:14px 28px 0"><table role="presentation" width="100%%" cellpadding="0" '
+                 'cellspacing="0"><tr><td class="a" style="background:%s;border-left:4px solid %s;padding:14px 16px">'
+                 '%s</td></tr></table></td></tr>' % (_C["act_bg"], _C["act"], "".join(body)))
+    if not mine:
+        lines(['<span class="s" style="color:%s">No container errors need you today.</span>' % _C["soft"]], "10px 28px 0")
+    for e in extra:
+        section(e["title"] + (" (needs you)" if e.get("needs_you") else ""))
+        lines([_e(_short(x, 200)) for x in e["lines"]])
+    if (rec.get("playback") or {}).get("spells"):
+        try:
+            import plex_playback
+            pl = [_e(_short(x, 240)) for x in plex_playback.notify_lines(rec["playback"])]
+            section("Plex buffering")
+            lines(pl)
+        except Exception:  # noqa: BLE001 - the message goes out without it
+            pass
+    if held:
+        section("Below the bar, no action needed")
+        lines(['%s <span class="s" style="color:%s">(%s; %s)</span>' % (
+            _e(it["what"]), _C["soft"], _e(_when(it)), _e(it["held"])) for it in held])
+    cs = rec.get("containers") or {}
+    n_lines = sum(sc["count"] for i in cs.values() for sc in i["sigs"])
+    nc = len(al.get("claude") or []) + len(al.get("new_for_claude") or []) + (al.get("new_for_claude_more") or 0)
+    o.append('<tr><td class="s r" style="padding:22px 28px 26px;font-size:13px;line-height:1.5;color:%s">'
+             '<div class="r" style="border-top:1px solid %s;padding-top:12px">%s error and warning lines from %d '
+             'container%s. %d item%s went to Claude, not to you. Full digest on Unraid: error-digest/digests/%s.md'
+             '</div></td></tr>' % (_C["soft"], _C["rule"], f"{n_lines:,}", len(cs), "" if len(cs) == 1 else "s", nc,
+                                   "" if nc == 1 else "s",
+                                   _e(rec["day"])))
+    o.append("</table></td></tr></table></body></html>")
+    return "".join(o)
 
 
 def notify_settings():
@@ -935,7 +1032,12 @@ def send_notify(rec, waits=None):
     if not url.startswith("https://"):
         return {"status": "failed", "at": now, "why": "the notify URL must be https"}
     subj, text = notify_text(rec)
-    body = json.dumps({"app": "error-digest", "ref": rec["day"], "subject": subj, "text": text}).encode()
+    body = {"app": "error-digest", "ref": rec["day"], "subject": subj, "text": text}
+    try:
+        body["html"] = notify_html(rec)
+    except Exception:  # noqa: BLE001 - the plain text goes out without its HTML twin
+        pass
+    body = json.dumps(body).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "User-Agent": "error-digest"})
     req.add_unredirected_header("Authorization", "Bearer " + tok)
