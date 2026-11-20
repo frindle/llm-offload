@@ -77,3 +77,17 @@ def test_plan_is_model_major_and_labels_are_neutral():
     assert all(len(j["label"]) <= 60 and j["label"].startswith("bakeoff-prr-") for j in jobs)
     assert pr_review_submit.ctx_for("phi4:14b") == 16384 and pr_review_submit.ctx_for("qwen3:8b") == 32768
     assert pr_review_submit.ctx_for("x:8b", {"x:8b": 8192}) == 8192
+
+
+if __name__ == "__main__":   # no pytest needed: run every test_* with a fresh tmp dir
+    import inspect, tempfile, traceback
+    bad = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    fn(Path(td)) if inspect.signature(fn).parameters else fn()
+                print("ok  ", name)
+            except Exception:
+                bad += 1; print("FAIL", name); traceback.print_exc()
+    sys.exit(1 if bad else 0)
