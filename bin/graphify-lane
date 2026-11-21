@@ -22,7 +22,7 @@ Runner jobs: payload = graphify's file list + the graphify-out state files under
 mode); the job restores the Mac mtimes so manifest.json stays valid here; results are checked (valid JSON, no
 absolute or runner paths, semantic nodes kept) and the Mac's graphify backs up a protected graph before it is replaced.
 Lock: ~/Library/Caches/graphify-all.lock (shared with the old graphify-all). Log: --log FILE (trimmed past 1 MB).
-CPU_RUNNER_API (env) points at the queue; default from the config.
+CPU_RUNNER_API (env) points at the queue; default: queue.api_url from the shared queue config (queue_config.py).
 """
 import argparse
 import fcntl
@@ -236,18 +236,28 @@ def build_mac(cfg, proj):
 
 
 # ---------------- runner path ----------------
-def cpu_job_lib():
-    spec = importlib.util.spec_from_file_location("cpu_job", HOME / "bin" / "cpu_job.py")
+def bin_module(name):
+    spec = importlib.util.spec_from_file_location(name, HOME / "bin" / f"{name}.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def cpu_job_lib():
+    return bin_module("cpu_job")
+
+
+def queue_api_base():
+    """The queue's address from the shared queue config (queue.api_url), the same one cpu_dispatch uses.
+    A copy in this lane's config went stale when the queue moved off the Mac on 2026-11-15."""
+    return bin_module("queue_config").queue_api()[0]
 
 
 class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lib = cpu_job_lib()
-        self.api = os.environ.get("CPU_RUNNER_API") or cfg["api_default"]
+        self.api = os.environ.get("CPU_RUNNER_API") or cfg.get("api_default") or queue_api_base()
         self.req_path = self.req_sha = None
         self.tmp_root = Path(tempfile.mkdtemp(prefix="graphify-lane-"))
 
