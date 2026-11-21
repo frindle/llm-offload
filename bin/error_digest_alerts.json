@@ -52,6 +52,6 @@
    "why": "added 2026-11-20: recurring kind no rule covered"},
   {"route": "claude", "container": "scrypted", "match": "prebuffer session .* with error|error while decoding MB", "what": "A camera stream hiccup in Scrypted (timeout or decode error)", "counted_only": true,
    "why": "added 2026-11-20: recurring kind no rule covered"},
-  {"route": "claude", "container": "ev-dashboard*", "match": "\\[rivian-ws\\] websocket error", "what": "The EV dashboard's Rivian websocket dropped", "counted_only": true,
+  {"route": "claude", "container": "ev-dashboard*", "match": "\\[(?:rivian-ws|parallax)\\] websocket error", "what": "The EV dashboard's Rivian websocket (rivian-ws or parallax) dropped", "counted_only": true,
    "why": "added 2026-11-20: recurring kind no rule covered"}
 ]
