@@ -258,6 +258,28 @@ def test_noise():
     chk("skip rule: arr health is alerted elsewhere",
         ED.noise_action(rules, "sonarr", "[Warn] HealthCheckService: Indexers unavailable due to failures") == "skip")
     chk("rules are per container", ED.noise_action(rules, "radarr", "Seed floor 3d: removal deferred") is None)
+    for c, line in [
+            ("ollama", 'time=2026-11-20T10:36:26.647Z level=WARN source=runner.go:584 msg="llama-server GPU discovery watchdog timed out"'),
+            ("ollama", 'level=WARN source=runner.go:364 msg="unable to refresh free memory, using old values"'),
+            ("ollama", 'level=WARN msg="model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable"'),
+            ("Plex-Media-Server", "decoder error: 254"), ("Plex-Media-Server", "TrueHD processing failed with 254"),
+            ("scrypted", "[Backyard Pool] creating error image with background Snapshot Timed Out true"),
+            ("AdGuard-Home", "2026/11/20 00:00:35.376312 [error] closing query log: flushing log buffer: nothing to write to a file"),
+            ("reselling-app-1", "[walmart/page:error] Failed to load resource: net::ERR_FAILED"),
+            ("arr-webhook", "ERROR [stuck] scheduler tick failed: HTTPConnectionPool(host='h', port=1): Read timed out. (read timeout=45)")]:
+        chk("2026-11-20 noise is routine: " + line[:50], ED.noise_action(rules, c, line) == "routine", line)
+    for c, line in [
+            ("radarr", "[Error] DownloadedMovieImportService: Import failed, path does not exist or is not accessible by Radarr: /data/Downloads/Complete/seedbox/Some.Movie.2024.2160p-GRP/"),
+            ("sonarr", "[Error] DownloadedEpisodesImportService: Import failed, path does not exist or is not accessible by Sonarr: /data/Downloads/Complete/seedbox/Show.S01-GRP"),
+            ("vault", "2026-11-22T10:26:04 committer: cycle error: TimeoutExpired: Command '['git', '-c', 'core.filemode=false', '-C', '/vault', 'status', '--porcelain', '-z', '--untracked-files=all']' timed out after 120.0 seconds")]:
+        chk("2026-11-22 noise is routine: " + line[:50], ED.noise_action(rules, c, line) == "routine", line)
+    chk("a missing path outside the seedbox folder still counts",
+        ED.noise_action(rules, "radarr", "Import failed, path does not exist or is not accessible by Radarr: /data/Downloads/Complete/radarr/X") is None)
+    chk("a vault commit or push failure still counts",
+        ED.noise_action(rules, "vault", "committer: cycle error: CalledProcessError: Command '['git', 'commit']' returned non-zero exit status 128") is None)
+    chk("a real Ollama failure is not noise", ED.noise_action(rules, "ollama", "level=ERROR msg=\"CUDA error: out of memory\"") is None)
+    chk("a scheduler tick failing for another reason is not noise",
+        ED.noise_action(rules, "arr-webhook", "ERROR [stuck] scheduler tick failed: KeyError('x')") is None)
     d = Path(tempfile.mkdtemp())
     (d / "n.json").write_text(json.dumps([{"match": "(", "action": "routine"}, {"match": "x", "action": "explode"},
                                           {"container": "a*", "match": "boom", "action": "skip"}]))

@@ -32,5 +32,15 @@
   {"container": "CloudflaredTunnel", "match": "AccessJWTValidator: oidc: token .* expired", "action": "routine",
    "why": "a browser tab with an expired Access login; the visitor is sent to log in again"},
   {"container": "logstack", "match": "failed mapping AST.*context canceled", "action": "routine",
-   "why": "Loki logs this when a query is cancelled (a digest query timing out, a closed dashboard tab)"}
+   "why": "Loki logs this when a query is cancelled (a digest query timing out, a closed dashboard tab)"},
+  {"container": "ollama", "match": "llama-server GPU discovery watchdog timed out|unable to refresh free memory, using old values", "action": "routine", "why": "Ollama's periodic GPU free-memory probe timed out while a model was loading or running; it keeps the last known values and works (about 30 in 4 days, no crash, no failed request). The load aborts stay counted by their own rule"},
+  {"container": "ollama", "match": "model is missing tokenizer\\.chat_template", "action": "routine", "why": "a locally built model (swe7b) has no chat template in its GGUF; logged on every load, chat works"},
+  {"container": "Plex-Media-Server", "match": "^\\s*decoder error: \\d+|TrueHD processing failed with \\d+", "action": "routine", "why": "the external TrueHD audio decoder gave up on one media file during a transcode or analysis; a property of that file, not of Plex"},
+  {"container": "scrypted", "match": "creating error image with background Snapshot Timed Out", "action": "routine", "why": "a camera did not answer a snapshot request in time and Scrypted shows a placeholder; the camera's own offline state already notifies"},
+  {"container": "AdGuard-Home", "match": "closing query log: flushing log buffer: nothing to write to a file", "action": "routine", "why": "AdGuard logs this at its midnight query-log rotation when the buffer is empty; nothing was lost"},
+  {"container": "reselling-app-1", "match": "\\[walmart/page:error\\]", "action": "routine", "why": "errors printed by walmart.com's own page in the sidecar browser (CSP, CORS, blocked trackers, unresolved ad hosts); a failed order sync still alerts through 'sync FAILED'"},
+  {"container": "arr-webhook", "match": "scheduler tick failed: HTTPConnectionPool.*Read timed out", "action": "routine", "why": "plex-automation: a Deluge read hit its 45 s timeout while Deluge was busy; the scheduler runs again on its next tick"},
+  {"container": "radarr", "match": "Import failed, path does not exist or is not accessible by Radarr: /data/Downloads/Complete/seedbox/", "action": "routine", "why": "a seedbox download is finished but grab-sync has not pulled it home yet; the arr retries every minute until it lands, and grab-sync has its own failure watch"},
+  {"container": "sonarr", "match": "Import failed, path does not exist or is not accessible by Sonarr: /data/Downloads/Complete/seedbox/", "action": "routine", "why": "a seedbox download is finished but grab-sync has not pulled it home yet; the arr retries every minute until it lands, and grab-sync has its own failure watch"},
+  {"container": "vault", "match": "committer: cycle error: TimeoutExpired: .*'status'", "action": "routine", "why": "git status over the array passed its 120 s timeout while the disks were busy; the next 3-minute cycle commits, and the staleness alarm catches a real stall"}
 ]

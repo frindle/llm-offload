@@ -5,7 +5,6 @@
   "extra": ["~/bin", "~/offload-research", "~/.claude"],
   "runner": "unraid-cpu-1",
   "runner_fresh_s": 90,
-  "api_default": "http://127.0.0.1:7684",
   "claim_timeout_s": 1800,
   "run_timeout_s": 2400,
   "setup_timeout_s": 1500,
