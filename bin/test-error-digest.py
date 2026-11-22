@@ -268,6 +268,15 @@ def test_noise():
             ("reselling-app-1", "[walmart/page:error] Failed to load resource: net::ERR_FAILED"),
             ("arr-webhook", "ERROR [stuck] scheduler tick failed: HTTPConnectionPool(host='h', port=1): Read timed out. (read timeout=45)")]:
         chk("2026-11-20 noise is routine: " + line[:50], ED.noise_action(rules, c, line) == "routine", line)
+    for c, line in [
+            ("radarr", "[Error] DownloadedMovieImportService: Import failed, path does not exist or is not accessible by Radarr: /data/Downloads/Complete/seedbox/Some.Movie.2024.2160p-GRP/"),
+            ("sonarr", "[Error] DownloadedEpisodesImportService: Import failed, path does not exist or is not accessible by Sonarr: /data/Downloads/Complete/seedbox/Show.S01-GRP"),
+            ("vault", "2026-11-22T10:26:04 committer: cycle error: TimeoutExpired: Command '['git', '-c', 'core.filemode=false', '-C', '/vault', 'status', '--porcelain', '-z', '--untracked-files=all']' timed out after 120.0 seconds")]:
+        chk("2026-11-22 noise is routine: " + line[:50], ED.noise_action(rules, c, line) == "routine", line)
+    chk("a missing path outside the seedbox folder still counts",
+        ED.noise_action(rules, "radarr", "Import failed, path does not exist or is not accessible by Radarr: /data/Downloads/Complete/radarr/X") is None)
+    chk("a vault commit or push failure still counts",
+        ED.noise_action(rules, "vault", "committer: cycle error: CalledProcessError: Command '['git', 'commit']' returned non-zero exit status 128") is None)
     chk("a real Ollama failure is not noise", ED.noise_action(rules, "ollama", "level=ERROR msg=\"CUDA error: out of memory\"") is None)
     chk("a scheduler tick failing for another reason is not noise",
         ED.noise_action(rules, "arr-webhook", "ERROR [stuck] scheduler tick failed: KeyError('x')") is None)
