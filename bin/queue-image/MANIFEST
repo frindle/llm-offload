@@ -17,6 +17,7 @@ dashboard_chat.py
 runstatus_retention.py
 queue_upload.py
 docsum_proxy.py   # ollama-queue-api.py's /docsum/* route imports it (missing until 11-17: /docsum answered 503)
+board.py          # ollama-queue-api.py's /board and /api/board* routes import it (the Work Board)
 
 # config layer (new)
 queue_config.py

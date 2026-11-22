@@ -1921,6 +1921,7 @@ FRONTEND_HTML = r"""<!doctype html>
   <h1>Ollama Queue</h1>
   <a href="/chat">Chat &rarr;</a>
   <a href="/docsum/">Docs &rarr;</a>
+  <a href="/board">Board &rarr;</a>
   <span class="spacer"></span>
   <span class="upd" id="updated">loading&hellip;</span>
   <button class="btn" id="clearFinished" title="Remove every done/failed row from the queue state">Clear finished</button>
@@ -8655,6 +8656,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
+    def _board(self, method):
+        """/board (the page) and /api/board*: thin socket wrapper over board.handle (all rules live there). GETs
+        are open like the rest of the dashboard; POSTs reach here only after _require_write_auth."""
+        try:
+            import board
+        except Exception as e:  # noqa: BLE001
+            return self._text("board unavailable: %s" % type(e).__name__, 503)
+        if method == "GET" and self.path.split("?", 1)[0].rstrip("/") == "/board":
+            return self._html(board.PAGE_HTML)
+        try:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > board.MAX_BODY:
+                return self._json({"ok": False, "error": "bad or oversized Content-Length"},
+                                  413 if length > board.MAX_BODY else 400)
+            body = self.rfile.read(length) if length else b""
+            status, obj = board.handle(method, self.path, self.headers, body)
+        except Exception as e:  # noqa: BLE001
+            status, obj = 500, {"ok": False, "error": f"board error: {type(e).__name__}"}
+        return self._json(obj, status)
+
     def _cpu_lane(self, method):
         """/api/cpu/* = the Unraid CPU runner's API. It enforces its OWN bearer token and
         refuses Cloudflare-fronted requests (cpu_lane.handle); everything else on this
@@ -9187,6 +9211,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error_digest()
         if _is_docsum_path(self.path):
             return self._docsum()
+        if _is_board_path(self.path):
+            return self._board("GET")
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("GET")
         if self.path == "/api/cpu-lane":
@@ -9364,6 +9390,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if _is_docsum_path(self.path):
             return self._docsum()
+        if _is_board_path(self.path):
+            return self._board("POST")
         if self.path.startswith("/api/bypass/"):
             return self._plex_bypass()
         if self.path.split("?")[0].rstrip("/") == "/api/cli":
@@ -9888,6 +9916,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def _is_docsum_path(p):
     return p == "/docsum" or p.startswith("/docsum/")
+
+
+def _is_board_path(p):
+    r = (p or "").split("?", 1)[0].rstrip("/")
+    return r in ("/board", "/api/board") or r.startswith("/api/board/")
 
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

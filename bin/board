@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""board: post a lane (one thread of work) to the Work Board on the queue API, or read it.
+  board set LANE [--project P] [--item T] [--status S] [--next T] [--needs T | --no-needs] [--report T|-] [--by NAME]
+  board done LANE [--report T|-] [--by NAME]
+  board ls [--all]          open lanes (needs-you first); --all adds done ones from the last 14 days
+  board log LANE [-n N]
+A field left out keeps its value; --needs "" or --no-needs clears it. --report - reads the report from stdin.
+Status: active, waiting, needs-you, blocked (done comes from `board done`). --by defaults to $BOARD_BY, else the
+cwd's folder name. The page is <queue API>/board. URL and token come from queue_config.queue_api().
+Exit 0 on success, 1 when the API refused or could not be reached (callers may ignore it: the board never blocks work)."""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import queue_config  # noqa: E402
+
+TIMEOUT = 15
+
+
+def call(method, path, payload=None):
+    base, token = queue_config.queue_api()
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers.update({"Content-Type": "application/json", "X-Requested-With": "board"})
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("error")
+        except Exception:  # noqa: BLE001
+            msg = None
+        sys.exit(f"board: HTTP {e.code}: {msg or e.reason}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        sys.exit(f"board: queue API not reachable ({type(e).__name__})")
+
+
+def ago(s):
+    s = max(0, s)
+    return "now" if s < 90 else f"{round(s / 60)}m" if s < 5400 else f"{round(s / 3600)}h" if s < 129600 else f"{round(s / 86400)}d"
+
+
+def show(lanes, now):
+    for l in lanes:
+        print(f"{l['lane']}  [{l.get('status', '')}]  {l.get('project', '')}  ({ago(now - l.get('updated', 0))} ago"
+              + (f", {l['by']}" if l.get("by") else "") + ")")
+        if l.get("needs"):
+            print("  NEEDS YOU: " + l["needs"].replace("\n", "\n    "))
+        for k, label in (("item", "now"), ("next", "next")):
+            if l.get(k):
+                print(f"  {label}: " + l[k].replace("\n", "\n    "))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="board", description="Work Board client")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("set")
+    s.add_argument("lane")
+    s.add_argument("--project")
+    s.add_argument("--item")
+    s.add_argument("--status", choices=("active", "waiting", "needs-you", "blocked"))
+    s.add_argument("--next", dest="next_")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--needs")
+    g.add_argument("--no-needs", action="store_true")
+    s.add_argument("--report")
+    s.add_argument("--by")
+    d = sub.add_parser("done")
+    d.add_argument("lane")
+    d.add_argument("--report")
+    d.add_argument("--by")
+    l = sub.add_parser("ls")
+    l.add_argument("--all", action="store_true")
+    lg = sub.add_parser("log")
+    lg.add_argument("lane")
+    lg.add_argument("-n", type=int, default=20)
+    a = ap.parse_args()
+
+    if a.cmd in ("set", "done"):
+        body = {"lane": a.lane, "by": a.by or os.environ.get("BOARD_BY") or os.path.basename(os.getcwd())}
+        if a.report is not None:
+            body["report"] = sys.stdin.read() if a.report == "-" else a.report
+        if a.cmd == "set":
+            for k, v in (("project", a.project), ("item", a.item), ("status", a.status), ("next", a.next_),
+                         ("needs", a.needs)):
+                if v is not None:
+                    body[k] = v
+            if a.no_needs:
+                body["needs"] = ""
+        r = call("POST", "/api/board/" + a.cmd, body)
+        print(f"board: {a.lane} {r['lane'].get('status')}" + (f" (changed: {', '.join(r.get('changed') or [])})"
+                                                              if r.get("changed") else " (no change)"))
+    elif a.cmd == "ls":
+        r = call("GET", "/api/board")
+        lanes = [x for x in r.get("lanes", []) if a.all or x.get("status") != "done"]
+        show(lanes, r.get("now", time.time())) if lanes else print("no open lanes")
+    else:
+        r = call("GET", "/api/board/log?" + urllib.parse.urlencode({"lane": a.lane, "limit": a.n}))
+        now = time.time()
+        for e in r.get("log", []):
+            ch = {k: ("(cleared)" if v == "" else v) for k, v in (e.get("changes") or {}).items() if k != "report"}
+            extra = "; report updated" if "report" in (e.get("changes") or {}) else ""
+            print(f"{ago(now - e.get('ts', 0))} ago {e.get('by', '')}: "
+                  + ("; ".join(f"{k}: {v}" for k, v in ch.items()) or "touched") + extra)
+
+
+if __name__ == "__main__":
+    main()

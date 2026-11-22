@@ -24,6 +24,13 @@ esac
 docker inspect "$NAME" >/dev/null 2>&1 || { echo "no container named $NAME"; exit 1; }
 IMG=$(docker inspect -f '{{.Config.Image}}' "$NAME")
 OLD=$(docker inspect -f '{{.Image}}' "$NAME")
+# A compose install follows its .env (QUEUE_IMAGE): pull what compose would run, not the tag the container was
+# made from, or a tag changed in .env never takes effect.
+CDIR=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$NAME")
+if [ -n "$CDIR" ] && [ -f "$CDIR/docker-compose.yml" ]; then
+  CIMG=$(cd "$CDIR" && { docker compose config --images 2>/dev/null || docker-compose config --images 2>/dev/null; } | grep -m1 'llm-offload-queue' || true)
+  [ -n "$CIMG" ] && [ "$CIMG" != "$IMG" ] && { echo "=== compose .env names $CIMG (container was made from $IMG) ==="; IMG=$CIMG; }
+fi
 case "$IMG" in
   *:pre-*|*@sha256:*) echo "note: $NAME is pinned to one build ($IMG). Set the tag to :standby in its template to follow new builds.";;
 esac
