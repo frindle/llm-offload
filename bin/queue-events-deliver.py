@@ -269,6 +269,15 @@ def review_hint(e):
     return None
 
 
+ROUTINE_LABEL = re.compile(r"^(lane-bakeoff-judge|bakeoff-|bo-|error-digest)")
+
+
+def routine_done(e, cls):
+    """A plain 'done' with no launcher from a bake-off/digest job: noise, collapsed to one count line per delivery.
+    Never true for passed, failed, needs-review, needs_info or any other state."""
+    return cls == "unstamped" and e.get("state") == "done" and bool(ROUTINE_LABEL.match(str(e.get("label") or "")))
+
+
 def fmt(e, cls):
     tag = {"yours": "yours", "unstamped": "no launcher", "orphan": "launcher gone"}[cls]
     extra = " ".join(f"{k}={e[k]}" for k in ("verdict", "reason") if e.get(k))
@@ -339,6 +348,7 @@ def deliver(events, sid, me, bridge):
         known = [c for c in (s, k) if c is not None]
         base = max(known) if known else g
         lines, shown, alive, top, gtop, seen = [], set(), {}, base, g, set()
+        routine = {}
         for e in sorted(events, key=lambda x: x["seq"]):
             n = e["seq"]
             if n <= base or (n, e.get("id"), e["state"]) in seen:
@@ -354,8 +364,15 @@ def deliver(events, sid, me, bridge):
                 gtop = max(gtop, n)
                 if cls == "orphan" and n <= owner_cursor(e):
                     continue           # its launcher already got it before it exited
+            if routine_done(e, cls):
+                k2 = re.sub(r"[-_0-9a-f]{6,}$", "", str(e.get("label") or "?")) or "?"
+                routine[k2] = routine.get(k2, 0) + 1
+                continue
             lines.append(fmt(e, cls))
             shown.add(e.get("id"))
+        if routine:
+            lines.append(f"{sum(routine.values())} routine done (no launcher): "
+                         + ", ".join(f"{k2} x{v}" for k2, v in sorted(routine.items())))
         if spath and (s is None or top > s):
             wr(spath, str(top))
         if kpath and (k is None or top > k):

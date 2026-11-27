@@ -220,7 +220,7 @@ def main():
     e.run()
     check("running job: nothing written", not e.gh_writes())
     e = Env()
-    e.config({"repos": {}})
+    e.config({"repos": {}, "owner_repos": False})
     e.issues([issue(71)])
     e.run()
     check("repo not in allow-list: untouched", not e.calls("gh.calls") and not e.calls("auto.calls"))

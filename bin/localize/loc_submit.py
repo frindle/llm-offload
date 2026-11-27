@@ -38,6 +38,14 @@ RUN_TIMEOUT = 6000
 LOCK = threading.Lock()
 
 
+
+def _queue_api():
+    """CPU_RUNNER_API override, else the configured queue API (never a hard-coded loopback)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import queue_config
+    return os.environ.get("CPU_RUNNER_API") or queue_config.queue_api()[0]
+
+
 def cpu_job_lib():
     spec = importlib.util.spec_from_file_location("cpu_job", Path.home() / "bin" / "cpu_job.py")
     m = importlib.util.module_from_spec(spec)
@@ -98,7 +106,7 @@ def submit(task, mode, arms, qmax, label_extra=""):
         env={"DISPATCH_LOC_ARMS": " ".join(arms), "DISPATCH_LOC_TASK": task, "DISPATCH_LOC_TOPK": "50"},
         setup={"cmd": 'bash "$JOB_TOOLS/loc_job.sh" setup', "timeout_s": SETUP_TIMEOUT},
         artifacts=True, artifacts_dest=str(dest), on_log=lambda b: (logf.write(b), logf.flush()),
-        fallback=False, claim_timeout_s=14400, api=os.environ.get("CPU_RUNNER_API") or "http://127.0.0.1:7684")
+        fallback=False, claim_timeout_s=14400, api=_queue_api())
     logf.close()
     rec = {"ts": time.strftime("%FT%T"), "task": task, "mode": mode, "arms": arms, "query_chars": len(q),
            "issue_chars": full, "exit_code": res.exit_code, "timed_out": res.timed_out,
@@ -136,7 +144,7 @@ def collect(task, job_prefix, qmax):
     ids = [r[0] for r in db.execute("select id from jobs where id like ?", (job_prefix + "%",))]
     if len(ids) != 1:
         raise SystemExit(f"{task}: job prefix {job_prefix!r} matches {len(ids)} jobs")
-    lib, api = cpu_job_lib(), os.environ.get("CPU_RUNNER_API") or "http://127.0.0.1:7684"
+    lib, api = cpu_job_lib(), _queue_api()
     tok = lib._token()
     code, st = lib._http(api, tok, "GET", "/api/cpu/jobs/%s" % ids[0])
     res = (st or {}).get("result") or {}

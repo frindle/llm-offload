@@ -145,7 +145,13 @@ def main():
     rows = [{"id": "r1", "label": "fix-a", "verdict": "pass", "status": "done", "timestamp": "2026-11-12T03:00:00"},
             {"id": "r2", "label": "fix-b", "verdict": "fail", "status": "done", "timestamp": "2026-11-12T02:00:00"},
             {"id": "r3", "label": "other", "verdict": "pass", "status": "done", "timestamp": "2026-11-12T01:00:00"}]
-    api.q._iter_job_results = lambda log_dir=None: [dict(r) for r in rows]
+    # the endpoint scans the log dir for sidecar ids (bounded, memoized) and loads each through q._load_job_result: fake both
+    _rl = tmp / "results-logs"
+    _rl.mkdir()
+    for _r in rows:
+        (_rl / (_r["id"] + ".done.json")).write_text("{}")
+    api.q.LOG_DIR = _rl
+    api.q._load_job_result = lambda jid, log_dir=None: next((dict(r) for r in rows if r["id"] == jid), None)
     check("no token / LAN peer: results -> 403", call(lan, "GET", "/api/results")[0], 403)
     check("no token / loopback: results -> 200", call(lo, "GET", "/api/results")[0], 200)
     check("no token / loopback + Cf header: results refused", call(lo, "GET", "/api/results", headers={"Cf-Ray": "x"})[0], 403)

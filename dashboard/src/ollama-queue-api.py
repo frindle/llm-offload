@@ -7926,6 +7926,39 @@ try:
 except ValueError:
     MAX_INFLIGHT_CPU_LLM = 12
 _CPU_LLM_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_CPU_LLM)
+# Read starvation (2026-11): slow scans (/api/results over thousands of sidecars, digests, handoff) held general
+# slots for a minute while cheap reads (/api/state, /api/triage, /api/hosts) were refused with 503. Slow paths now
+# draw from a small pool of their own, and when the general pool is full a request falls back to a reserve pool, so
+# a pile-up of slow reads can never push the cheap ones out.
+try:
+    MAX_INFLIGHT_HEAVY = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT_HEAVY", "6")))
+    MAX_INFLIGHT_RESERVE = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT_RESERVE", "8")))
+except ValueError:
+    MAX_INFLIGHT_HEAVY, MAX_INFLIGHT_RESERVE = 6, 8
+_HEAVY_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_HEAVY)
+_RESERVE_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_RESERVE)
+_HEAVY_PATHS = ("/api/results", "/api/error-digest", "/api/handoff", "/api/log-retention")
+
+
+def _is_heavy_path(path):
+    base = path.split("?", 1)[0].rstrip("/")
+    return base in _HEAVY_PATHS
+
+
+def _pick_slot(path):
+    """The semaphore this request holds (already acquired), or None when every pool it may use is full."""
+    if _CPU_LLM_PATH.match(path):
+        pools = (_CPU_LLM_SLOTS,)
+    elif path.startswith("/api/cpu/"):
+        pools = (_CPU_SLOTS,)
+    elif _is_heavy_path(path):
+        pools = (_HEAVY_SLOTS,)
+    else:
+        pools = (_API_SLOTS, _RESERVE_SLOTS)
+    for pool in pools:
+        if pool.acquire(blocking=False):
+            return pool
+    return None
 _CPU_LLM_PATH = re.compile(r"^/api/cpu/jobs/[0-9a-f]{32}/llm/")
 
 
@@ -8493,6 +8526,77 @@ def _gpu_hold_now(lane=GPU_HOLD_DEFAULT_LANE):
     return 200, held
 
 
+# ---- /api/results: bounded, memoized scan ---------------------------------------------------------------------------
+# q._iter_job_results() parses every done/gate sidecar (and stats the diff) on every call: with a log dir of tens of
+# thousands of files that is minutes of work per request. Here the directory is listed once, ids are ordered by their
+# sidecars' mtime (newest first), and each id's record is memoized by that mtime signature, so a repeat call only
+# parses what changed and a limited call only parses ~limit records.
+_RESULT_MEMO = {}
+_RESULT_MEMO_MAX = 20000
+
+
+def _result_candidates(ld):
+    """[(newest sidecar mtime_ns, id, signature)] for every id with a done/gate sidecar, newest first."""
+    seen = {}
+    try:
+        with os.scandir(ld) as it:
+            for e in it:
+                n = e.name
+                if n.endswith(".done.json"):
+                    jid = n[:-10]
+                elif n.endswith(".gate.json"):
+                    jid = n[:-10]
+                elif n.endswith(".log"):
+                    # pre-sidecar research/diagnosis jobs: the label in the filename says so (same test as the CLI)
+                    mo = re.match(r"([0-9a-f]{6,})-(.+)\.log$", n)
+                    if not mo or mo.group(2).startswith(("gate-", "regate-")) or not q.LABEL_RESEARCH_RE.search(mo.group(2)):
+                        continue
+                    jid = mo.group(1)
+                else:
+                    continue
+                try:
+                    m = e.stat().st_mtime_ns
+                except OSError:
+                    continue
+                cur = seen.get(jid, (0, ()))
+                seen[jid] = (max(cur[0], m), cur[1] + ((n, m),))
+    except OSError:
+        return []
+    out = [(m, jid, sig) for jid, (m, sig) in seen.items()]
+    out.sort(reverse=True)
+    return out
+
+
+def _results_bounded(verdict=None, label=None, limit=0, log_dir=None):
+    ld = Path(log_dir) if log_dir else q.LOG_DIR
+    cands = _result_candidates(ld)
+    # without a verdict/label filter only the newest `limit` (plus slack for gate-/regate- rows, which are skipped)
+    # records are ever returned, so only those are parsed
+    budget = (limit * 2 + 25) if (limit and limit > 0 and not verdict and not label) else None
+    out = []
+    parsed = 0
+    for _m, jid, sig in cands:
+        if budget is not None and parsed >= budget:
+            break
+        hit = _RESULT_MEMO.get((str(ld), jid))
+        if hit and hit[0] == sig:
+            r = hit[1]
+        else:
+            try:
+                r = q._load_job_result(jid, ld)
+            except Exception:  # noqa: BLE001 -- one unreadable sidecar must not fail the listing
+                r = None
+            if len(_RESULT_MEMO) >= _RESULT_MEMO_MAX:
+                _RESULT_MEMO.clear()
+            _RESULT_MEMO[(str(ld), jid)] = (sig, r)
+        parsed += 1
+        if r is None or str(r.get("label") or "").startswith(("gate-", "regate-")):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
+    return q._filter_results(out, verdict, label, limit)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     _slot = None
 
@@ -8501,11 +8605,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         do_* handler: take a slot from the right pool or refuse with 503 + Retry-After."""
         if not super().parse_request():
             return False
-        if _CPU_LLM_PATH.match(self.path):
-            pool = _CPU_LLM_SLOTS
-        else:
-            pool = _CPU_SLOTS if self.path.startswith("/api/cpu/") else _API_SLOTS
-        if not pool.acquire(blocking=False):
+        pool = _pick_slot(self.path)
+        if pool is None:
             body = b"server busy, retry shortly"
             self.send_response(503)
             self.send_header("Content-Type", "text/plain")
@@ -8830,8 +8931,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             limit = int((qs.get("limit") or ["0"])[0])
         except ValueError:
             return self._text("limit must be a number", 400)
-        rows = q._filter_results(q._iter_job_results(), (qs.get("verdict") or [None])[0],
-                                 (qs.get("label") or [None])[0], limit)
+        verdict, label = (qs.get("verdict") or [None])[0], (qs.get("label") or [None])[0]
+        rows = _cached_response("results:" + json.dumps([verdict, label, limit]),
+                                lambda: _results_bounded(verdict, label, limit), ttl=15, stale=300)
         self._json({"results": rows})
 
     def _error_digest(self):
@@ -9712,7 +9814,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(_res if isinstance(_res, dict) else {"stopped": job_id})
             # explicit=True: DELETE /api/jobs/<id> is the dashboard's "remove" button,
             # an operator action -- see cancel_job() for why a terminal row may go.
-            self._json(q.cancel_job(job_id, explicit=True))
+            self._json(q.cancel_job(job_id, explicit=True, cause="api:delete"))
         except q.QueueActionError as e:
             self._text(str(e), 400)
         except Exception as e:

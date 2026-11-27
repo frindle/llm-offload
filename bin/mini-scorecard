@@ -150,9 +150,64 @@ SOFT_HINT = {"fix_hunks": "a code hunk no test needs (dead or unrelated code, or
              "literals": "a literal the task requires is missing", "lint": "new lint findings in the changed files"}
 
 
+def _api_jobs(cut, seen, ex):
+    """Outcomes from the queue's HTTP API (/api/results) when the queue is remote: this machine's QLOGS is empty then
+    (2026-11: pass and reject rates were unmeasurable). [] when the API is unreachable."""
+    import urllib.request
+    base, _tok = queue_config.queue_api()
+    try:
+        req = urllib.request.Request(base + "/api/results?limit=2000", headers=queue_config.queue_api_headers())
+        data = json.loads(urllib.request.urlopen(req, timeout=20).read())
+    except Exception:
+        return []
+    rows = data.get("results") if isinstance(data, dict) else data
+    out = []
+    for d in rows if isinstance(rows, list) else []:
+        if not isinstance(d, dict) or d.get("id") in seen or d.get("id") in ex:
+            continue
+        if "mini-swe-runner" not in str(d.get("runner") or ""):
+            continue
+        t = parse_ts(d.get("timestamp")) or 0
+        if t < cut:
+            continue
+        nr = bool(d.get("needs_review"))
+        ok = d.get("status") == "done" and not d.get("terminal_reason")
+        out.append({"asks": 0, "id": d.get("id"), "label": d.get("label"), "family": family_of(d), "ok": ok, "nr": nr and ok,
+                    "active_s": 0.0, "t": t, "task_file": None, "failed": d.get("status") == "failed"})
+    return out
+
+
+def _event_jobs(cut, seen, ex):
+    """Outcomes from queue-events.jsonl (+ .1) for mini-swe jobs: passed / needs-review / failed events."""
+    out = {}
+    for fn in ("queue-events.jsonl.1", "queue-events.jsonl"):
+        for e in read_jsonl(HOME / fn):
+            if not isinstance(e, dict) or e.get("id") in seen or e.get("id") in ex:
+                continue
+            if "mini-swe-runner" not in str(e.get("runner") or ""):
+                continue
+            st = e.get("state")
+            if st not in ("passed", "needs-review", "failed"):
+                continue
+            try:
+                t = datetime.strptime(str(e.get("ts")), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+            except ValueError:
+                t = 0
+            if t < cut:
+                continue
+            out[e["id"]] = {"asks": 0, "id": e["id"], "label": e.get("label"), "family": family_of(e),
+                            "ok": st != "failed", "nr": st == "needs-review", "active_s": 0.0, "t": t,
+                            "task_file": None, "failed": st == "failed"}
+    return list(out.values())
+
+
 def load_jobs(days):
     """mini-swe jobs finished in the window: [{id,label,family,ok,nr,active_s,t}] (ok includes needs-review passes)"""
     cut, out, ex = now() - days * 86400, [], exclusions()
+    return _load_jobs_local(days, cut, out, ex)
+
+
+def _load_jobs_local(days, cut, out, ex):
     for f in glob.glob(str(QLOGS / "*.done.json")):
         try:
             d = json.load(open(f))
@@ -171,6 +226,11 @@ def load_jobs(days):
         out.append({"asks": int(d.get("needs_info_asks") or 0), "id": d.get("id"), "label": d.get("label"), "family": family_of(d), "ok": ok, "nr": nr, "active_s": float(d.get("active_s") or 0), "t": t,
                     "task_file": d.get("task_file"),
                     "failed": d.get("status") == "failed" or (d.get("runner_verdict") not in (None, "PASS") and not nr)})
+    seen = {j["id"] for j in out}
+    if queue_config.queue_is_remote() or not out:
+        extra = _api_jobs(cut, seen, ex)
+        seen |= {j["id"] for j in extra}
+        out += extra + _event_jobs(cut, seen, ex)
     return sorted(out, key=lambda j: j["t"])
 
 

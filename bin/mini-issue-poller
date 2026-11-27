@@ -19,8 +19,12 @@ Rules (all enforced here):
   * the must-not-offload gate (mini-submit C3) still runs inside mini-auto; a refusal is reported as "failed";
   * GitHub only ever sees: the labels local-queued / local-review / local-failed and the comments "queued",
     "passed checks, awaiting review", "failed". No logs, paths, hostnames, model output or run dirs, ever;
-  * after a pass the poller STOPS at "passed checks, awaiting review". open_draft_pr() below is the later step (after a
-    review verdict); it is deliberately NOT called.
+  * after a pass the poller says "passed checks, awaiting review" and calls open_draft_pr(): a DRAFT pull request whose
+    body says it awaits review (the PR review is the review; nothing is merged here). A failure there is logged, never
+    fatal, and not retried;
+  * repos: every repo owned by the configured owner is allowed (not only the config's "repos"; those entries give a
+    checkout and base). An owner repo with no entry uses <checkout_root>/<name> (default ~/dispatch-repos) and is skipped
+    when that checkout is absent. The label, owner-author and daily-cap gates apply to all of them.
 
 State: ~/.ollama-dispatch/issue-poller/  (config.json, state.json, lock, poller.log). Config example:
   {"owner": "frindle", "label": "local-fix", "daily_cap": 5,
@@ -42,7 +46,9 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -183,6 +189,29 @@ def set_status(repo, n, word, label):
 
 
 # ------------------------------------------------------------------------------------------------ selection
+def owner_repos(cfg):
+    """{repo: {checkout, base}}: the configured entries, plus every non-archived repo of the owner that has a local
+    checkout under checkout_root. Only repos under the configured owner are ever used."""
+    owner = str(cfg["owner"])
+    out = {r: rc for r, rc in cfg["repos"].items() if r.split("/")[0].lower() == owner.lower()}
+    if not cfg.get("owner_repos", True):
+        return out
+    root = Path(str(cfg.get("checkout_root") or "~/dispatch-repos")).expanduser()
+    try:
+        p = gh("repo", "list", owner, "--no-archived", "--limit", "200", "--json", "nameWithOwner", check=False)
+        found = json.loads(p.stdout or "[]") if not p.returncode else []
+    except Exception:
+        found = []
+    for r in found if isinstance(found, list) else []:
+        nm = (r or {}).get("nameWithOwner") or ""
+        if not nm.lower().startswith(owner.lower() + "/") or nm in out:
+            continue
+        co = root / nm.split("/", 1)[1]
+        if (co / ".git").exists():
+            out[nm] = {"checkout": str(co), "base": "origin/main"}
+    return out
+
+
 def eligible(issue, cfg, st, repo):
     """(ok, why-not). Owner-authored, labelled, not already queued/tracked."""
     n = issue.get("number")
@@ -295,16 +324,68 @@ def report_finished(st, dry):
         rec["status"] = out
         rec["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         save_state(st)
-        # After a review verdict of ok (a later, separate step), a draft PR may be opened:
-        #   open_draft_pr(repo, n, rec)       <- intentionally NOT wired in
+        if out == "passed" and not rec.get("pr"):
+            rec["pr"] = "tried"            # once only: a failure is logged, not retried every tick
+            save_state(st)
+            try:
+                if open_draft_pr(repo, n, rec):
+                    rec["pr"] = "opened"
+            except Exception as e:
+                log(f"{key}: draft PR failed ({type(e).__name__}: {str(e)[:120]})")
+            save_state(st)
 
 
-def open_draft_pr(repo, n, rec):
-    """LATER, NOT WIRED IN. After `mini-auto review JOB ok` (the owner's or the review lane's verdict): push a branch whose
-    name is only issue-<n> (no job id, no paths) from the private checkout and run
-      gh pr create --draft -R <repo> --head issue-<n> --title "Fix for issue #<n>" --body "Fixes #<n>. Awaiting review."
-    The title and body carry no model output, logs, hostnames or run dirs. Must refuse unless the job's review verdict is ok."""
-    raise NotImplementedError("draft PRs come after a review verdict; not wired into the poller")
+PR_BODY = "Fixes #{n}. Awaiting review."
+
+
+def open_draft_pr(repo, n, rec, checkout=None):
+    """After "passed checks": land the job's files into a throwaway worktree of the private checkout, commit, push a
+    branch named only issue-<n> (no job id, no paths) and open a DRAFT PR titled "Fix for issue #<n>" whose body says it
+    awaits review. Title and body carry no model output, logs, hostnames or run dirs. Returns True when the PR was opened."""
+    rc = checkout or load_config().get("repos", {}).get(repo) or owner_repos(load_config()).get(repo)
+    if not rc:
+        log(f"{repo}#{n}: no checkout for a draft PR")
+        return False
+    co = str(Path(rc["checkout"]).expanduser())
+    branch = f"issue-{int(n)}"
+    wt = Path(tempfile.mkdtemp(prefix="poller-pr-"))
+    def git(*a, check=True):
+        p = subprocess.run(["git", "-C", co, *a], capture_output=True, text=True, timeout=300)
+        if check and p.returncode:
+            raise RuntimeError(f"git {a[0]} rc={p.returncode}")
+        return p
+    try:
+        # Branch from the commit the job started from: whole files are copied over, so any other base could revert
+        # upstream changes. A base that is not in the checkout aborts (no fallback to a stale origin/main).
+        bp = subprocess.run([*MINI_AUTO, "base", rec["job"]], capture_output=True, text=True, timeout=120)
+        base = (bp.stdout or "").strip().splitlines()[-1] if bp.returncode == 0 and (bp.stdout or "").strip() else ""
+        if not re.fullmatch(r"[0-9a-f]{7,40}", base) or git("cat-file", "-e", base + "^{commit}", check=False).returncode:
+            raise RuntimeError("job base commit unknown")
+        git("worktree", "add", "-b", branch, str(wt / "w"), base)
+        p = subprocess.run([*MINI_AUTO, "land", rec["job"], "--into", str(wt / "w"), "--assume-ok"],
+                           capture_output=True, text=True, timeout=300,
+                           env={**os.environ, "MINI_AUTO_ASSUME_OK": "poller-draft-pr"})
+        if p.returncode:
+            raise RuntimeError(f"land rc={p.returncode}")
+        w = ["git", "-C", str(wt / "w")]
+        subprocess.run([*w, "add", "-A"], check=True, capture_output=True, timeout=120)
+        if subprocess.run([*w, "diff", "--cached", "--quiet"], timeout=120).returncode == 0:
+            raise RuntimeError("land produced no changes")
+        subprocess.run([*w, "commit", "-q", "-m", f"Fix for issue #{int(n)}"], check=True, capture_output=True, timeout=120)
+        # Model output headed for a possibly public repo: no push when the private-info scan flags anything.
+        scan = (os.environ.get("POLLER_SCAN") or str(HERE / "queue-image" / "scan-private-info.py")).split()
+        sp = subprocess.run([sys.executable, *scan, "--diff", f"{base}..HEAD"], cwd=str(wt / "w"),
+                            capture_output=True, text=True, timeout=300)
+        if sp.returncode:
+            raise RuntimeError(f"private-info scan blocked the push (rc={sp.returncode})")
+        subprocess.run([*w, "push", "-q", "-u", "origin", branch], check=True, capture_output=True, timeout=300)
+        gh("pr", "create", "--draft", "-R", repo, "--head", branch, "--title", f"Fix for issue #{int(n)}",
+           "--body", PR_BODY.format(n=int(n)))
+        log(f"{repo}#{n}: draft PR opened")
+        return True
+    finally:
+        git("worktree", "remove", "--force", str(wt / "w"), check=False)
+        shutil.rmtree(wt, ignore_errors=True)
 
 
 # ------------------------------------------------------------------------------------------------ tick
@@ -321,7 +402,7 @@ def tick(dry=False):
         summary["waited"] = True
         return summary
 
-    for repo, rc in sorted(cfg["repos"].items()):
+    for repo, rc in sorted(owner_repos(cfg).items()):
         try:
             issues = list_issues(repo, cfg["label"])
         except Exception as e:

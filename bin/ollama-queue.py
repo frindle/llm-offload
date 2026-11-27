@@ -1780,6 +1780,111 @@ def focus_release_log_step(state, pre_release, active, why):
             f"{why}; lanes to {active}"), True
 
 
+BUNDLE_STATE_KEYS = ("_bundle_next", "_fairshare", "_bundle_fail_streak", "_bundle_flaps")
+BUNDLE_STATE_MAX_AGE_S = 3 * 86400
+BUNDLE_STATE_PRUNE_EVERY_S = 3600
+_BUNDLE_PRUNE_AT = [0.0]        # 0 = never run: the first tick after a daemon start prunes
+
+
+def prune_stale_bundle_state(state, now=None, max_age_s=BUNDLE_STATE_MAX_AGE_S):
+    """Drop the per-bundle entries (_bundle_next, _fairshare, _bundle_fail_streak, _bundle_flaps) of bundles that
+    have no live job and were not touched for `max_age_s` (default 3 days). Those dicts only ever grew: a live
+    state carried 1235 _bundle_next keys back to 10-09. "Touched" = the newest of the entry's own stamp
+    (_bundle_next.at, _fairshare.t, the newest flap time) and the newest timestamp on any job row of the bundle;
+    an entry with neither is stamped now in state["_bundle_touched"] and ages from there. Bundles that hold the lanes
+    (commit, focus, override, pinned, parked) are never dropped. Returns how many entries were removed. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        jobs = state.get("jobs") or []
+        pk = _plan_key_map(jobs)
+        live, last = set(), {}
+        for j in jobs:
+            try:
+                k = pk(j)
+            except Exception:
+                continue
+            if k is None:
+                continue
+            if j.get("status") in _LIVE_ROW_STATES:
+                live.add(k)
+            for f in ("launched_at", "finished_at", "enqueued_at", "persisted_at"):
+                t = _parse_iso_ts(j.get(f))
+                if t is not None and t > last.get(k, 0.0):
+                    last[k] = t
+        protect = set(live)
+        for j in jobs:
+            if j.get("status") in (PLANNED_STATUS, ESCALATION_STATUS):
+                try:
+                    k = pk(j)
+                except Exception:
+                    k = None
+                if k is not None:
+                    protect.add(k)
+        for name in ("_bundle_commit", "_focus_wait", "_focus_override"):
+            rec = state.get(name)
+            if isinstance(rec, dict) and rec.get("key"):
+                protect.add(rec["key"])
+        if state.get("pinned_group") is not None:
+            protect.add(state["pinned_group"])
+        parked = state.get("_bundle_parked")
+        if isinstance(parked, dict):
+            protect.update(parked)
+        keys = set()
+        for name in BUNDLE_STATE_KEYS:
+            d = state.get(name)
+            if isinstance(d, dict):
+                keys.update(d)
+        touched = state.get("_bundle_touched")
+        if not isinstance(touched, dict):
+            touched = state["_bundle_touched"] = {}
+        stamp = dict(last)
+        nx, fs, fl = (state.get(n) if isinstance(state.get(n), dict) else {}
+                      for n in ("_bundle_next", "_fairshare", "_bundle_flaps"))
+        for k in keys:
+            cand = []
+            e = nx.get(k)
+            if isinstance(e, dict) and isinstance(e.get("at"), (int, float)):
+                cand.append(float(e["at"]))
+            e = fs.get(k)
+            if isinstance(e, dict) and isinstance(e.get("t"), (int, float)):
+                cand.append(float(e["t"]))
+            e = fl.get(k)
+            if isinstance(e, list) and e:
+                cand.extend(float(t) for t in e if isinstance(t, (int, float)))
+            if cand:
+                stamp[k] = max(stamp.get(k, 0.0), max(cand))
+            if k not in stamp:
+                stamp[k] = float(touched.setdefault(k, now))   # nothing dates it: age from first sight
+        dead = [k for k in keys if k not in protect and now - stamp.get(k, now) > max_age_s]
+        removed = 0
+        for name in BUNDLE_STATE_KEYS:
+            d = state.get(name)
+            if isinstance(d, dict):
+                for k in dead:
+                    if k in d:
+                        del d[k]
+                        removed += 1
+        for k in list(touched):
+            if k in dead or k not in keys:
+                del touched[k]
+        return removed
+    except Exception as e:  # noqa: BLE001
+        _degraded_note("prune_stale_bundle_state", e)
+        return 0
+
+
+def maybe_prune_bundle_state(state, now=None, force=False):
+    """Hourly (and on the first tick of a daemon) prune; logs the count. Returns removed (0 when not due)."""
+    now = time.time() if now is None else now
+    if not force and now - _BUNDLE_PRUNE_AT[0] < BUNDLE_STATE_PRUNE_EVERY_S:
+        return 0
+    _BUNDLE_PRUNE_AT[0] = now
+    n = prune_stale_bundle_state(state, now)
+    print(f"[queue] bundle-state prune: dropped {n} stale per-bundle entries "
+          f"(no live job, untouched > {BUNDLE_STATE_MAX_AGE_S // 86400}d)")
+    return n
+
+
 def update_bundle_fail_streaks(jobs, streaks, pk, verdict=None, now=None):
     """Fold newly-terminal WORK jobs into `streaks` ({bundle: consecutive non-PASS
     count}) per the rules above, stamping `_streak_counted` so a job counts once. A
@@ -4718,7 +4823,28 @@ def _gate_firing_this_tick_hold(job, gated_jobs):
     unaffected, so no in-flight work is stranded."""
     if not gated_jobs:
         return False
+    # 2026-11 audit: ~19k pointless "HELD ... gate is being enqueued" lines, then "gate SKIPPED ... no code diff" 1467
+    # times. Only a finished job that WILL be gated holds the others; one with no code diff (research / --runner /
+    # image / draft / gate output / chain step) never gets a gate row, so there is no barrier to wait for.
+    if not any(_gate_will_enqueue(g) for g in gated_jobs):
+        return False
     return _is_fresh_authoring_job(job)
+
+
+def _gate_will_enqueue(job):
+    """PURE. True when _fire_gate_on_complete will enqueue a code gate for this finished job (so a barrier is coming).
+    Mirrors that function's skips (a gate/regate/secondop row always counts: it can escalate); any doubt answers True (hold, the old behaviour)."""
+    try:
+        lbl = str(job.get("label", ""))
+        if lbl.startswith(("gate-", "regate-", "secondop-")):
+            return True       # a finished gate can escalate to a regate row: keep the barrier
+        if str(job.get("model", "")).lower() == "image" or lbl.startswith(("pet-", "draft-")):
+            return False
+        if not _should_gate_job(job) or _is_ungateable_job(job):
+            return False
+    except Exception:
+        return True
+    return True
 
 
 def _pinned_lane_of(job):
@@ -8933,6 +9059,35 @@ def cmd_ttc(args):
 # ===================== END PROGRESS CONTINUATION / N-SAMPLE ===================
 
 
+_TERMINAL_FAILED_STATUSES = ("failed", "done_unconverged", "blocked", "error")
+
+
+def _ensure_terminal_fields(job):
+    """Every terminal record says WHY (2026-11 audit: failure_class, terminal_reason, models_tried were null on every
+    done.json, so nobody could see why things bounced). Fills what the worker/classifier did not: a cancelled job
+    gets terminal_reason=cancelled, failure_class=operator and a cancel_cause; a failed one is classified from its
+    log, then falls back to 'unclassified'/'unknown'. Never overwrites a value already set. Never raises."""
+    try:
+        st = job.get("status")
+        if st == "cancelled":
+            job["terminal_reason"] = job.get("terminal_reason") or "cancelled"
+            job["failure_class"] = job.get("failure_class") or "operator"
+            job["cancel_cause"] = job.get("cancel_cause") or "unspecified"
+        elif st in _TERMINAL_FAILED_STATUSES:
+            if not job.get("terminal_reason"):
+                job["terminal_reason"] = _parse_terminal_reason(job.get("log_path")) or "unknown"
+            if not job.get("failure_class"):
+                _stamp_failure_class(job)
+            job["failure_class"] = job.get("failure_class") or "unclassified"
+            if job.get("terminal_reason") in ("cancelled", "force_stopped") and not job.get("cancel_cause"):
+                job["cancel_cause"] = "unspecified"
+        if "models_tried" in job and not job.get("models_tried") and job.get("model") and st in (
+                "done", "failed", "cancelled", "done_unconverged", "blocked"):
+            job["models_tried"] = [job["model"]]
+    except Exception as e:  # noqa: BLE001
+        _degraded_note("_ensure_terminal_fields", e)
+
+
 def _persist_job_completion(job):
     """Freeze the terminal job facts the advisory gate needs into a per-job
     sidecar that SURVIVES pruning.
@@ -8952,6 +9107,7 @@ def _persist_job_completion(job):
     leaves the dispatch untouched -- the gate simply abstains as it did before."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_terminal_fields(job)
         rec = {k: job.get(k) for k in (
             "id", "label", BUNDLE_FIELD, "model", "cwd", "verify", "status", "exit_code",
             # the round this one continues (2026-10-05): the job ladder's clear-on-pass
@@ -8973,7 +9129,7 @@ def _persist_job_completion(job):
             # pruned handoff sidecar so a ctx/scaffold defect stays legible after
             # the live row is gone. failure_class/_detail (2026-09-22) is the
             # who-is-at-fault axis beside it -- see classify_failure.
-            "terminal_reason", "failure_class", "failure_detail",
+            "terminal_reason", "failure_class", "failure_detail", "cancel_cause",
             # TTC audit (2026-10-09): continuation rounds + N-sample group, and the GPU seconds
             # the per-task cap's median is computed from
             "runner_verdict", "needs_review", "needs_review_gates", "continuations", "nsample", "nsample_of", "nsample_group", "active_s", "thinking_arm")}
@@ -10111,6 +10267,7 @@ def _auto_resume_decide(job, ceiling, looping):
     self-testable. Returns one of:
       ("skip",  reason)                 -- not eligible / nothing to do; do not touch.
       ("park",  message)                -- give up: force status='paused', log message.
+      ("fail_ctx", message, reason)     -- at the host's safe ceiling: terminal, status='failed', class=context.
       ("bump_ctx",  new_ctx,  message)  -- double num_ctx and re-queue.
       ("bump_iters", new_iters, message)-- add iterations and re-queue.
     `ceiling` is the lane's safe num_ctx ceiling (None if unknown); `looping` is the
@@ -10127,9 +10284,11 @@ def _auto_resume_decide(job, ceiling, looping):
         return ("skip", "no resumable pause_reason")
     bumps = job.get("auto_resume_count", 0)
     lbl = job.get("label")
+    # A park is sticky, whatever parked it (bump cap, looping transcript, unknown ceiling): logged once,
+    # and an operator `resume` (which clears this flag) is not undone on the next tick.
+    if job.get("_auto_resume_gaveup_logged"):
+        return ("skip", "already gave up")
     if bumps >= AUTO_RESUME_MAX_BUMPS:
-        if job.get("_auto_resume_gaveup_logged"):
-            return ("skip", "already gave up")
         return ("park", f"[queue] AUTO-RESUME: {job['id']} ({lbl}) has already been "
                         f"auto-bumped {bumps} times and paused again -- leaving it paused for "
                         f"manual review rather than bumping further.")
@@ -10142,10 +10301,17 @@ def _auto_resume_decide(job, ceiling, looping):
     if reason == "context_threshold":
         current = job["num_ctx"]
         new_ctx = min(current * 2, ceiling) if ceiling else current * 2
-        if not ceiling or new_ctx <= current:
-            return ("park", f"[queue] AUTO-RESUME: {job['id']} ({lbl}) paused on context "
-                            f"threshold but is already at its host's safe ceiling ({current}) -- "
-                            f"cannot help by bumping, leaving paused for manual review.")
+        if ceiling and current >= ceiling:
+            # Terminal, not a pause: nothing can raise the context any further, so re-checking the row every tick
+            # forever (7930 "leaving paused" lines in the 2026-11 audit) helps no one. Fail it, class=context.
+            return ("fail_ctx", f"[queue] AUTO-RESUME: {job['id']} ({lbl}) paused on context "
+                                f"threshold but is already at its host's safe ceiling ({current}) -- "
+                                f"cannot help by bumping; marking it failed (class=context).",
+                    f"context_ceiling: paused on context_threshold at num_ctx={current}, already at the host's "
+                    f"safe ceiling ({ceiling or 'unknown'}); a bigger context cannot be granted")
+        if not ceiling:
+            return ("park", f"[queue] AUTO-RESUME: {job['id']} ({lbl}) paused on context threshold but its "
+                            f"host has no confirmed safe ceiling for this model -- leaving paused for manual review.")
         return ("bump_ctx", new_ctx,
                 f"[queue] AUTO-RESUME: {job['id']} ({lbl}) paused on context threshold "
                 f"({meta.get('tokens_used')}/{meta.get('num_ctx')} tokens) -- bumping --num-ctx "
@@ -10171,6 +10337,18 @@ def _auto_resume_apply(job, decision):
     action = decision[0]
     if action == "skip":
         return False
+    if action == "fail_ctx":
+        print(decision[1])
+        job["status"] = "failed"
+        job["pause_reason"] = None
+        job["terminal_reason"] = "context_ceiling"
+        job["failure_class"] = "context"
+        job["failure_detail"] = decision[2]
+        try:
+            _persist_job_completion(job)      # the durable done.json carries the class and reason
+        except Exception as e:  # noqa: BLE001
+            print(f"[queue] completion-record write failed for {job.get('id')}: {e}", file=sys.stderr)
+        return True
     if action == "park":
         print(decision[1])
         job["status"] = "paused"        # stop the relaunch spin; a no-op if already paused
@@ -10202,6 +10380,8 @@ def _auto_resume_paused_jobs():
                 continue
             if job.get("pause_reason") not in ("context_threshold", "request_more_iterations"):
                 continue
+            if job.get("_auto_resume_gaveup_logged"):
+                continue   # parked: skip the transcript parse too (decide would skip it anyway)
             lane = job.get("lane") or job.get("host_pref")
             if lane == "unraid":
                 ceiling = w.UNRAID_CONFIRMED_SAFE_CTX.get(job["model"])
@@ -14871,6 +15051,11 @@ def resume_job(job_id, force=False):
             new_iters = min(current + bump, AUTO_RESUME_MAX_ITERS)
             job["max_iters"] = max(new_iters, current)  # only raise -- never lower
         job["status"] = "pending"
+        if job.pop("_auto_resume_gaveup_logged", None) and reason in ("context_threshold", "request_more_iterations"):
+            # The operator took a PARKED row back: the bump above is the resume, so drop the sticky reason
+            # (as an auto bump does) or the watchdog would bump again next tick. The reap sets it again if it re-pauses.
+            job["pause_reason"] = None
+            job["pause_meta"] = None
         lock.save(state)
     print(f"[queue] resumed {job_id} ({job['label']}) -- will relaunch from "
           f"{job.get('resume_transcript') or 'scratch (no transcript recorded)'} on the next free lane")
@@ -14943,7 +15128,7 @@ def _mark_plan_cancelled_for_job(job, by, runs_dir=None):
         return None
 
 
-def cancel_job(job_id, explicit=False, mark_plan=False):
+def cancel_job(job_id, explicit=False, mark_plan=False, cause=None):
     """Remove a job's state entry outright. Added 2026-08-29 (github-projects-bf flagged
     this as a real gap): cancelling a queued job was only reachable via the HTTP API's
     DELETE /api/jobs/<id>, which does nothing for a CLI-only session or when the API
@@ -14954,7 +15139,10 @@ def cancel_job(job_id, explicit=False, mark_plan=False):
     "done"/"failed"/"paused" means clear-a-finished-or-resumable entry -- all safe state
     edits with no live process attached. "running" is refused: removing its state entry
     without killing the pid would orphan the process and desync the daemon's own
-    reap-by-pid bookkeeping -- use `kill` (SIGTERM by pid) for a running job instead."""
+    reap-by-pid bookkeeping -- use `kill` (SIGTERM by pid) for a running job instead.
+
+    `cause` (short text: who/what cancelled it, e.g. "cli:cancel", "api:delete", "stop") is recorded as the job's
+    cancel_cause and lands in its done.json and terminal event."""
     with _Locked() as lock:
         state = lock.load()
         job = next((j for j in state["jobs"] if j.get("id") == job_id), None)
@@ -15017,6 +15205,7 @@ def cancel_job(job_id, explicit=False, mark_plan=False):
             prev = job.get("status")
             job["status"] = "failed" if prev not in ("done", "done_unconverged") else prev
             job["terminal_reason"] = job.get("terminal_reason") or "cancelled"
+            job["cancel_cause"] = cause or job.get("cancel_cause") or ("operator" if explicit else "stop")
             if job["status"] == "failed":
                 _stamp_failure_class(job)
             lock.save(state)
@@ -15035,6 +15224,7 @@ def cancel_job(job_id, explicit=False, mark_plan=False):
         # slicer maps it to FAILED (_QUEUE_TO_SLICE), never to a re-enqueue.
         job["status"] = "cancelled"
         job["terminal_reason"] = job.get("terminal_reason") or "cancelled"
+        job["cancel_cause"] = cause or job.get("cancel_cause") or ("operator" if explicit else "stop")
         _persist_job_completion(job)
         # Rows dep-gated on this one must not be left pointing at a removed id
         # (a PLANNED placeholder cancelled after its real job appeared left its
@@ -15151,7 +15341,7 @@ def stop_job(job_id):
                   f"{PREEMPT_SIGKILL_GRACE_S}s if it does not exit, then records it stopped.")
             return {"stopping": job_id, "pid": pid}
     # Fell through: job not running -> delegate to the plain cancel path.
-    return cancel_job(job_id)
+    return cancel_job(job_id, cause="stop")
 
 
 def _mark_resolved_slice_superseded(job):
@@ -15780,7 +15970,10 @@ def cmd_cancel(args):
             # row's record survives in its never-pruned sidecars regardless.
             # mark_plan only with --plan (2026-10-04, 2c): a bare cancel is job-scoped.
             run_with_receipt("cancel", args.job_id,
-                             lambda: cancel_job(args.job_id, explicit=True, mark_plan=_plan_wide))
+                             lambda: cancel_job(args.job_id, explicit=True, mark_plan=_plan_wide,
+                                               cause=(getattr(args, "cause", None)
+                                                      or ("cli:cancel --automated" if getattr(args, "automated", False)
+                                                          else "cli:cancel"))))
     except QueueActionError as e:
         sys.exit(f"[queue] {e}")
 
@@ -16388,6 +16581,9 @@ def cmd_run(args):
             # Bounded focus: fold this tick's terminal jobs into the per-bundle non-PASS
             # streak (see bundle_focus_exhausted) BEFORE the resume/focus decisions read it.
             _pk_t = _plan_key_map(state["jobs"])
+            _bt0 = dict(state.get("_bundle_touched") or {})
+            if maybe_prune_bundle_state(state) or (state.get("_bundle_touched") or {}) != _bt0:
+                changed = True   # first-sight stamps must persist too, or undated entries never age
             _streaks = state.setdefault("_bundle_fail_streak", {})
             for _sk, _sn, _sid in update_bundle_fail_streaks(state["jobs"], _streaks, _pk_t):
                 changed = True
@@ -18839,6 +19035,17 @@ def _self_test():
     _auto_resume_apply(looper, dl)
     check("watchdog: refused loop is parked (status=paused, stops relaunch spin)", looper["status"], "paused")
     check("watchdog: refused loop num_ctx untouched", looper["num_ctx"], 65536)
+    # 3) A park is sticky and logged once: the next tick skips (no re-park, no re-log, no save).
+    check("watchdog: parked loop is skipped next tick", _dec(looper, looping=True)[0], "skip")
+    check("watchdog: skip does not mark the row changed", _auto_resume_apply(looper, _dec(looper, looping=True)), False)
+    nc = {"id": "noceil000000", "label": "noceil", "status": "paused", "pause_reason": "context_threshold",
+          "num_ctx": 65536, "max_iters": 40, "host_pref": "studio", "auto_resume_count": 0}
+    _auto_resume_apply(nc, _dec(nc, ceiling=None))
+    check("watchdog: unknown-ceiling park is sticky", _dec(nc, ceiling=None)[0], "skip")
+    # 4) An operator resume of a parked row (status pending, flag cleared, reason cleared) is not re-parked.
+    looper.update(status="pending", pause_reason=None, pause_meta=None)
+    looper.pop("_auto_resume_gaveup_logged", None)
+    check("watchdog: operator-resumed parked row is left to run", _dec(looper, looping=True)[0], "skip")
 
     # --- ctx gate (2026-09-17) ------------------------------------------------
     # The property: a job whose prompt provably needs more than the passed window
@@ -18906,11 +19113,11 @@ def _self_test():
     check("watchdog: loop detector trips on a no-op-repeat transcript", _isl, True)
     os.unlink(_loop_tp)
 
-    # 3) paused + context_threshold already at ceiling -> park (can't help).
+    # 3) paused + context_threshold already at ceiling -> terminal failed, class=context (can't help; not re-checked).
     ceil_job = {"id": "atceil000000", "label": "at-ceiling", "status": "paused",
                 "pause_reason": "context_threshold", "num_ctx": STUDIO_CEIL, "max_iters": 40,
                 "host_pref": "studio", "auto_resume_count": 1}
-    check("watchdog: at ceiling -> park (no infinite doubling)", _dec(ceil_job)[0], "park")
+    check("watchdog: at ceiling -> fail_ctx (no infinite doubling, no per-tick re-check)", _dec(ceil_job)[0], "fail_ctx")
 
     # 4) request_more_iterations, not looping -> bump iters by the min bump.
     iters_job = {"id": "moreiters000", "label": "wants-iters", "status": "paused",
@@ -21947,6 +22154,9 @@ def main():
                                         "(graceful SIGTERM, then daemon SIGKILL escalation) "
                                         "instead of refusing it -- no raw-kill needed.")
     cn.add_argument("job_id")
+    cn.add_argument("--cause", default=None,
+                    help="short text saying who/what cancelled it (recorded as cancel_cause in done.json and the "
+                         "terminal event); default cli:cancel")
     cn.add_argument("--automated", action="store_true",
                     help="a PIPELINE abort (e.g. dispatch-auto's omnibus choke), not a human "
                          "cancel: do NOT mark the job's slice plan cancelled")
