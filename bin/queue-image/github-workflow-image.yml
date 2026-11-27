@@ -51,7 +51,7 @@ jobs:
         run: |
           set -eu
           bash -n entrypoint.sh every.sh throttle.sh stage.sh
-          python3 -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('supervisord.conf'); p=[s for s in c.sections() if s.startswith('program:')]; assert len(p)==11, p; print(sorted(p))"
+          python3 -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('supervisord.conf'); p=[s for s in c.sections() if s.startswith('program:')]; assert len(p)==12, p; print(sorted(p))"
   publish:
     needs: test
     runs-on: ubuntu-24.04
@@ -97,7 +97,7 @@ jobs:
           docker run --rm --entrypoint python3 "$img" -c "import sys,yaml,jinja2; assert sys.version_info[:2]==(3,14), sys.version; print('python', sys.version.split()[0])"
           docker run --rm --entrypoint node "$img" -v
           docker run --rm --entrypoint sh "$img" -c 'set -e; git --version; pnpm --version; tini --version; test "$(id -u)" != 0; test -L /home/queue/bin; /opt/mini-venv/bin/python -c "import litellm, minisweagent"'
-          docker run --rm --entrypoint python3 "$img" -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('/etc/queue/supervisord.conf'); assert len([s for s in c.sections() if s.startswith('program:')])==11"
+          docker run --rm --entrypoint python3 "$img" -c "import configparser; c=configparser.RawConfigParser(strict=True); c.read('/etc/queue/supervisord.conf'); assert len([s for s in c.sections() if s.startswith('program:')])==12"
           docker run --rm --entrypoint sh "$img" -c 'set -e; cd /home/queue/bin; for f in ollama-queue.py ollama-queue-api.py queue_upload.py queue_config.py mini-swe-runner.py configs/mini-local.yaml configs/mini-diagnose.yaml configs/mini-testwrite.yaml configs/mini-diagnose-polish.yaml; do test -f "$f"; done'
       - name: Parity checks inside the image (made-up data, fake tokens; one PASS/FAIL line each)
         run: |

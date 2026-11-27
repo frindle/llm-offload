@@ -1,0 +1,60 @@
+# Ephemeral GitHub Actions runner(s) that poke the queue when an issue is labelled local-fix (reaction in seconds).
+# Image: myoung34/github-runner (https://github.com/myoung34/docker-github-actions-runner). One service per repo: a personal
+# account cannot share a runner across repos. Add a repo by copying the `runner-REPO1` block (new name, REPO_URL, IP, MAC).
+# Deploy dir on Unraid: its own appdata folder with this file and a .env beside it (see env.example). Then:
+#   docker compose up -d        (the image runs as root only to set up; the runner itself runs as user `runner`)
+#
+# Why br0 with its own IP: the queue sits on a br0 macvlan address; a container on the default bridge cannot reach a
+# macvlan address of the same host. Same standard as every other served container (own IP + MAC, no per-stack network).
+#
+# What the runner is NOT given: no docker socket, not privileged, no queue write token, no GitHub token except ACCESS_TOKEN
+# (used at start to register; UNSET_CONFIG_VARS removes it from the job environment). The only other secret is
+# ISSUE_POKE_TOKEN, which can do one thing: ask the queue to run one poller tick.
+# EPHEMERAL: the runner takes ONE job and exits; `restart: always` brings it back and it registers afresh.
+x-runner: &runner
+  image: ${RUNNER_IMAGE:-myoung34/github-runner:ubuntu-noble}
+  pull_policy: always
+  restart: always
+  environment: &runner-env
+    RUN_AS_ROOT: "false"
+    EPHEMERAL: "true"
+    UNSET_CONFIG_VARS: "true"
+    DISABLE_AUTO_UPDATE: "true"
+    RANDOM_RUNNER_SUFFIX: "true"
+    LABELS: local-fix-intake
+    NO_DEFAULT_LABELS: "true"             # only [self-hosted, local-fix-intake] matches; no "linux"/"x64" catch-all
+    RUNNER_WORKDIR: /tmp/_work
+    ISSUE_POKE_TOKEN: ${ISSUE_POKE_TOKEN:?set ISSUE_POKE_TOKEN in .env}
+    ISSUE_POKE_URL: ${ISSUE_POKE_URL:?set ISSUE_POKE_URL in .env}   # http://<queue-ip>:7684/api/issue-poke
+  tmpfs:
+    - /tmp:size=256m
+  cap_drop: [ALL]
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]   # the image chowns its work dir, then drops to `runner`
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+  mem_limit: 512m
+  cpus: 1
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+  networks: [lan]
+
+services:
+  runner-REPO1:
+    <<: *runner
+    container_name: gh-runner-REPO1
+    hostname: gh-runner-REPO1
+    environment:
+      <<: *runner-env
+      REPO_URL: https://github.com/${RUNNER1_REPO:?set RUNNER1_REPO in .env (OWNER/NAME)}
+      ACCESS_TOKEN: ${RUNNER1_ACCESS_TOKEN:?set RUNNER1_ACCESS_TOKEN in .env}
+      RUNNER_NAME_PREFIX: local-fix-REPO1
+    mac_address: ${RUNNER1_MAC:?set RUNNER1_MAC in .env}
+    networks:
+      lan:
+        ipv4_address: ${RUNNER1_IP:?set RUNNER1_IP in .env}
+
+networks:
+  lan:
+    external: true
+    name: br0

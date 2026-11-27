@@ -96,6 +96,11 @@ fi
 [ -z "${CPU_RUNNER_TOKEN:-}" ]   || { write_secret "$HOME/.config/dispatch-cpu-runner/token" "$CPU_RUNNER_TOKEN"; log "wrote dispatch-cpu-runner token file"; }
 [ -z "${OBSIDIAN_TOKEN:-}" ]     || { write_secret "$HOME/.config/ollama-worker/obsidian-token" "$OBSIDIAN_TOKEN"; log "wrote obsidian token file"; }
 [ -z "${QUEUE_AGENT_TOKEN:-}" ]  || { write_secret "$HOME/.config/ollama-queue/agent-token" "$QUEUE_AGENT_TOKEN"; log "wrote queue-agent token file"; }
+# GitHub issue intake (mini-issue-poller + the poke route): files only, and the env copies are dropped so no worker
+# process inherits them (supervisord and every program start from this shell's environment).
+[ -z "${ISSUE_POLLER_GH_TOKEN:-}" ] || { write_secret "$HOME/.config/mini-issue-poller/gh-token" "$ISSUE_POLLER_GH_TOKEN"; log "wrote issue poller gh token file"; }
+[ -z "${ISSUE_POKE_TOKEN:-}" ]      || { write_secret "$HOME/.config/mini-issue-poller/poke-token" "$ISSUE_POKE_TOKEN"; log "wrote issue poke token file"; }
+unset ISSUE_POLLER_GH_TOKEN ISSUE_POKE_TOKEN
 # Other secrets stay env-only: DARKBLOOM_API_KEY, QUEUE_API_TOKEN, worker search keys.
 
 # ---- required settings, by name only -------------------------------------------------------------

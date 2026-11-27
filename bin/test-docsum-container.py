@@ -63,7 +63,7 @@ import configparser
 c = configparser.RawConfigParser(strict=True)
 c.read(os.path.join(HERE, "queue-image", "supervisord.conf"))
 progs = [s for s in c.sections() if s.startswith("program:")]
-check("supervisord has 11 programs incl. docsum-ui, error-digest and plex-glacier-watch", len(progs) == 11
+check("supervisord has 12 programs incl. docsum-ui, error-digest, plex-glacier-watch and issue-poller", len(progs) == 12
       and "program:docsum-ui" in progs and "program:error-digest" in progs and "program:plex-glacier-watch" in progs)
 d = c["program:docsum-ui"]
 check("docsum-ui autostarts in standby and binds loopback", d["autostart"] == "true" and "--host 127.0.0.1" in d["command"])

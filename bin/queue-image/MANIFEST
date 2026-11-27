@@ -108,6 +108,8 @@ land_packet.py
 mini-auto
 mini-finish
 mini-graph
+mini-issue-poller
+mini-lane
 mini-precheck
 mini-scorecard
 mini-spec
@@ -154,6 +156,7 @@ error_digest_noise.json
 error_digest_alerts.json
 prompt_jobs.py
 digest_lines.py
+issue_poke.py
 prompt-json-runner.py
 plex_glacier_watch.py
 plex_playback.py

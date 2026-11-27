@@ -296,3 +296,4 @@ test-plex-glacier-watch.py
 test-plex-playback.py
 test_review_remote_job.py
 test-bundle-infra-wait.py
+test-issue-poke.py

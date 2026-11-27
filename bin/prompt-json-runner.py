@@ -62,10 +62,24 @@ def is_darkbloom(host):
         return False
 
 
-def ollama_chat(base, model, num_ctx, system, user, want_json, max_tokens, timeout=600):
+MAX_IMAGES = 5
+IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def clean_images(raw):
+    """task["images"] -> [{"mime", "b64"}] with an allowed type, at most MAX_IMAGES; anything else is dropped."""
+    out = []
+    for i in raw if isinstance(raw, list) else []:
+        if isinstance(i, dict) and i.get("mime") in IMAGE_MIMES and isinstance(i.get("b64"), str) and i["b64"]:
+            out.append({"mime": i["mime"], "b64": i["b64"]})
+    return out[:MAX_IMAGES]
+
+
+def ollama_chat(base, model, num_ctx, system, user, want_json, max_tokens, timeout=600, images=None):
     body = {"model": model, "stream": False, "keep_alive": "5m", "think": False,
             "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": max_tokens},
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+            "messages": [{"role": "system", "content": system},
+                         dict({"role": "user", "content": user}, **({"images": [i["b64"] for i in images]} if images else {}))]}
     if want_json:
         body["format"] = "json"
     for attempt in (1, 2):
@@ -83,8 +97,11 @@ def ollama_chat(base, model, num_ctx, system, user, want_json, max_tokens, timeo
             raise
 
 
-def darkbloom_chat(host, model, system, user, want_json, max_tokens):
+def darkbloom_chat(host, model, system, user, want_json, max_tokens, images=None):
     import darkbloom_chat as dbk
+    if images:     # OpenAI image parts: the model must be vision-capable
+        user = [{"type": "text", "text": user}] + [
+            {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (i["mime"], i["b64"])}} for i in images]
     content, _finish = dbk.chat(host, model, system, user, schema=({"type": "object"} if want_json else None),
                                 temperature=0, max_tokens=max_tokens, role="review")
     return content or ""
@@ -131,6 +148,7 @@ def run(a, call=None):
         system, text = str(task.get("system") or ""), str(task.get("text") or "")
         want_json = task.get("json", True) is not False
         max_tokens = max(64, min(int(task.get("max_tokens") or 2048), MAX_TOKENS_CAP))
+        images = clean_images(task.get("images"))
         if not text:
             raise ValueError("no text")
     except (OSError, ValueError, TypeError, AttributeError):
@@ -150,8 +168,8 @@ def run(a, call=None):
 
         def call(sy, us):
             if db:
-                return darkbloom_chat(base, a.model, sy, us, want_json, max_tokens)
-            return ollama_chat(base, a.model, a.num_ctx, sy, us, want_json, max_tokens)
+                return darkbloom_chat(base, a.model, sy, us, want_json, max_tokens, images)
+            return ollama_chat(base, a.model, a.num_ctx, sy, us, want_json, max_tokens, images=images)
     sys_full = system + (JSON_HINT if want_json else "")
     user = text
     raw, lane_fail = None, 0

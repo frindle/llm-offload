@@ -117,4 +117,33 @@ class T(unittest.TestCase):
         L.packet_path = lambda job: None
         R, rc = L.run_lane(a, j, sleep=lambda s: None, show=lambda job, env=None: (True, "PASS gate=ok", " 1 file changed, 30 insertions(+), 2 deletions(-)"))
         self.assertEqual(R["status"], "done"); self.assertEqual(R["verdict"], "ok"); self.assertLessEqual(R["words"], 121)
+    def test_api_judge_only_for_public(self):
+        self.assertIsInstance(L.make_api_judge(True, "n"), L.ClaudeApiJudge)
+        for pub in (False, None, "PUBLIC", 1):
+            self.assertIsInstance(L.make_api_judge(pub, "n"), L.ClaudeJudge)
+        for spec in ("claude-api:haiku", "claude-api:sonnet"):
+            with self.assertRaises(ValueError): L.parse_judge_spec(spec)
+    def test_api_judge_budget_is_total(self):
+        j = L.ClaudeApiJudge("haiku", "n", 0.15); j.spent = 0.145
+        with self.assertRaises(L.JudgeError) as e: j.call("s", "t")
+        self.assertEqual(e.exception.code, "E_BUDGET")
+    def test_describe_with_images_prompt(self):
+        seen = {}
+        class J(L.Judge):
+            def call(s, system, text, max_tokens=700, images=()): seen.update(system=system, text=text, images=images); return {"task_md": "x" * 50}, {}
+        o, _ = L.judge_describe(J(), "st", "r", images=["/tmp/a/image-1.png"])
+        self.assertIn("Read tool", seen["system"]); self.assertIn("/tmp/a/image-1.png", seen["text"]); self.assertTrue(seen["images"])
+        L.judge_describe(J(), "st", "r"); self.assertNotIn("Read tool", seen["system"])
+    def test_image_parts_and_runner_filter(self):
+        d = tempfile.mkdtemp(); f = Path(d, "image-1.png"); f.write_bytes(b"\x89PNG")
+        part = L._image_part(str(f)); self.assertEqual(part["mime"], "image/png"); self.assertTrue(part["b64"])
+        with self.assertRaises(L.JudgeError): L._image_part(str(Path(d, "x.svg")))
+        R = load("prompt-json-runner.py")
+        got = R.clean_images([part, {"mime": "image/svg+xml", "b64": "x"}, {"mime": "image/png"}, "z"] + [part] * 9)
+        self.assertEqual(len(got), 5); self.assertTrue(all(g["mime"] == "image/png" for g in got))
+    def test_packager_judge_setting(self):
+        self.assertIsInstance(L.make_packager_judge("claude-api:haiku", True, "n"), L.ClaudeApiJudge)
+        self.assertIsInstance(L.make_packager_judge("claude-api:haiku", False, "n"), L.ClaudeJudge)
+        self.assertEqual(L.make_packager_judge("darkbloom:future-model-1", None, "n").spec, "darkbloom:future-model-1")
+        with self.assertRaises(ValueError): L.make_packager_judge("bogus", True, "n")
 if __name__ == "__main__": unittest.main()
