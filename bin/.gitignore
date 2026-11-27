@@ -19,6 +19,9 @@
 !mini-precheck
 !mini-throttle
 !board
+!mini-lane
+!lane-bakeoff
+!mini-issue-poller
 !mini-scorecard
 !mini-testdraft
 !mini-answer

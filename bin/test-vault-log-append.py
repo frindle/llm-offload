@@ -13,7 +13,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"])).decode()
         assert self.headers["Authorization"] == "Bearer SECRET123"
-        self.send_response(413 if self.path in full else 200); self.end_headers(); seen.append((self.path, body))
+        seen.append((self.path, body))  # record before replying, or the client can return and assert before this runs
+        self.send_response(413 if self.path in full else 200); self.end_headers()
     def log_message(self, *a): pass
 srv = HTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
 tok = Path(tempfile.mkdtemp()) / "tok"; tok.write_text("SECRET123\n")

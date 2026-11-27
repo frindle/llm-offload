@@ -151,7 +151,7 @@ sampling_escalation:
 # The model that just failed is skipped. While bloom_control holds the queue's PAIR only
 # (Qwen3.5-9B + qwen3.6-35b-a3b), an escalation model outside the pair needs the pair widened first:
 # see darkbloom-apply-wide-models.sh / BLOOMCTL_PAIR. Candidates with a vendored card but no profile
-# yet (add an entry before listing): Qwen3.5-35B-A3B, Nemotron-3.5-Lightning-30B-A3B,
+# yet (add an entry before listing): Nemotron-3.5-Lightning-30B-A3B,
 # Nemotron-Cascade-2-30B-A3B, gemma-4-12b.
 escalation:
   roles:
@@ -209,6 +209,22 @@ models:
       non_thinking:      # L835
         {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
       review:            # L835
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  qwen3.5-35b-a3b:             # Darkbloom; the lane bake-off judge (2026-11-27)
+    card: models/Qwen_Qwen3.5-35B-A3B.md
+    card_sha256: "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492"
+    names: [Qwen3.5-35B-A3B, "qwen3.5:35b-a3b"]
+    backend: darkbloom
+    tool_call_format: qwen3_coder   # card L939/L970 (--tool-call-parser qwen3_coder)
+    ctx_native: 262144              # card L72, L915
+    source: "card L1021-1022 (sampling), L915-917 (ctx >=128K advised), L939/L970 (tool parser), L1179 (chat_template_kwargs), L1332 (output length)"
+    modes:
+      thinking_coding:   # "Thinking mode for precise coding tasks", L1021
+        {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: true, preserve_thinking: null, preserve_reasoning: true, stop: []}
+      non_thinking:      # "Instruct (or non-thinking) mode for general tasks", L1022
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:            # L1022
         {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
 
   "qwen3.8:27b-q4_K_M":     # Unraid/Ollama-only; on the Darkbloom lane the alias above applies
