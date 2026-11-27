@@ -140,6 +140,7 @@ def reset():
     CALLS.clear()
     if hasattr(api, "_API_SLOTS"):
         api._API_SLOTS = threading.BoundedSemaphore(500)    # B/C measure the cache, not the cap
+        api._HEAVY_SLOTS = threading.BoundedSemaphore(500)
 
 
 print("A. every routed GET endpoint is covered")
@@ -191,6 +192,8 @@ has_cap = hasattr(api, "_API_SLOTS") and hasattr(api, "_CPU_SLOTS")
 ok("the server defines an API slot pool and a separate CPU-lane pool", has_cap)
 if has_cap:
     api._API_SLOTS = threading.BoundedSemaphore(4)
+    api._RESERVE_SLOTS = threading.BoundedSemaphore(1)      # the overflow reserve is tested in test-api-results-bounded.py
+    api._RESERVE_SLOTS.acquire()
     api._CPU_SLOTS = threading.BoundedSemaphore(8)
     GATE_DELAY = 0.8
     api.q._load_job_result = lambda jid: (time.sleep(GATE_DELAY), None)[1]      # uncached slow route
@@ -210,6 +213,7 @@ if has_cap:
     free = sum(1 for _ in range(4) if api._API_SLOTS.acquire(blocking=False))
     ok("every slot is returned after the burst (%d/4 free)" % free, free == 4)
     api._API_SLOTS = threading.BoundedSemaphore(500)
+    api._RESERVE_SLOTS = threading.BoundedSemaphore(8)
     api.q._load_job_result = _real_gate
 
 print("F. the runner's /api/cpu/* writes do NOT wipe the response cache; any other write does")

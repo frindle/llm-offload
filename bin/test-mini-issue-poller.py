@@ -27,6 +27,8 @@ args = sys.argv[1:]
 open(d + "/gh.calls", "a").write(json.dumps(args) + "\n")
 if args[:2] == ["issue", "list"]:
     print(open(d + "/issues.json").read())
+if args[:2] == ["search", "issues"]:
+    print(json.dumps([dict(i, repository={"nameWithOwner": "frindle/priv"}) for i in json.load(open(d + "/issues.json"))]))
 sys.exit(0)
 '''
 AUTO_STUB = r'''#!/usr/bin/env python3
@@ -80,7 +82,7 @@ class Env:
         self.issues([])
 
     def config(self, over):
-        c = {"owner": "frindle", "label": "local-fix", "daily_cap": 5, "models": ["m1"],
+        c = {"owner": "frindle", "label": "local-fix", "daily_cap": 5, "models": ["m1"], "packager": "off",
              "repos": {"frindle/priv": {"checkout": str(self.t / "checkout"), "base": "origin/main"}}}
         c.update(over)
         (self.home / "config.json").write_text(json.dumps(c))
@@ -212,6 +214,23 @@ def main():
     check("must-not-offload refusal reported as 'failed' only", words == ["failed"], words)
     check("refusal reason stays local (not on GitHub)", "C3" not in json.dumps(e.gh_writes()))
 
+    # 7b. one tick = one search call; nothing new = no repo list, no per-repo issue list, no write
+    e = Env()
+    e.issues([issue(80)])
+    e.run()
+    e.clear()
+    e.run()
+    cs = [c[:2] for c in e.calls("gh.calls")]
+    check("nothing new: exactly one gh call (the search)", cs == [["search", "issues"]], str(cs))
+    e = Env()
+    e.issues([])
+    e.run()
+    check("no labelled issue: one search, no repo list", [c[:2] for c in e.calls("gh.calls")] == [["search", "issues"]])
+    e.issues([issue(81)])
+    e.run()
+    check("search call is owner+label scoped", any(c[:2] == ["search", "issues"] and "--owner" in c and "frindle" in c and "local-fix" in c
+                                                   for c in e.calls("gh.calls")))
+
     # 8. running job: no comment yet; label without the repo allow-list is ignored
     e = Env()
     e.issues([issue(70)])
@@ -220,10 +239,10 @@ def main():
     e.run()
     check("running job: nothing written", not e.gh_writes())
     e = Env()
-    e.config({"repos": {}})
+    e.config({"repos": {}, "owner_repos": False})
     e.issues([issue(71)])
     e.run()
-    check("repo not in allow-list: untouched", not e.calls("gh.calls") and not e.calls("auto.calls"))
+    check("repo not in allow-list: untouched", not e.gh_writes() and not e.calls("auto.calls"))
 
     # 9. lock: a second tick while the lock is held exits without work
     import fcntl

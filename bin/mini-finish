@@ -36,7 +36,7 @@ Files: <run dir>/finish/FINISH.json (claim), finish/local/ (the local attempt as
 
 Env: MINI_FINISH_HOME (~/.ollama-dispatch), MINI_FINISH_LOGS (~/bin/ollama-queue-logs), MINI_FINISH_LIVELOGS
 (~/bin/ollama-queue-livelogs), MINI_FINISH_STATE (~/bin/ollama-queue-state.json), MINI_RUNNER, MINI_FINISH_QUEUE,
-MINI_FINISH_SUBMIT, MINI_FINISH_VALIDATE (commands; default the ~/bin tools), MINI_FINISH_API (http://127.0.0.1:7684),
+MINI_FINISH_SUBMIT, MINI_FINISH_VALIDATE (commands; default the ~/bin tools), MINI_FINISH_API (default: queue_config.queue_api()),
 MINI_FINISH_DELIVER (queue-events-deliver.py, for this session's identity).
 
 Remote queue (queue_config.queue_is_remote(); see mini_finish_remote.py): the job's run dir is fetched from the queue into
@@ -126,7 +126,12 @@ def RUNNER():
 
 
 def API():
-    return (os.environ.get("MINI_FINISH_API") or "http://127.0.0.1:7684").rstrip("/")
+    return (os.environ.get("MINI_FINISH_API") or queue_config.queue_api()[0]).rstrip("/")
+
+
+def API_HEADERS():
+    """Bearer header for the queue API; none for a MINI_FINISH_API override (tests, explicit target)."""
+    return {} if os.environ.get("MINI_FINISH_API") else queue_config.queue_api_headers()
 
 
 def tool(var, name):
@@ -1092,7 +1097,7 @@ def resolve_and_clear(jid):
         probs.append(f"queue resolve: {type(e).__name__}: {e}")
     try:
         rq = urllib.request.Request(f"{API()}/api/runs/{jid}/clear", data=b"{}", method="POST",
-                                    headers={"Content-Type": "application/json"})
+                                    headers={"Content-Type": "application/json", **API_HEADERS()})
         with urllib.request.urlopen(rq, timeout=30) as r:
             say(f"mini-finish: cleared {jid} (HTTP {r.status})")
     except urllib.error.HTTPError as e:

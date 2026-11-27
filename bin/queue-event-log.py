@@ -299,6 +299,13 @@ def poll_once():
         if bundle:
             ev["bundle"] = str(bundle)[:60]
         ev.update(launcher(rec))
+        # Why it ended (2026-11 audit: nobody could see why jobs bounced). From the sidecar or live row.
+        src = rec if isinstance(rec, dict) else {}
+        if src.get("runner"):
+            ev["runner"] = os.path.basename(str(src["runner"]))[:60]    # lets the scorecard pick mini-swe outcomes
+        for fld in ("failure_class", "terminal_reason", "cancel_cause"):
+            if src.get(fld):
+                ev[fld] = str(src[fld])[:80]
         if state == "failed":
             h = finish_hint(jid, rec)
             if h:

@@ -48,6 +48,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -225,7 +226,31 @@ def finish_hint(job, run, spec):
 
 
 # ---------------------------------------------------------------------------------------------------- land
+ASSUME_OK_TOKEN = "poller-draft-pr"   # only mini-issue-poller sets this (env MINI_AUTO_ASSUME_OK), for its fresh temp worktree
+
+
+def assume_ok_allowed(into):
+    """--assume-ok skips the recorded review. Only the poller's draft-PR step may use it: it sets the env token AND lands
+    into a fresh worktree it just made under the temp dir (the PR review is the review). Everything else needs a review."""
+    if os.environ.get("MINI_AUTO_ASSUME_OK") != ASSUME_OK_TOKEN or not into:
+        return False
+    tmp = os.path.realpath(tempfile.gettempdir())
+    return os.path.realpath(os.path.expanduser(into)).startswith(tmp + os.sep)
+
+
+def cmd_base(a):
+    """Print the commit the job started from (its work dir's HEAD)."""
+    rec, run, work, spec = resolve(a.job)
+    p = git(work, "rev-parse", "HEAD")
+    if p.returncode:
+        die(f"cannot read the base commit of {work}")
+    print(p.stdout.strip())
+    return 0
+
+
 def cmd_land(a):
+    if getattr(a, "assume_ok", False) and not a.dry_run and not assume_ok_allowed(a.into):
+        die("--assume-ok is only for the issue poller's draft-PR step (needs its env token and a fresh temp --into)")
     rec, run, work, spec = resolve(a.job)
     if spec.get("mode") != "auto":
         die(f"job {a.job} is not an auto job (spec mode {spec.get('mode')!r}): land it the usual way")
@@ -387,6 +412,10 @@ def main(argv=None):
     ld.add_argument("job")
     ld.add_argument("--into")
     ld.add_argument("--dry-run", action="store_true")
+    ld.add_argument("--assume-ok", action="store_true",
+                    help="skip the recorded-review requirement (for a DRAFT pull request, where the PR review is the review)")
+    bs = sub.add_parser("base")
+    bs.add_argument("job")
     rv = sub.add_parser("review")
     rv.add_argument("job")
     rv.add_argument("verdict", choices=["ok", "reject"])
@@ -396,7 +425,7 @@ def main(argv=None):
     sh = sub.add_parser("show")
     sh.add_argument("job")
     a = ap.parse_args(argv)
-    return {"new": cmd_new, "land": cmd_land, "review": cmd_review, "show": cmd_show}[a.cmd](a)
+    return {"new": cmd_new, "land": cmd_land, "base": cmd_base, "review": cmd_review, "show": cmd_show}[a.cmd](a)
 
 
 if __name__ == "__main__":

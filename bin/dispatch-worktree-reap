@@ -55,6 +55,9 @@ import sys
 import tempfile
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import queue_config  # noqa: E402
+
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, "Desktop", "GitHub Projects")
 # dispatch worktrees also live on the NVMe volume (symlink-free, outside $HOME)
@@ -178,7 +181,10 @@ class Sources:
         self.queue_logs = os.path.join(home, "bin", "ollama-queue-logs")
         self.slice_plans = os.path.join(home, ".ollama-dispatch", "slice-plans")
         self.slice_runs = os.path.join(home, ".ollama-dispatch", "slice-runs")
-        self.runs_api = "http://127.0.0.1:7684/api/runs"
+        self.runs_api = queue_config.queue_api()[0] + "/api/runs"
+        self.runs_headers = queue_config.queue_api_headers()
+        # The queue runs in a container when the API is remote: the Mac's state file is a stale copy.
+        self.queue_remote = queue_config.queue_is_remote()
         self.handoff_cmd = [sys.executable, os.path.join(home, "bin", "handoff-emit.py"),
                             "--json"]
         self.roots = [os.path.join(home, ".ollama-dispatch", "worktrees"),
@@ -199,6 +205,7 @@ class LiveRefs:
 
     def __init__(self):
         self.paths, self.tokens, self.errors = [], [], []
+        self.api_down = False
 
     def add(self, path, rule, detail):
         if path:
@@ -233,13 +240,21 @@ def collect_live(src, runs_fetch=None, handoff_fetch=None):
     # 1. queue
     qjobs = {}
     try:
-        with open(src.queue_state) as fh:
-            st = json.load(fh)
+        if getattr(src, "queue_remote", False):
+            # remote queue: the local state file is stale and /api/runs lists only finished runs, so read the live state
+            st = queue_config.load_queue_state()
+            if st is None:
+                raise _StaleLocalState()
+        else:
+            with open(src.queue_state) as fh:
+                st = json.load(fh)
         for j in st.get("jobs", []):
             qjobs[j.get("id")] = j
             if str(j.get("status")) in LIVE_QUEUE_STATUSES:
                 for k in ("cwd", "worktree"):
                     L.add(j.get(k), "queue", f"{j.get('status')} job {j.get('id')} {j.get('label')}")
+    except _StaleLocalState:
+        L.errors.append("remote queue state unreachable: live job paths unprotected")
     except FileNotFoundError:
         L.errors.append(f"queue state missing: {src.queue_state}")
     except Exception as e:  # noqa: BLE001
@@ -307,12 +322,13 @@ def collect_live(src, runs_fetch=None, handoff_fetch=None):
     # the queue log dir -- clearing archives them to archive/).
     ids = {}
     try:
-        rows = runs_fetch() if runs_fetch else _fetch_json(src.runs_api)
+        rows = runs_fetch() if runs_fetch else _fetch_json(src.runs_api, getattr(src, "runs_headers", None))
         rows = rows if isinstance(rows, list) else (rows or {}).get("runs") or []
         for r in rows:
             ids[r.get("id")] = r.get("label")
     except Exception as e:  # noqa: BLE001
         L.errors.append(f"run-status API unreachable ({e}); using sidecars only")
+        L.api_down = True
     if os.path.isdir(src.queue_logs):
         for f in os.listdir(src.queue_logs):
             m = re.match(r"(.+)\.(done|gate)\.json$", f)
@@ -363,8 +379,12 @@ def collect_live(src, runs_fetch=None, handoff_fetch=None):
     return L
 
 
-def _fetch_json(url):
-    with urllib.request.urlopen(url, timeout=15) as resp:
+class _StaleLocalState(Exception):
+    pass
+
+
+def _fetch_json(url, headers=None):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -967,7 +987,7 @@ def main():
     repos = resolve_repos(a.repo or DEFAULT_REPOS)
     src = Sources()
     live = collect_live(src)
-    hard = [e for e in live.errors if "API unreachable" not in e]
+    hard = [e for e in live.errors if "API unreachable" not in e or src.queue_remote]
     if a.apply and hard:
         for e in hard:
             print(f"REFUSING --apply: {e}", file=sys.stderr)
