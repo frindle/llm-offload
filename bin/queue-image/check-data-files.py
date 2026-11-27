@@ -30,6 +30,7 @@ NOT_SHIPPED = {
                         "Darkbloom on the Mac, so it cannot run in the container",
     "dispatch-worktree-reap": "reaps the Mac's dispatch worktrees under ~/Desktop/GitHub Projects; the container has "
                               "none, and dispatch-escalation-watcher skips the daily reap when the tool is absent",
+    "board": "board.py's X-Requested-With value, not a path; ~/bin/board is the Mac client that posts to the board",
 }
 
 LITERAL = re.compile(r"""["']((?:~/)?[A-Za-z0-9_][A-Za-z0-9_./-]*)["']""")  # absolute paths are not ~/bin files

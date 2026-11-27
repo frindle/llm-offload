@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""lane-bakeoff: score lane judges on real history. Results go to ~/.ollama-dispatch/lane-bakeoff/<round>/ only.
+
+  lane-bakeoff round1 [--judges J,J,...] [--e2e-top N] [--limit N]   Darkbloom + Unraid judges (default: auto-detected)
+  lane-bakeoff round2 [--judges claude:haiku]                        Haiku
+  lane-bakeoff round3 [--judges claude:sonnet]                       Sonnet
+  lane-bakeoff review|triage|e2e --round NAME --judges J,...          one phase
+  lane-bakeoff judges                                                 print the judges round1 would use
+
+Phases: (a) review replay: all rejects + equal oks (hash of job id) from reviews.jsonl, packet = REVIEW.md only (the
+`mini-scorecard review brief` text leaks the verdict and is never shown to a judge); (b) triage replay: refusals derived
+from the runner's must-not-offload rule + multi-file jobs, sends from clean one-file jobs; (c) e2e: real landed jobs on a
+scratch clone at commit^ in the OUT dir, full `mini-lane run --bakeoff`. Never writes reviews.jsonl / landed.jsonl, never
+runs review or land, never touches a checkout. Writes <round>.done when finished.
+"""
+import argparse
+import concurrent.futures as cf
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+OHOME = Path(os.environ.get("OFFLOAD_HOME") or Path.home() / ".ollama-dispatch")
+ROOT = OHOME / "lane-bakeoff"
+REVIEWS = OHOME / "reviews.jsonl"
+LANDED = OHOME / "landed.jsonl"
+UNRAID_URL = "http://198.51.100.145:11434"
+# Fit in the 9.6 GB usable cap with 12288 ctx headroom (weights up to ~8.2 GB).
+UNRAID_FIT = ["qwen3:8b", "qwen3.5:9b", "llama3.1:8b", "gemma4:12b-it-q4_K_M", "gemma3:12b", "mistral:latest",
+              "ornith:9b", "qwen2.5-coder:7b"]
+
+
+def load_lane():
+    ld = SourceFileLoader("mini_lane", str(HERE / "mini-lane"))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+    ld.exec_module(m)
+    return m
+
+
+L = load_lane()
+
+
+# ----------------------------------------------------------------------------------------------- data
+def h(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def review_cases():
+    """[{job, truth, path}] for every reject plus an equal number of oks chosen by hash. Jobs with no packet are skipped."""
+    rows = [json.loads(x) for x in REVIEWS.read_text().splitlines() if x.strip()]
+    latest = {}
+    for r in rows:
+        latest[r["job"]] = r
+    have = []
+    for job, r in latest.items():
+        p = packet_file(job)
+        if p and r.get("verdict") in ("ok", "reject"):
+            have.append({"job": job, "truth": r["verdict"], "path": p})
+    rej = [c for c in have if c["truth"] == "reject"]
+    ok = sorted([c for c in have if c["truth"] == "ok"], key=lambda c: h(c["job"]))[:len(rej)]
+    return sorted(rej + ok, key=lambda c: h("o" + c["job"]))
+
+
+def packet_file(job):
+    try:
+        p = subprocess.run([sys.executable, str(HERE / "mini-scorecard"), "review", "brief", job], capture_output=True,
+                           text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"packet:\s+(\S+)", p.stdout)
+    return m.group(1) if m and os.path.exists(m.group(1)) else None
+
+
+def job_records():
+    out = []
+    d = HERE / "ollama-queue-logs"
+    for f in list(d.glob("*.done.json")) + list((d / "archive").glob("*.done.json")):
+        try:
+            r = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if str(r.get("runner", "")).endswith("mini-swe-runner.py") and r.get("task_file"):
+            out.append(r)
+    return out
+
+
+def spec_of(rec):
+    try:
+        sp = json.loads(Path(rec["task_file"]).read_text())
+        task = Path(sp["task"]).read_text()
+        return sp, task
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+
+
+def triage_cases(limit_each=12):
+    """Cases {id, truth: send|refuse, kind, repo, ask, files}. Truth comes from the runner's rule and the job's shape."""
+    groups = {"refuse_area": [], "refuse_multi": [], "send_clean": []}
+    for rec in job_records():
+        sp, task = spec_of(rec)
+        if not sp or not task:
+            continue
+        files = list(sp.get("allowed") or sp.get("files") or [])
+        repo = Path(str(sp.get("auto_repo") or sp.get("baseline_from") or sp.get("repo") or "repo")).name
+        hits = L.forbidden_hits(repo, files, task)
+        cid = str(rec.get("id") or Path(rec["task_file"]).parent.name)
+        c = {"id": cid, "repo": repo, "ask": task[:7000], "files": files[:4]}
+        if hits:
+            groups["refuse_area"].append(dict(c, truth="refuse", kind="refuse_area"))
+        elif len(files) >= 3:
+            groups["refuse_multi"].append(dict(c, truth="refuse", kind="refuse_multi"))
+        elif len(files) == 1 and "ONE FILE" not in task.upper()[:0] and len(task) > 400:
+            groups["send_clean"].append(dict(c, truth="send", kind="send_clean"))
+    out = []
+    for k, v in groups.items():
+        out += sorted(v, key=lambda c: h(c["id"]))[:limit_each if k != "refuse_multi" else 6]
+    return sorted(out, key=lambda c: h("t" + c["id"]))
+
+
+def e2e_cases(n=4):
+    """Clean landed jobs: commit^ is the pre-fix state. Problem statement = the landed note, short."""
+    out = []
+    for ln in LANDED.read_text().splitlines():
+        r = json.loads(ln)
+        note = str(r.get("note") or "")
+        if not r.get("commit") or not r.get("repo"):
+            continue
+        if L.forbidden_hits(Path(r["repo"]).name, [], note):
+            continue
+        g = subprocess.run(["git", "-C", r["repo"], "show", "--stat", "--format=%s%n%b", r["commit"]], capture_output=True, text=True).stdout
+        files = [x.split("|")[0].strip() for x in g.splitlines() if "|" in x]
+        if len([f for f in files if "test" not in f]) != 1:
+            continue
+        if L.forbidden_hits(Path(r["repo"]).name, files, g + note):
+            continue
+        out.append({"id": r["job"], "repo": r["repo"], "commit": r["commit"],
+                    "statement": "Landed change to reproduce, from its commit message (do not copy the answer):\n" + g.splitlines()[0][:300]
+                    + "\nFile: " + [f for f in files if "test" not in f][0] + "\n" + note[:300]})
+    return out[:n]
+
+
+# ----------------------------------------------------------------------------------------------- stats
+def pct(x, n):
+    return round(100.0 * x / n, 1) if n else None
+
+
+def quant(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+
+def review_stats(rows):
+    n = len(rows)
+    parsed = [r for r in rows if r.get("pred")]
+    rej = [r for r in rows if r["truth"] == "reject"]
+    ok = [r for r in rows if r["truth"] == "ok"]
+    lat = [r["wall_s"] for r in rows if r.get("wall_s") is not None]
+    return {"n": n, "parse_rate": pct(len(parsed), n),
+            "agreement": pct(sum(1 for r in parsed if r["pred"] == r["truth"]), n),
+            "reject_recall": pct(sum(1 for r in rej if r.get("pred") == "reject"), len(rej)),
+            "false_reject": pct(sum(1 for r in ok if r.get("pred") == "reject"), len(ok)),
+            "errors": sum(1 for r in rows if r.get("error")), "p50_s": quant(lat, .5), "p90_s": quant(lat, .9)}
+
+
+def triage_stats(rows):
+    n = len(rows)
+    by = {}
+    for r in rows:
+        k = by.setdefault(r["kind"], [0, 0])
+        k[1] += 1
+        k[0] += 1 if r.get("pred") == r["truth"] else 0
+    return {"n": n, "accuracy": pct(sum(1 for r in rows if r.get("pred") == r["truth"]), n),
+            "parse_rate": pct(sum(1 for r in rows if r.get("pred")), n),
+            "by_kind": {k: f"{a}/{b}" for k, (a, b) in by.items()},
+            "errors": sum(1 for r in rows if r.get("error"))}
+
+
+# ----------------------------------------------------------------------------------------------- phases
+def run_one(judge, fn, case, fatal):
+    """fn(case) -> row; a judge outage is recorded on the row, and `fatal` collects hard failures so a dead judge stops early."""
+    try:
+        return fn(case)
+    except L.JudgeError as e:
+        fatal.append(e.code)
+        return {"error": e.code}
+
+
+def phase_review(judge, cases, outdir, limit=None):
+    rows, fatal = [], []
+
+    def one(c):
+        if len(fatal) >= 5:
+            return dict(job=c["job"], truth=c["truth"], error="skipped_judge_down")
+
+        def f(c):
+            txt = Path(c["path"]).read_text(errors="replace")
+            v = L.judge_verdict(judge, L.packet_for_review(txt))
+            return {"job": c["job"], "truth": c["truth"], "pred": v["verdict"], "reason": v["reason"],
+                    "wall_s": round(sum(m["wall_s"] for m in v["metas"]), 1)}
+        r = run_one(judge, f, c, fatal)
+        r.update(job=c["job"], truth=c["truth"])
+        return r
+    for c in (cases[:limit] if limit else cases):
+        rows.append(one(c))
+    (outdir / "review.json").write_text(json.dumps({"stats": review_stats(rows), "rows": rows}, indent=1))
+    return review_stats(rows)
+
+
+def phase_triage(judge, cases, outdir, limit=None):
+    rows, fatal = [], []
+    for c in (cases[:limit] if limit else cases):
+        if len(fatal) >= 5:
+            rows.append(dict(id=c["id"], truth=c["truth"], kind=c["kind"], error="skipped_judge_down"))
+            continue
+
+        def f(c):
+            t = L.judge_triage(judge, c["repo"], c["ask"], c["files"])
+            return {"id": c["id"], "truth": c["truth"], "kind": c["kind"], "pred": t["decision"], "reason": t["reason"]}
+        r = run_one(judge, f, c, fatal)
+        r.update(id=c["id"], truth=c["truth"], kind=c["kind"])
+        rows.append(r)
+    (outdir / "triage.json").write_text(json.dumps({"stats": triage_stats(rows), "rows": rows}, indent=1))
+    return triage_stats(rows)
+
+
+def phase_e2e(spec, cases, outdir, coding_model=None):
+    """Full `mini-lane run --bakeoff` per case on a scratch clone at commit^, then the landed diff for comparison."""
+    res = []
+    for c in cases:
+        cd = outdir / "e2e" / c["id"]
+        cd.mkdir(parents=True, exist_ok=True)
+        clone = cd / "repo"
+        if not clone.exists():
+            subprocess.run(["git", "clone", "-q", "--no-hardlinks", c["repo"], str(clone)], check=False, timeout=900)
+            subprocess.run(["git", "-C", str(clone), "checkout", "-q", c["commit"] + "^"], check=False, timeout=120)
+        tf = cd / "problem.txt"
+        tf.write_text(c["statement"])
+        cmd = [str(HERE / "mini-lane"), "run", "--repo", str(clone), "--task-file", str(tf), "--judge", spec,
+               "--bakeoff", str(cd), "--base", "HEAD", "--remote"]
+        if coding_model:
+            cmd += ["--coding-model", coding_model]
+        t0 = time.time()
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        landed = subprocess.run(["git", "-C", c["repo"], "show", "--stat", "--format=%h %s", c["commit"]],
+                                capture_output=True, text=True).stdout[-600:]
+        try:
+            r = json.loads((cd / "result.json").read_text())
+        except (OSError, ValueError):
+            r = {"status": "no_result"}
+        res.append({"id": c["id"], "status": r.get("status"), "verdict": r.get("verdict"), "rc": p.returncode,
+                    "wall_s": round(time.time() - t0), "report": r.get("report"), "landed": landed})
+    (outdir / "e2e.json").write_text(json.dumps(res, indent=1))
+    return res
+
+
+# ----------------------------------------------------------------------------------------------- judges
+def detect_judges():
+    """Judges round1 can reach: the Darkbloom model the queue has loaded + each fitting Unraid model that is pulled."""
+    js, notes = [], []
+    try:
+        sys.path.insert(0, str(HERE))
+        import darkbloom_chat
+        served = sorted(darkbloom_chat.served_models())
+        loaded = [m for m in served if m.startswith("qwen3.5-35b-a3b")]
+        js += ["darkbloom:" + m for m in (loaded or served[:1])]
+        notes.append("darkbloom served: " + ", ".join(served))
+    except Exception as e:  # noqa: BLE001
+        notes.append("darkbloom not detected: " + type(e).__name__)
+    try:
+        import urllib.request
+        with urllib.request.urlopen(UNRAID_URL + "/api/tags", timeout=15) as r:
+            have = {m["name"] for m in json.loads(r.read())["models"]}
+        js += ["unraid:" + m for m in UNRAID_FIT if m in have]
+    except Exception as e:  # noqa: BLE001
+        notes.append("unraid not detected: " + type(e).__name__)
+    return js, notes
+
+
+def safe(spec):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", spec)
+
+
+def run_judge(spec, rnd_dir, rc, ec, limit, do_e2e, coding_model):
+    out = rnd_dir / safe(spec)
+    out.mkdir(parents=True, exist_ok=True)
+    j = L.make_judge(spec)
+    if isinstance(j, L.QueueJudge):
+        why = j.ready()
+        if why:
+            res = {"judge": spec, "blocked": why}
+            (out / "summary.json").write_text(json.dumps(res))
+            return res
+    res = {"judge": spec}
+    res["review"] = phase_review(j, rc, out, limit)
+    res["triage"] = phase_triage(j, ec[0], out, limit)
+    if do_e2e:
+        res["e2e"] = [{k: v for k, v in r.items() if k != "landed"} for r in phase_e2e(spec, ec[1], out, coding_model)]
+    (out / "summary.json").write_text(json.dumps(res, indent=1))
+    return res
+
+
+def score(r):
+    rv = (r.get("review") or {})
+    return (rv.get("reject_recall") or 0) * 2 + (rv.get("agreement") or 0) - (rv.get("false_reject") or 0) * 0.5
+
+
+def write_report(rnd_dir, results, notes):
+    L_ = [f"# lane-bakeoff {rnd_dir.name}", "", *notes, "",
+          "| judge | n | parse% | agree% | reject recall% | false reject% | p50 s | p90 s | triage acc% | errors |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in sorted(results, key=score, reverse=True):
+        if r.get("blocked"):
+            L_.append(f"| {r['judge']} | blocked: {r['blocked']} |||||||||")
+            continue
+        v, t = r["review"], r["triage"]
+        L_.append(f"| {r['judge']} | {v['n']} | {v['parse_rate']} | {v['agreement']} | {v['reject_recall']} | {v['false_reject']} "
+                  f"| {v['p50_s']} | {v['p90_s']} | {t['accuracy']} | {v['errors'] + t['errors']} |")
+    L_ += ["", "Ranking: reject recall counts double, then agreement, minus half the false-reject rate.",
+           "Triage by kind and e2e outcomes: see <judge>/triage.json, <judge>/e2e.json."]
+    (rnd_dir / "report.md").write_text("\n".join(L_) + "\n")
+    (rnd_dir / "report.json").write_text(json.dumps(results, indent=1))
+
+
+def cmd_round(a, rnd, default_judges):
+    rnd_dir = ROOT / (a.round or rnd)
+    rnd_dir.mkdir(parents=True, exist_ok=True)
+    notes = []
+    if a.judges:
+        judges = [x.strip() for x in a.judges.split(",") if x.strip()]
+    elif default_judges is None:
+        judges, notes = detect_judges()
+    else:
+        judges = default_judges
+    rc, ec = review_cases(), (triage_cases(), e2e_cases())
+    notes.append(f"cases: review {len(rc)} ({sum(1 for c in rc if c['truth'] == 'reject')} rejects), triage {len(ec[0])}, "
+                 f"e2e pool {len(ec[1])}; started {time.strftime('%F %T')}")
+    (rnd_dir / "cases.json").write_text(json.dumps({"review": [{k: c[k] for k in ('job', 'truth')} for c in rc],
+                                                     "triage": [{k: c[k] for k in ('id', 'truth', 'kind')} for c in ec[0]],
+                                                     "e2e": [c["id"] for c in ec[1]]}, indent=1))
+    # Same-lane judges run one after another (one model resident at a time); lanes run in parallel.
+    lanes = {}
+    for j in judges:
+        lanes.setdefault(j.split(":")[0], []).append(j)
+    results = []
+    e2e_top = set()
+
+    def lane_worker(specs):
+        out = []
+        for s in specs:
+            print(f"[{time.strftime('%T')}] judge {s} start", flush=True)
+            try:
+                out.append(run_judge(s, rnd_dir, rc, ec, a.limit, False, a.coding_model))
+            except Exception as e:  # noqa: BLE001
+                out.append({"judge": s, "blocked": "crashed: " + type(e).__name__})
+            print(f"[{time.strftime('%T')}] judge {s} done", flush=True)
+        return out
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
+        for r in ex.map(lane_worker, lanes.values()):
+            results += r
+    ranked = [r for r in sorted(results, key=score, reverse=True) if not r.get("blocked")]
+    for r in ranked[:a.e2e_top]:
+        e2e_top.add(r["judge"])
+    for s in sorted(e2e_top):  # GPU-ordered: one judge's e2e at a time, so the model swaps stay minimal
+        print(f"[{time.strftime('%T')}] e2e {s}", flush=True)
+        o = rnd_dir / safe(s)
+        next(r for r in results if r["judge"] == s)["e2e"] = [
+            {k: v for k, v in x.items() if k != "landed"} for x in phase_e2e(s, ec[1], o, a.coding_model)]
+    write_report(rnd_dir, results, notes)
+    (rnd_dir / f"{rnd}.done").write_text(time.strftime("%F %T") + "\n")
+    print("done:", rnd_dir / "report.md")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["round1", "round2", "round3", "judges", "review", "triage", "e2e"])
+    ap.add_argument("--judges")
+    ap.add_argument("--round")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--e2e-top", dest="e2e_top", type=int, default=2)
+    ap.add_argument("--coding-model", dest="coding_model")
+    a = ap.parse_args()
+    if a.cmd == "judges":
+        js, notes = detect_judges()
+        print("\n".join(js + notes))
+        return 0
+    if a.cmd == "round1":
+        return cmd_round(a, "round1", None)
+    if a.cmd == "round2":
+        return cmd_round(a, "round2", ["claude:haiku"])
+    if a.cmd == "round3":
+        return cmd_round(a, "round3", ["claude:sonnet"])
+    rnd_dir = ROOT / (a.round or "adhoc")
+    rnd_dir.mkdir(parents=True, exist_ok=True)
+    for s in [x for x in (a.judges or "").split(",") if x]:
+        out = rnd_dir / safe(s)
+        out.mkdir(exist_ok=True)
+        j = L.make_judge(s)
+        if a.cmd == "review":
+            print(s, phase_review(j, review_cases(), out, a.limit))
+        elif a.cmd == "triage":
+            print(s, phase_triage(j, triage_cases(), out, a.limit))
+        else:
+            print(s, json.dumps(phase_e2e(s, e2e_cases(), out, a.coding_model))[:800])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

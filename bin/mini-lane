@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""mini-lane: the deterministic driver behind the mini-swe "lane agent" (2026-11-26).
+
+  mini-lane run --repo R --task-file T [--judge J] [--coding-model M] [--base REF] [--name SLUG] [--remote]
+                [--wait-s N] [--record] [--bakeoff OUT_DIR] [--out DIR]
+  mini-lane default-judge [JUDGE]       show / set the one default-judge setting
+  mini-lane judges                      what a judge spec may look like
+
+The driver does every mechanical step itself and calls a pluggable judge only for the judgment steps:
+  1 triage    judge: send or refuse against the threshold rule (+ a deterministic must-not-offload guard)
+  2 describe  judge writes the job description (TASK.md)
+  3 submit    ~/bin/mini-auto new ... --desc-file - --submit
+  4 wait      poll `mini-auto show JOB` until the job ends (--wait-s, default 540)
+  5 checks    parse the gate line of the job's review packet (mini-scorecard review brief JOB)
+  6 verdict   judge reads the packet: ok | reject
+  7 report    judge writes the report; hard cap 120 words (deterministic fallback)
+
+Judges (J): darkbloom:<model> | unraid:<model>  -> the home queue's prompt-job door (POST /api/prompt-jobs), so a call
+            waits when the lane is busy or down; never a direct call to Darkbloom/Ollama.
+            claude:haiku | claude:sonnet        -> signed-in `claude -p` (subscription). NEVER --bare, NEVER claude-api:
+            these repos are private and private code must not go to API credits.
+Default judge: $MINI_LANE_JUDGE, else the one line in ~/.config/mini-lane/default-judge, else DEFAULT_JUDGE below.
+Door token: $QUEUE_PROMPT_TOKEN, else the file $QUEUE_PROMPT_TOKEN_FILE, else ~/.config/ollama-queue/prompt-token.
+  The door takes optional "model" and "lane" fields; an old door ignores them, so the driver checks which model answered
+  and fails the call with E_MODEL_MISMATCH instead of crediting the wrong model.
+
+--bakeoff OUT_DIR: results go to OUT_DIR only. Never writes reviews.jsonl or landed.jsonl, never runs `mini-auto review` or
+`land`, never records a verdict, and refuses a --repo that is not inside OUT_DIR (run it on a scratch clone).
+Outside bakeoff the verdict is NOT recorded unless --record is given: the main session owns sign-off and landing.
+Exit: 0 finished (any verdict / refusal), 2 usage, 3 judge unavailable, 4 submit failed.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE))
+BIN = HERE
+DEFAULT_JUDGE = "darkbloom:qwen3.5-35b-a3b"
+DEFAULT_JUDGE_FILE = Path.home() / ".config" / "mini-lane" / "default-judge"
+OHOME = Path(os.environ.get("OFFLOAD_HOME") or Path.home() / ".ollama-dispatch")
+LANE_RUNS = OHOME / "lane-runs"
+REPORT_WORDS = 120
+MAX_SYSTEM_B = 4000          # the door refuses system > 4096 bytes
+MAX_TEXT_B = 15500           # and text > 16384; leave a margin
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+# --------------------------------------------------------------------------------------------------- prompts
+TRIAGE_SYS = """You are the intake step of a lane that hands small code changes to a local coding model. Decide send or refuse.
+SEND only if ALL hold:
+1. A check already exists or is easy to state: a failing test, lint or type error, or a refactor covered by existing tests.
+2. The change is in ONE file (two at most) and is one step, not a chain.
+3. It is big enough to pay for the wrapping: roughly 40 or more changed lines. Edits under about 40 lines are done directly.
+4. It is NOT money, tax, accounting, auth, secrets, keys, tokens, migrations, payments, billing, the offload gates or the
+   queue itself, and not the resell/bfmr tracker.
+REFUSE (with the first rule broken) otherwise. Answer with one JSON object only:
+{"decision": "send" or "refuse", "rule": 1-4, "reason": "<=25 words"}"""
+
+DESCRIBE_SYS = """You write the job description a local coding model will receive, from a short problem statement.
+Write it as the reporter would: what is wrong, the file and function if known, the exact check command that fails now (if
+given), and what correct behaviour looks like. No code. No preamble. Under 350 words.
+Answer with one JSON object only:
+{"name": "area-change slug, lowercase words joined by single hyphens, max 40 chars",
+ "file": "one repo-relative file path if the statement names it, else empty",
+ "fn": "function name if named, else empty",
+ "task_md": "the description"}"""
+
+VERDICT_SYS = """You review a change a local coding model made, as if you wrote it yourself. The mechanical gates already
+passed; look for what they cannot see:
+1. The diff does what the task asks, completely, and nothing else (no unrelated edits, dead code, debug output).
+2. The test checks behaviour: a wrong fix would fail it (real assertions; no text matching, no mocking the target).
+3. Edge cases, error handling and naming fit the repo; no security, data-loss or concurrency risk.
+4. You would land this diff unchanged.
+Reject when any of these fails or you are unsure. Answer with one JSON object only:
+{"verdict": "ok" or "reject", "reason": "<=40 words naming what is wrong or why it is fine"}"""
+
+REPORT_SYS = """Write the final report of a lane run for the coordinating session, at most 110 words, plain sentences, no
+markdown. Include: the job id, the verdict and its reason, the diff size, the checks run, and the ONE thing the main session
+must do next (land, fix directly, or wait). Use only the facts given. Answer with one JSON object only:
+{"report": "..."}"""
+
+
+# --------------------------------------------------------------------------------------------------- helpers
+class JudgeError(Exception):
+    def __init__(self, code, detail=""):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+
+
+def fit(text, max_bytes):
+    """text cut to max_bytes (UTF-8), keeping the head and the tail with a marker between."""
+    b = (text or "").encode("utf-8", "replace")
+    if len(b) <= max_bytes:
+        return text or ""
+    head, tail = int(max_bytes * 0.62), int(max_bytes * 0.30)
+    return (b[:head].decode("utf-8", "ignore") + "\n...[cut %d bytes]...\n" % (len(b) - head - tail)
+            + b[len(b) - tail:].decode("utf-8", "ignore"))
+
+
+_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
+
+
+def parse_object(raw):
+    """The first JSON object in a model answer (fence, think block and chatter tolerated), or None."""
+    s = re.sub(r"(?s)<think>.*?</think>", "", (raw or "")).strip()
+    m = _FENCE.match(s)
+    if m:
+        s = m.group(1)
+    cands = [s]
+    if "{" in s and "}" in s:
+        cands.append(s[s.find("{"):s.rfind("}") + 1])
+    for c in cands:
+        try:
+            d = json.loads(c)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
+def clip_words(s, n=REPORT_WORDS):
+    w = str(s or "").split()
+    return " ".join(w[:n]) + (" ..." if len(w) > n and n < 1000 else "") if len(w) > n else " ".join(w)
+
+
+def parse_judge_spec(spec):
+    spec = (spec or "").strip()
+    kind, _, model = spec.partition(":")
+    if kind in ("darkbloom", "unraid") and model:
+        return kind, model
+    if kind == "claude" and model in ("haiku", "sonnet"):
+        return kind, model
+    raise ValueError(f"bad judge {spec!r}: use darkbloom:<model> | unraid:<model> | claude:haiku | claude:sonnet")
+
+
+def default_judge():
+    v = (os.environ.get("MINI_LANE_JUDGE") or "").strip()
+    if not v:
+        try:
+            v = DEFAULT_JUDGE_FILE.read_text().strip().splitlines()[0].strip()
+        except (OSError, IndexError):
+            v = ""
+    return v or DEFAULT_JUDGE
+
+
+def prompt_token():
+    t = (os.environ.get("QUEUE_PROMPT_TOKEN") or "").strip()
+    if not t:
+        f = (os.environ.get("QUEUE_PROMPT_TOKEN_FILE") or str(Path.home() / ".config/ollama-queue/prompt-token")).strip()
+        try:
+            t = Path(f).expanduser().read_text().strip()
+        except OSError:
+            t = ""
+    return t
+
+
+def queue_base():
+    try:
+        import queue_config
+        return queue_config.queue_api()[0]
+    except Exception:  # noqa: BLE001
+        return (os.environ.get("QUEUE_API") or "http://127.0.0.1:7684").rstrip("/")
+
+
+# --------------------------------------------------------------------------------------------------- judges
+class Judge:
+    """call(system, text, max_tokens) -> (obj|None, meta). obj is the parsed JSON object (None = not JSON);
+    meta: {judge, model, lane, wall_s, raw_chars, error}. Raises JudgeError when the judge cannot answer at all."""
+    spec = ""
+
+    def call(self, system, text, max_tokens=700):
+        raise NotImplementedError
+
+
+class QueueJudge(Judge):
+    """darkbloom:<model> | unraid:<model> through POST /api/prompt-jobs (the queue waits for a free lane)."""
+
+    def __init__(self, lane, model, base=None, token=None, poll_s=5.0, timeout_s=3600, sleep=time.sleep):
+        self.lane, self.model, self.spec = lane, model, f"{lane}:{model}"
+        self.base = (base or queue_base()).rstrip("/")
+        self.token = token if token is not None else prompt_token()
+        self.poll_s, self.timeout_s, self.sleep = poll_s, timeout_s, sleep
+
+    def _req(self, method, path, payload=None, timeout=30):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except ValueError:
+                return e.code, {}
+
+    def ready(self):
+        """None when the door accepts our token, else the reason. A POST of {} is a 400 only after auth passes."""
+        if not self.token:
+            return "no prompt-job token (set QUEUE_PROMPT_TOKEN_FILE or ~/.config/ollama-queue/prompt-token)"
+        try:
+            st, body = self._req("POST", "/api/prompt-jobs", {})
+        except (urllib.error.URLError, OSError) as e:
+            return f"queue unreachable ({type(e).__name__})"
+        if st == 400:
+            return None
+        return f"door answered {st} {body.get('error', '')}".strip()
+
+    def call(self, system, text, max_tokens=700):
+        if not self.token:
+            raise JudgeError("E_NOTOKEN", "no prompt-job token")
+        body = {"app": "minilane", "ref": "ml-" + uuid.uuid4().hex[:20], "system": fit(system, MAX_SYSTEM_B),
+                "text": fit(text, MAX_TEXT_B), "json": True, "max_tokens": max_tokens,
+                "model": self.model, "lane": self.lane}
+        t0 = time.time()
+        try:
+            st, r = self._req("POST", "/api/prompt-jobs", body)
+        except (urllib.error.URLError, OSError) as e:
+            raise JudgeError("E_QUEUE_DOWN", type(e).__name__)
+        if st not in (200, 202):
+            raise JudgeError("E_DOOR_%d" % st, str(r.get("error", "")))
+        jid = r.get("id")
+        meta = {"judge": self.spec, "model": None, "lane": None, "wall_s": 0, "raw_chars": 0, "error": None, "job": jid}
+        try:
+            while True:
+                if time.time() - t0 > self.timeout_s:
+                    raise JudgeError("E_TIMEOUT", f"{self.timeout_s}s in the queue")
+                try:
+                    st, g = self._req("GET", "/api/prompt-jobs/" + jid)
+                except (urllib.error.URLError, OSError):
+                    g, st = {}, 0                      # the queue blinked: keep waiting
+                if st == 200 and g.get("status") == "done":
+                    break
+                if st == 200 and g.get("status") == "failed":
+                    raise JudgeError(g.get("error") or "E_FAILED")
+                self.sleep(self.poll_s)
+        finally:
+            try:
+                self._req("DELETE", "/api/prompt-jobs/" + str(jid))
+            except (urllib.error.URLError, OSError):
+                pass
+        meta.update(model=g.get("model"), lane=g.get("lane"), wall_s=round(time.time() - t0, 1))
+        got = str(g.get("model") or "")
+        if got and got.lower() != self.model.lower():
+            raise JudgeError("E_MODEL_MISMATCH", f"asked {self.model}, the queue answered with {got}")
+        if g.get("lane") and g.get("lane") != self.lane and self.lane in ("darkbloom", "unraid"):
+            raise JudgeError("E_LANE_MISMATCH", f"asked {self.lane}, answered on {g.get('lane')}")
+        res = g.get("result")
+        meta["raw_chars"] = len(json.dumps(res)) if res is not None else 0
+        return (res if isinstance(res, dict) else None), meta
+
+
+class ClaudeJudge(Judge):
+    """claude:haiku | claude:sonnet through signed-in `claude -p` (subscription). Never --bare, never claude-api."""
+
+    def __init__(self, model, runner=None, timeout_s=420):
+        self.model, self.spec, self.timeout_s = model, f"claude:{model}", timeout_s
+        self.runner = runner
+
+    def call(self, system, text, max_tokens=700):
+        prompt = system + "\n\n---\n\n" + text + "\n\nAnswer with one JSON object only."
+        t0 = time.time()
+        meta = {"judge": self.spec, "model": self.model, "lane": "claude", "wall_s": 0, "raw_chars": 0, "error": None}
+        if self.runner:
+            raw = self.runner(prompt)
+        else:
+            cmd = ["claude", "-p", "--model", self.model, "--output-format", "json", "--tools", "",
+                   "--disable-slash-commands", "--no-session-persistence"]
+            try:
+                with tempfile.TemporaryDirectory(prefix="mini-lane-claude-") as cwd:
+                    p = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=self.timeout_s, cwd=cwd)
+            except (OSError, subprocess.SubprocessError) as e:
+                raise JudgeError("E_CLAUDE", type(e).__name__)
+            if p.returncode:
+                raise JudgeError("E_CLAUDE", f"rc {p.returncode}")
+            try:
+                env = json.loads(p.stdout)
+                raw = env.get("result") if isinstance(env, dict) else p.stdout
+            except ValueError:
+                raw = p.stdout
+        meta.update(wall_s=round(time.time() - t0, 1), raw_chars=len(raw or ""))
+        return parse_object(raw), meta
+
+
+def make_judge(spec, **kw):
+    kind, model = parse_judge_spec(spec)
+    return ClaudeJudge(model, **kw) if kind == "claude" else QueueJudge(kind, model, **kw)
+
+
+# --------------------------------------------------------------------------------------------------- judgment steps
+def _retry(judge, system, text, max_tokens, want_keys):
+    """One call, then one retry when the answer is not an object with the wanted key. -> (obj|None, [metas])."""
+    metas = []
+    for attempt in (1, 2):
+        obj, meta = judge.call(system, text if attempt == 1 else text + "\n\n(Reply with the JSON object only.)", max_tokens)
+        metas.append(meta)
+        if isinstance(obj, dict) and all(k in obj for k in want_keys):
+            return obj, metas
+    return None, metas
+
+
+def triage_ask(repo_name, ask, files=(), check=""):
+    parts = ["Repository: " + repo_name]
+    if files:
+        parts.append("Files named: " + ", ".join(files))
+    if check:
+        parts.append("Check: " + check)
+    parts.append("Ask:\n" + ask.strip())
+    return "\n".join(parts)
+
+
+def judge_triage(judge, repo_name, ask, files=(), check=""):
+    """-> {"decision": send|refuse|None, "reason", "parsed": bool, "metas": [...]}. No guard here: this is the judge alone."""
+    obj, metas = _retry(judge, TRIAGE_SYS, triage_ask(repo_name, fit(ask, 9000), files, check), 200, ("decision",))
+    dec = str((obj or {}).get("decision") or "").strip().lower()
+    return {"decision": dec if dec in ("send", "refuse") else None, "reason": str((obj or {}).get("reason") or "")[:200],
+            "parsed": dec in ("send", "refuse"), "metas": metas}
+
+
+def judge_describe(judge, statement, repo_name, files=(), check=""):
+    obj, metas = _retry(judge, DESCRIBE_SYS, triage_ask(repo_name, fit(statement, 9000), files, check), 900, ("task_md",))
+    return obj, metas
+
+
+def judge_verdict(judge, packet_text, task_text=""):
+    """-> {"verdict": ok|reject|None, "reason", "parsed", "metas"}."""
+    text = (("Task given to the coding model:\n" + fit(task_text, 2500) + "\n\n") if task_text else "") + \
+        "Review packet:\n" + fit(packet_text, MAX_TEXT_B - 3000 if task_text else MAX_TEXT_B - 200)
+    obj, metas = _retry(judge, VERDICT_SYS, text, 300, ("verdict",))
+    v = str((obj or {}).get("verdict") or "").strip().lower()
+    return {"verdict": v if v in ("ok", "reject") else None, "reason": str((obj or {}).get("reason") or "")[:300],
+            "parsed": v in ("ok", "reject"), "metas": metas}
+
+
+def packet_for_review(text, cap=MAX_TEXT_B - 200):
+    """A review packet cut to the door's size, section by section so the diff and the gates always survive.
+    Budgets (bytes) per `## ` section; the first lines (title + gate line) are kept whole."""
+    budgets = [("Problem", 1800), ("Constraints", 1800), ("Phase B gates", 1500), ("Diff", 5200), ("Test file", 3200),
+               ("Phase A", 1200), ("Final test output", 900), ("Model's final message", 600), ("Mutation", 900),
+               ("Root cause", 900), ("Fix diff", 5200), ("Review asks", 700)]
+    parts = re.split(r"(?m)^(?=## )", text)
+    out = []
+    for i, p in enumerate(parts):
+        if i == 0 and not p.startswith("## "):
+            out.append(fit(p, 900))
+            continue
+        title = p.split("\n", 1)[0]
+        cap_s = next((b for k, b in budgets if k.lower() in title.lower()), 700)
+        out.append(fit(p, cap_s))
+    s = "".join(out)
+    return fit(s, cap)
+
+
+def final_report(judge, facts):
+    """Report of at most REPORT_WORDS words. The judge writes it; a deterministic text stands in when it cannot."""
+    fallback = facts["fallback"]
+    try:
+        obj, metas = _retry(judge, REPORT_SYS, json.dumps(facts["data"], indent=1)[:6000], 300, ("report",))
+    except JudgeError:
+        return clip_words(fallback), "fallback", []
+    if obj and str(obj["report"]).strip():
+        return clip_words(str(obj["report"]).strip()), "judge", metas
+    return clip_words(fallback), "fallback", metas
+
+
+# --------------------------------------------------------------------------------------------------- mechanical steps
+_GUARD = {}
+
+
+def forbidden_hits(repo_name, files, text):
+    """The runner's own must-not-offload rule (the one mini-submit C3 applies). [] when clear or when it cannot load."""
+    try:
+        if "R" not in _GUARD:
+            from importlib.machinery import SourceFileLoader
+            import importlib.util
+            ld = SourceFileLoader("mini_swe_runner_guard", str(BIN / "mini-swe-runner.py"))
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+            ld.exec_module(m)
+            _GUARD["R"] = m
+        names = [("repo", repo_name)] + [("file hint", f) for f in files]
+        return _GUARD["R"].auto_forbidden(names, text)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sh(cmd, env=None, input_=None, timeout=300):
+    e = dict(os.environ)
+    e.update(env or {})
+    p = subprocess.run(cmd, capture_output=True, text=True, input=input_, env=e, timeout=timeout)
+    return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+
+def git_has_file(repo, base, f):
+    rc, out, _ = sh(["git", "-C", repo, "ls-tree", "--name-only", base, "--", f], timeout=60)
+    return rc == 0 and out.strip() == f
+
+
+def submit_job(repo, base, name, task_md, file_, fn, coding_model, remote, env, label=None):
+    """mini-auto new ... --desc-file - --submit. -> (job_id|None, text)."""
+    cmd = [str(BIN / "mini-auto"), "new", "--repo", repo, "--base", base, "--name", name, "--desc-file", "-", "--submit",
+           "--label", label or name]
+    if file_:
+        cmd += ["--file", file_]
+    if fn:
+        cmd += ["--fn", fn]
+    if coding_model:
+        cmd += ["--model", coding_model]
+    if remote:
+        cmd += ["--remote"]
+    rc, out, err = sh(cmd, env=env, input_=task_md, timeout=900)
+    text = (out + err).strip()
+    m = re.search(r"^job_id:\s*(\S+)", text, re.M)
+    return (m.group(1) if m and rc == 0 else None), text[-1200:]
+
+
+def show_job(job, env=None):
+    """-> (finished, result_line, text). `mini-auto show` fails until the job has a finished record."""
+    rc, out, err = sh([str(BIN / "mini-auto"), "show", job], env=env, timeout=120)
+    if rc != 0:
+        return False, "", (out + err).strip()[-300:]
+    m = re.match(r"job \S+\s+\S*\s*(.*)", out.splitlines()[0] if out else "")
+    return True, (m.group(1).strip() if m else ""), out
+
+
+def wait_job(job, wait_s, poll_s=30, env=None, sleep=time.sleep, show=None):
+    show = show or show_job
+    t0 = time.time()
+    while True:
+        fin, line, text = show(job, env) if show is show_job else show(job)
+        if fin:
+            return True, line, text
+        if time.time() - t0 >= wait_s:
+            return False, "", text
+        sleep(poll_s)
+
+
+def packet_path(job):
+    rc, out, _ = sh([sys.executable, str(BIN / "mini-scorecard"), "review", "brief", job], timeout=120)
+    m = re.search(r"packet:\s+(\S+)", out)
+    return m.group(1) if m and os.path.exists(m.group(1)) else None
+
+
+_GATE_TOK = re.compile(r"\b([a-z_]+)=(ok|OK|FAIL|fail|WARN|warn|skip)\b")
+
+
+def parse_gates(packet_text, result_line=""):
+    """Mechanical checks from the packet's first line / the RESULT line: -> {"ok": bool, "gates": {name: state}, "head": str}."""
+    head = ""
+    for ln in (packet_text or "").splitlines():
+        if ln.strip():
+            head = ln.strip()
+            break
+    gates = {}
+    for src in (head, result_line or ""):
+        for k, v in _GATE_TOK.findall(src):
+            gates[k] = v.lower()
+    passed = bool(re.search(r"\b(PASS|NEEDS-REVIEW)\b", head + " " + (result_line or "")))
+    bad = [k for k, v in gates.items() if v == "fail"]
+    return {"ok": passed and not bad, "gates": gates, "bad": bad, "head": head[:240]}
+
+
+def diff_size(show_text):
+    m = re.search(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?", show_text or "")
+    if not m:
+        return "diff size unknown"
+    return f"{m.group(1)} file(s), +{m.group(2) or 0}/-{m.group(3) or 0}"
+
+
+# --------------------------------------------------------------------------------------------------- run
+def slug(s, fallback="lane-change"):
+    s = re.sub(r"[^a-z0-9]+", "-", str(s or "").lower()).strip("-")[:40].strip("-")
+    return s if NAME_RE.match(s or "") else fallback
+
+
+def run_lane(a, judge=None, now=time.time, sleep=time.sleep, show=None):
+    """The whole lane. -> result dict (also written to <out>/result.json). Raises nothing for judge trouble: a judge that
+    cannot answer ends the run with status judge_error."""
+    repo = os.path.realpath(os.path.expanduser(a.repo))
+    task_text = Path(a.task_file).read_text()
+    repo_name = Path(repo).name
+    bake = bool(a.bakeoff)
+    out_dir = Path(a.bakeoff or a.out or (LANE_RUNS / time.strftime("%Y%m%d-%H%M%S")))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    R = {"judge": a.judge, "repo": repo, "bakeoff": bake, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "steps": {},
+         "status": None, "job": None, "verdict": None, "report": None, "judge_calls": []}
+
+    def finish(status, fallback, data=None, rc=0):
+        R["status"] = status
+        facts = {"fallback": fallback, "data": dict(data or {}, status=status, job=R["job"], verdict=R["verdict"])}
+        try:
+            rep, src, metas = final_report(judge, facts)
+            R["judge_calls"] += metas
+        except JudgeError as e:
+            rep, src = clip_words(fallback), "fallback:" + e.code
+        R["report"], R["report_source"] = rep, src
+        R["words"] = len(rep.split())
+        (out_dir / "result.json").write_text(json.dumps(R, indent=1))
+        return R, rc
+
+    if bake:
+        od = os.path.realpath(str(out_dir))
+        if not (repo == od or repo.startswith(od + os.sep)):
+            R["status"] = "refused_bakeoff_repo"
+            R["report"] = f"bakeoff refuses --repo {repo}: it must be a scratch clone inside {od}"
+            (out_dir / "result.json").write_text(json.dumps(R, indent=1))
+            return R, 2
+    try:
+        # 1 triage
+        t = judge_triage(judge, repo_name, task_text)
+        R["judge_calls"] += t["metas"]
+        hits = forbidden_hits(repo_name, [], task_text)
+        R["steps"]["triage"] = {"decision": t["decision"], "reason": t["reason"], "guard_hits": [list(h) for h in hits]}
+        if hits:
+            R["steps"]["triage"]["decision"] = "refuse"
+            R["steps"]["triage"]["reason"] = "must-not-offload guard: %s" % hits[0][2]
+        if R["steps"]["triage"]["decision"] != "send":
+            why = R["steps"]["triage"]["reason"] or "triage did not say send"
+            return finish("refused", f"Refused, nothing submitted: {why}. Fix it directly.", {"why": why})
+        # 2 describe
+        d, metas = judge_describe(judge, task_text, repo_name)
+        R["judge_calls"] += metas
+        if not d or len(str(d.get("task_md") or "").strip()) < 40:
+            R["steps"]["describe"] = {"ok": False}
+            return finish("describe_failed", "The judge could not write a usable job description; nothing submitted. Fix it directly.")
+        desc = str(d["task_md"]).strip()
+        f = str(d.get("file") or "").strip().lstrip("./")
+        f = f if f and git_has_file(repo, a.base, f) else ""
+        fn = re.sub(r"[^A-Za-z0-9_.]", "", str(d.get("fn") or ""))[:80]
+        name = (a.name or slug(d.get("name")))[:36] + "-" + time.strftime("%m%d%H%M%S")
+        R["steps"]["describe"] = {"ok": True, "name": name, "file": f, "fn": fn, "chars": len(desc)}
+        (out_dir / "TASK.md").write_text(desc + "\n")
+        # 3 submit
+        env = {}
+        if bake:
+            env = {"MINI_RUNS": str(out_dir / "runs"), "MINI_WT_ROOT": str(out_dir / "wt")}
+            (out_dir / "wt").mkdir(exist_ok=True)
+        job, text = submit_job(repo, a.base, name, desc, f, fn, a.coding_model, a.remote, env)
+        R["steps"]["submit"] = {"ok": bool(job), "tail": text[-400:]}
+        R["job"] = job
+        if not job:
+            return finish("submit_failed", "mini-auto refused or failed the submit (see the tail); nothing is running. Fix it directly.",
+                          {"tail": text[-300:]}, rc=4)
+        # 4 wait
+        fin, line, stext = wait_job(job, a.wait_s, poll_s=a.poll_s, env=env, sleep=sleep, show=show)
+        R["steps"]["wait"] = {"finished": fin, "result_line": line}
+        if not fin:
+            return finish("running", f"Job {job} is still running after {a.wait_s}s. Check `mini-auto show {job}` later; "
+                          f"do not wait here.", {"job": job})
+        # 5 checks
+        pk = packet_path(job)
+        ptxt = Path(pk).read_text(errors="replace") if pk else ""
+        gates = parse_gates(ptxt, line)
+        R["steps"]["checks"] = {"packet": pk, "diff": diff_size(stext), **gates}
+        if not gates["ok"]:
+            tri = ""
+            if not bake:
+                rc, o, e = sh([str(BIN / "mini-triage"), job], timeout=120)
+                tri = (o + e).strip()[-300:]
+            R["steps"]["checks"]["failure"] = tri
+            R["verdict"] = "fail"
+            return finish("job_failed", f"Job {job} did not pass its gates ({line or gates['head'][:80]}). Discard it and fix directly; "
+                          "do not finish the local attempt.", {"gates": gates["gates"], "bad": gates["bad"], "failure": tri})
+        # 6 verdict
+        v = judge_verdict(judge, packet_for_review(ptxt), desc)
+        R["judge_calls"] += v["metas"]
+        R["verdict"] = v["verdict"] or "unparsed"
+        R["steps"]["verdict"] = {"verdict": R["verdict"], "reason": v["reason"]}
+        nxt = {"ok": f"Read the packet, then record the review and `mini-auto land {job}`.",
+               "reject": "Fix the change directly; do not finish the local attempt."}.get(R["verdict"], "Review the packet yourself.")
+        if a.record and not bake and v["verdict"]:
+            rc, o, e = sh([sys.executable, str(BIN / "mini-scorecard"), "review", "add", "--job", job, "--verdict", v["verdict"],
+                           "--kind", "auto", "--note", f"lane judge {a.judge}: {v['reason']}"[:300]], timeout=120)
+            R["steps"]["verdict"]["recorded"] = rc == 0
+        return finish("done", f"Job {job} passed its gates ({diff_size(stext)}). Verdict {R['verdict']}: {v['reason']} {nxt}",
+                      {"diff": diff_size(stext), "checks": "gates ok: " + ", ".join(sorted(gates["gates"])[:12]),
+                       "reason": v["reason"], "next": nxt})
+    except JudgeError as e:
+        R["steps"]["judge_error"] = e.code
+        R["report"] = f"Judge {a.judge} could not answer ({e.code}). Nothing more was done" + (f"; job {R['job']} may be running." if R["job"] else ".")
+        R["status"] = "judge_error"
+        (out_dir / "result.json").write_text(json.dumps(R, indent=1))
+        return R, 3
+
+
+def cmd_run(a):
+    if not a.judge:
+        a.judge = default_judge()
+    try:
+        parse_judge_spec(a.judge)
+    except ValueError as e:
+        print(f"mini-lane: {e}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(os.path.expanduser(a.repo)) or not os.path.isfile(a.task_file):
+        print("mini-lane: --repo must be a directory and --task-file a file", file=sys.stderr)
+        return 2
+    if a.bakeoff and a.record:
+        print("mini-lane: --record is not allowed with --bakeoff", file=sys.stderr)
+        return 2
+    judge = make_judge(a.judge)
+    R, rc = run_lane(a, judge)
+    print(R["report"])
+    return rc
+
+
+def cmd_default(a):
+    if a.judge:
+        parse_judge_spec(a.judge)
+        DEFAULT_JUDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_JUDGE_FILE.write_text(a.judge.strip() + "\n")
+    print(default_judge())
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--repo", required=True)
+    r.add_argument("--task-file", required=True)
+    r.add_argument("--judge")
+    r.add_argument("--coding-model")
+    r.add_argument("--base", default="HEAD")
+    r.add_argument("--name")
+    r.add_argument("--remote", action="store_true", help="run the project's tests on a dispatch cpu runner, never on this Mac")
+    r.add_argument("--wait-s", dest="wait_s", type=int, default=540)
+    r.add_argument("--poll-s", dest="poll_s", type=int, default=30)
+    r.add_argument("--record", action="store_true", help="record the judge's verdict with mini-scorecard review add (never lands)")
+    r.add_argument("--bakeoff", metavar="OUT_DIR")
+    r.add_argument("--out")
+    d = sub.add_parser("default-judge")
+    d.add_argument("judge", nargs="?")
+    sub.add_parser("judges")
+    a = ap.parse_args(argv)
+    if a.cmd == "run":
+        return cmd_run(a)
+    if a.cmd == "default-judge":
+        return cmd_default(a)
+    print("darkbloom:<model> | unraid:<model> | claude:haiku | claude:sonnet")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
