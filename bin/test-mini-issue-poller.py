@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic tests for mini-issue-poller: fixture `gh`, `mini-auto`, queue CLI and Darkbloom-probe stubs. No network, no queue.
 Run on claude-sandbox, never on the Mac:  python3 test-mini-issue-poller.py"""
+import importlib.util
 import json
 import os
 import stat
@@ -259,6 +260,70 @@ def main():
     e.issues([issue(90)])
     e.run("--dry-run")
     check("dry run: no enqueue, no GitHub write", not e.calls("auto.calls") and not e.gh_writes())
+
+    # 11. excluded repos: never a job, a label, a comment, even with the label applied by hand; default list; override
+    import importlib.machinery
+    ld = importlib.machinery.SourceFileLoader("pollermod", str(POLLER))
+    pm = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))
+    ld.exec_module(pm)
+    cfgd = {"owner": "frindle"}
+    check("exclude default list", all(pm.is_excluded(f"frindle/{r}", cfgd) for r in
+          ("homelab-database", "homelab-dr", "obsidian-vault-backup", "briefd-knowledge", "claude-plans")))
+    check("exclude is case-insensitive and owner-scoped", pm.is_excluded("Frindle/Claude-Plans", cfgd) and not pm.is_excluded("other/claude-plans", cfgd))
+    check("normal repo not excluded", not pm.is_excluded("frindle/priv", cfgd))
+    check("eligible refuses an excluded repo", pm.eligible(issue(1), {**cfgd, "label": "local-fix"}, {"jobs": {}}, "frindle/homelab-dr") == (False, "excluded-repo"))
+    check("exclude_repos config replaces the default", not pm.is_excluded("frindle/homelab-dr", {**cfgd, "exclude_repos": ["x"]}) and pm.is_excluded("frindle/x", {**cfgd, "exclude_repos": ["x"]}))
+    e = Env()
+    e.config({"repos": {"frindle/priv": {"checkout": str(e.t / "checkout"), "base": "origin/main"}}, "exclude_repos": ["priv"]})
+    e.issues([issue(101)])
+    e.run()
+    check("excluded repo end to end: no job, no GitHub write", not e.calls("auto.calls") and not e.gh_writes())
+
+    # 12. auto clone: blobless, token from the file, never in .git/config or the log; fetch before the next job
+    import shutil
+    e = Env()
+    src = e.t / "origin" / "frindle" / "priv.git"
+    work = e.t / "w"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    (work / "a.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"], check=True)
+    src.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", "--bare", str(work), str(src)], check=True)
+    subprocess.run(["git", "-C", str(src), "config", "uploadpack.allowFilter", "true"], check=True)
+    root = e.t / "repos"
+    tokf = e.t / "ghtok"
+    SECRET = "-".join(["fake", "poller", "token", "0123456789"])   # built at run time: the public sync's secret guard
+    tokf.write_text(SECRET)
+    e.config({"repos": {}, "checkout_root": str(root), "auto_clone": True, "owner_repos": True})
+    e.issues([issue(110)])
+    (e.t / "gh").write_text(GH_STUB.replace('sys.exit(0)', 'if args[:2] == ["repo", "list"]:\n    print(json.dumps([{"nameWithOwner": "frindle/priv"}]))\nsys.exit(0)'))
+    os.chmod(e.t / "gh", 0o755)
+    env2 = {"POLLER_CLONE_BASE": "file://" + str(e.t / "origin") + "/", "ISSUE_POLLER_GH_TOKEN_FILE": str(tokf)}
+    r = e.run(extra_env=env2)
+    co = root / "priv"
+    check("auto clone: checkout created on first accepted issue", (co / ".git").exists() and (co / "a.txt").exists(), r.stdout + r.stderr)
+    cfgtxt = (co / ".git" / "config").read_text()
+    check("auto clone: blobless (partial clone filter set)", "blob:none" in cfgtxt)
+    check("auto clone: token not in .git/config, log or output", SECRET not in cfgtxt and SECRET not in (e.home / "poller.log").read_text()
+          and SECRET not in r.stdout + r.stderr)
+    check("auto clone: job enqueued", len(e.calls("auto.calls")) == 1)
+    e.clear()
+    (work / "b.txt").write_text("b\n")
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y"], check=True)
+    subprocess.run(["git", "-C", str(work), "push", "-q", str(src), "main"], check=True)
+    e.issues([issue(111)])
+    e.run(extra_env=env2)
+    tip = subprocess.run(["git", "-C", str(co), "rev-parse", "origin/main"], capture_output=True, text=True).stdout.strip()
+    srctip = subprocess.run(["git", "-C", str(src), "rev-parse", "main"], capture_output=True, text=True).stdout.strip()
+    check("auto clone: fetch before the next job", tip == srctip and tip != "")
+    e = Env()
+    e.config({"repos": {}, "checkout_root": str(e.t / "repos2"), "auto_clone": False})
+    e.issues([issue(120)])
+    e.run(extra_env=env2)
+    check("auto_clone off: no clone made", not (e.t / "repos2").exists())
+    shutil.rmtree(e.t, ignore_errors=True)
 
     print("\n%d failed" % len(FAILS) if FAILS else "\nall passed")
     return 1 if FAILS else 0

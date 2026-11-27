@@ -36,6 +36,8 @@ darkbloom_chat.py
 darkbloom_coldgate.py
 dataless_policy.py
 edit_guard.py
+anchored_edit.py
+mutation_recovery.py
 fixed_lane.py
 goose-chat-runner.py
 goose-darkbloom.sh
@@ -108,6 +110,8 @@ land_packet.py
 mini-auto
 mini-finish
 mini-graph
+mini-issue-poller
+mini-lane
 mini-precheck
 mini-scorecard
 mini-spec
@@ -115,6 +119,7 @@ mini-submit
 mini-testdraft
 mini-triage
 mini-validate
+mini_ext/child_env.py
 mini_ext/mini_ctx.py
 mini_ext/single_shot_call.py
 # mini-swe-runner's overlay configs: it reads ~/bin/configs/mini-*.yaml for every mini job (found missing by the 11-14 back-test)
@@ -154,6 +159,7 @@ error_digest_noise.json
 error_digest_alerts.json
 prompt_jobs.py
 digest_lines.py
+issue_poke.py
 prompt-json-runner.py
 plex_glacier_watch.py
 plex_playback.py

@@ -8279,6 +8279,11 @@ def _is_prompt_jobs_path(path):
     return p == "/api/prompt-jobs" or p.startswith("/api/prompt-jobs/")
 
 
+def _is_issue_poke_path(path):
+    """/api/issue-poke (issue_poke.py; its own scoped token)."""
+    return str(path or "").split("?", 1)[0].rstrip("/") == "/api/issue-poke"
+
+
 def _is_digest_lines_path(path):
     """/api/digest-lines (digest_lines.py; its own scoped token)."""
     return str(path or "").split("?", 1)[0].rstrip("/") == "/api/digest-lines"
@@ -8686,6 +8691,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "E_INTERNAL"}, 500)
         if method != "GET" and status < 300:
             self._invalidate_for_write()
+        return self._json(obj, status)
+
+    def _issue_poke(self):
+        """POST /api/issue-poke: thin socket wrapper over issue_poke.handle (it only writes a trigger file for the poller
+        loop). The body is read only after its declared length passes the cap. Logs nothing from the request."""
+        try:
+            import issue_poke
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > issue_poke.MAX_BODY:
+                return self._json({"error": "E_SIZE"}, 413 if length > 0 else 400)
+            body = self.rfile.read(length) if length else b""
+            status, obj = issue_poke.handle("POST", self.path, self.headers, body)
+        except Exception as e:  # noqa: BLE001
+            print(f"[api] issue-poke: {type(e).__name__}", file=sys.stderr)
+            return self._json({"error": "E_INTERNAL"}, 500)
         return self._json(obj, status)
 
     def _digest_lines(self):
@@ -9488,6 +9511,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._prompt_jobs("POST")
         if _is_digest_lines_path(self.path):         # its own scoped token (digest_lines.auth), never the queue's
             return self._digest_lines()
+        if _is_issue_poke_path(self.path):           # its own scoped token (issue_poke.auth), never the queue's
+            return self._issue_poke()
         if not self.path.startswith("/api/cpu/") and not self._require_write_auth():
             return
         if _is_docsum_path(self.path):

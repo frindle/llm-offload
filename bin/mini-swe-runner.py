@@ -87,6 +87,7 @@ _qc_dir = _qc_os.path.dirname(_qc_os.path.realpath(__file__))
 if _qc_dir not in _qc_sys.path:
     _qc_sys.path.append(_qc_dir)
 import queue_config
+import mutation_recovery
 
 HOME = Path.home()
 # launchd (queue daemon) PATH lacks Homebrew: node/npm/tsc gates and the agent's shell need it.
@@ -244,6 +245,13 @@ except ImportError:  # self-test stub runs without litellm installed
     litellm = sys.modules["litellm"] = types.ModuleType("litellm")
 litellm.api_key = k or None
 sys.path.insert(0, @MINI_EXT@)  # mini_ext (CtxLitellmModel); sys.path, not an env var: the agent's shell inherits env
+if os.environ.pop("MINI_CHILD_ENV", "") == "minimal":  # opt-in: the model's commands get a fixed allowlist of variables
+    try:
+        import child_env
+        if not child_env.install():
+            print("[mini-runner] child env allowlist not installed: this mini has no local._run to wrap", flush=True)
+    except Exception as e:
+        print("[mini-runner] child env allowlist not installed: %s" % e, flush=True)
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 '''
@@ -1417,6 +1425,9 @@ def failfast_reason(steps, phase, spec, cwd, base=None):
         last = steps[-FF_REPEAT:]
         if len({(_squash(c), o) for c, o in last}) == 1:
             return f"fail-fast: the same command ran {FF_REPEAT} times in a row with identical output (`{_squash(last[0][0])[:120]}`)"
+    why = mutation_recovery.mutation_reason(steps)  # repeated failed edits (anchored_edit refusals, failed shell patches)
+    if why:
+        return why
     if phase == "A" and len(steps) >= FF_TEST_STEP:
         tp = Path(cwd, spec["test_file"])
         skel = (base or {}).get(spec["test_file"])
@@ -1493,6 +1504,17 @@ class Usage:
                 f"decode_tok_s=None tok_s_basis=wall-incl-prefill calls={len(self.rows)}")
 
 
+def anchored_edit_help():
+    """The task-text block that offers the anchored edit tool (MINI_ANCHORED_EDITS=1). The old sed/python edit path stays valid."""
+    tool = f"python3 {shlex.quote(str(Path(__file__).resolve().parent / 'anchored_edit.py'))}"
+    return ("\n\n## Anchored edit tool (preferred for editing existing files)\n"
+            f"- `{tool} view FILE [A-B]` prints the file's tag and its lines as `N| text` (at most 200 lines; pass a range).\n"
+            f"- `{tool} edit FILE TAG <<'EOF'` then op lines and `+` rows, then `EOF`. Ops: `replace A-B`, `insert-after N`, `delete A-B`; "
+            "each `+text` row is one new line. Line numbers and TAG come from the latest view. You never retype the old text.\n"
+            "- If it says EDIT-REFUSED (stale tag, unseen line), view the range again and redo the edit; do not guess a tag. "
+            "After EDIT-OK the output shows the new tag and the changed lines; use that tag for your next edit.\n\n")
+
+
 def run_mini(model, task_text, traj, cwd, env, key, budget, usage, steps=None, tag="", wall=None, watch=None, no_think=False, overlay=None,
              draft=None):
     """One fresh-context mini run. Returns (log, timed_out). Kills the whole process group at the budget (or wall+60, the backstop
@@ -1509,6 +1531,16 @@ def run_mini(model, task_text, traj, cwd, env, key, budget, usage, steps=None, t
     env = {k: v for k, v in env.items() if k not in ("OPENAI_API_KEY", "MINI_KEY_FILE") and not k.startswith("MINI_DRAFT_")}
     env.update(draft or {})
     env["DISPATCH_VERIFY_SANDBOX"] = "1"  # the agent's shell: ollama-queue.py refuses every mutating subcommand (no real jobs from a run)
+    env.pop("ANCHOR_EDIT_STATE", None)
+    astate = None
+    if os.environ.get("MINI_ANCHORED_EDITS") == "1":  # opt-in: hash-tagged line-anchored edit tool offered next to the shell
+        astate = tempfile.mkdtemp(prefix="anchor-")
+        env["ANCHOR_EDIT_STATE"] = astate
+        task_text = task_text + anchored_edit_help()
+    if os.environ.get("MINI_CHILD_ENV") == "minimal":
+        env["MINI_CHILD_ENV"] = "minimal"  # read and removed by the launcher before the model's first command
+    else:
+        env.pop("MINI_CHILD_ENV", None)
     kdir = None
     if key:
         kdir, env["MINI_KEY_FILE"] = write_key_file(key)
@@ -1579,6 +1611,8 @@ def run_mini(model, task_text, traj, cwd, env, key, budget, usage, steps=None, t
     if kdir:
         shutil.rmtree(kdir, ignore_errors=True)
         _SECRET_FILES.discard(kdir)
+    if astate:
+        shutil.rmtree(astate, ignore_errors=True)
     ex = exit_status(traj)
     if ex == "ProviderUnavailable":
         raise ProviderDown(f"{tag or 'run'}: the provider stayed unavailable")

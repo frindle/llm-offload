@@ -50,6 +50,7 @@ Full list with placeholders: `env.example`. Secrets are masked in the Unraid tem
 | `CPU_RUNNER_TOKEN` | written to `~/.config/dispatch-cpu-runner/token` |
 | `LOKI_URL`, `LOKI_TOKEN` | daily container error digest (`error_digest.py tick`, from 05:07); empty = no digest |
 | `ERROR_DIGEST_NOTIFY_URL`, `ERROR_DIGEST_NOTIFY_TOKEN` | the digest's daily message is POSTed here once a day (https); empty = written to `<day>.notify.txt` only |
+| `ISSUE_POLLER_GH_TOKEN`, `ISSUE_POKE_TOKEN` | GitHub issue intake: the `gh` token for mini-issue-poller, and the bearer secret for `POST /api/issue-poke` (both written to 0600 files, then unset). See `github-runner/` |
 | `OBSIDIAN_TOKEN` | written to `~/.config/ollama-worker/obsidian-token` |
 | `TAVILY_API`, `BRAVE_SEARCH_API`, `OLLAMA_WEB_SEARCH` | worker search keys (env only) |
 | `QUEUE_STANDBY` | `1` (image default): standby. Only the API (and docsum) start; the daemon, watchers and reaper stay stopped; every POST/PUT/DELETE answers 503 `{"error":"standby"}` except `/api/standby/*` (state import, back-test; write token, 404 outside standby); nothing notifies or posts to the Mac. Set `0` and restart the container to go live. |
@@ -69,13 +70,13 @@ With `QUEUE_STANDBY=1` the container serves read routes on a copy of the Mac sta
 4. Stop the Mac queue (daemon, API, watchers) and wait until the daemon has exited. Only one machine may own the job list.
 5. Copy the state JSON and the carried keys (`_bundle_next`, `_bundle_accepted`, pinned group `docsum`) into `state/`. Copy `ollama-dispatch` data, including the CPU lane sqlite, with the Mac queue stopped.
 6. Fill in `.env` or the template: IP, MAC, tokens, `DARKBLOOM_*`, `QUEUE_AGENT_*`. Start the container.
-7. Check: `docker ps` shows healthy; `entrypoint.sh` printed no FATAL; `supervisorctl -c /etc/queue/supervisord.conf status` shows 11 programs RUNNING (in standby only queue-api and docsum-ui) (log-rotate waits for 04:17; error-digest ticks every 5 min and builds yesterday's digest at the first tick from 05:07); the dashboard loads at `http://QUEUE_IP:7684/`.
+7. Check: `docker ps` shows healthy; `entrypoint.sh` printed no FATAL; `supervisorctl -c /etc/queue/supervisord.conf status` shows 12 programs RUNNING (in standby only queue-api and docsum-ui) (log-rotate waits for 04:17; error-digest ticks every 5 min and builds yesterday's digest at the first tick from 05:07); the dashboard loads at `http://QUEUE_IP:7684/`.
 8. Point the CPU runners at the new API URL (the runner container's `CPU_RUNNER_API`); they keep the same token.
 9. Rollback: stop the container, start the Mac jobs again. The state copy on the Mac is untouched until you decide otherwise.
 
 ## Checks run on this branch (no docker)
 
-`bash -n` on all scripts; `supervisord.conf` parsed with configparser (11 programs); compose and the workflow parse as YAML; the template parses as XML; `stage.sh` (fake MANIFEST: good, missing file, bad path, no MANIFEST), `every.sh` (interval, daily, TERM), `throttle.sh` and `entrypoint.sh` (secret files 0600, no secret in output, fails on missing identity or read-only state, with supervisord replaced by echo) run on claude-sandbox. `hadolint` is not installed, so the Dockerfile has not been linted.
+`bash -n` on all scripts; `supervisord.conf` parsed with configparser (12 programs); compose and the workflow parse as YAML; the template parses as XML; `stage.sh` (fake MANIFEST: good, missing file, bad path, no MANIFEST), `every.sh` (interval, daily, TERM), `throttle.sh` and `entrypoint.sh` (secret files 0600, no secret in output, fails on missing identity or read-only state, with supervisord replaced by echo) run on claude-sandbox. `hadolint` is not installed, so the Dockerfile has not been linted.
 
 ## Open questions
 

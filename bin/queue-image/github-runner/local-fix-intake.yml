@@ -1,0 +1,34 @@
+# Template: copy to .github/workflows/local-fix-intake.yml in a target repo (the repo needs its own runner service).
+# When the owner labels their own issue `local-fix`, the self-hosted runner on the LAN asks the queue to run one poller tick.
+# The poller then re-checks everything itself (owner-authored, label, daily cap); this job decides nothing.
+# Replace OWNER with the account that owns the repo (it appears twice, and the poller's own "owner" must match).
+# Public repos: Settings > Actions > General > "Fork pull request workflows from outside collaborators" /
+# "Require approval for all external contributors" must be ON, so no outsider's workflow can ever reach the runner.
+name: local-fix-intake
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  poke:
+    if: >-
+      github.event.label.name == 'local-fix' &&
+      github.event.sender.login == 'OWNER' &&
+      github.event.issue.user.login == 'OWNER'
+    runs-on: [self-hosted, local-fix-intake]
+    timeout-minutes: 2
+    steps:
+      - name: Ask the queue to run one poller tick
+        env:
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+        # ISSUE_POKE_URL and ISSUE_POKE_TOKEN come from the runner host's environment, not from GitHub secrets.
+        run: |
+          set -eu
+          curl -fsS --max-time 20 -X POST "$ISSUE_POKE_URL" \
+            -H "Authorization: Bearer $ISSUE_POKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"repo\":\"$REPO\",\"issue\":$ISSUE}" >/dev/null
+          echo "poked"

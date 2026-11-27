@@ -265,6 +265,7 @@ test_mini_cwdguard.py
 test_mini_diagnose.py
 test_mini_finish.py
 test_mini_git_stall.py
+test-mini-anchored-edit.py
 test_mini_needsinfo_queue.py
 test_mini_needsinfo_runner.py
 test_mini_needsinfo_scorecard.py
@@ -296,3 +297,4 @@ test-plex-glacier-watch.py
 test-plex-playback.py
 test_review_remote_job.py
 test-bundle-infra-wait.py
+test-issue-poke.py

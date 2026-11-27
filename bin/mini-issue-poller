@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mini-issue-poller: turn labelled GitHub issues into local mini-swe jobs (design: Mini-SWE and Offload Research, section 4).
 
-Run by launchd every 15 minutes (com.example.mini-issue-poller). One tick:
+Run every 60 s in the queue container (issue_poke.py loop), or by a LaunchAgent on a Mac. One tick:
   1. take an exclusive lock (a second tick exits at once);
   2. report finished jobs back to their issues (status words only);
   3. Darkbloom gate: the coding model is Darkbloom only. If Darkbloom is not up and serving a configured model
@@ -29,7 +29,7 @@ Rules (all enforced here):
 State: ~/.ollama-dispatch/issue-poller/  (config.json, state.json, lock, poller.log). Config example:
   {"owner": "frindle", "label": "local-fix", "daily_cap": 5,
    "models": ["qwen3.6-35b-a3b-vl-mtp-mxfp8"],
-   "repos": {"frindle/some-private-repo": {"checkout": "/Users/user/dispatch-repos/some-private-repo", "base": "origin/main"}}}
+   "repos": {"frindle/some-private-repo": {"checkout": "~/dispatch-repos/some-private-repo", "base": "origin/main"}}}
 
 Usage: mini-issue-poller [--dry-run] [--forget OWNER/REPO#N] [--status]
 Packager (config "packager": "on" by default, "off" only for tests): before mini-auto, each accepted issue goes through
@@ -46,7 +46,7 @@ mini-lane's describe step (judge_describe), which writes the job description; th
     magic bytes (png/jpeg/gif/webp), in a per-issue temp dir that is deleted afterwards. Image content is untrusted data.
   * a tick is one `gh search issues --owner` call (falling back to per-repo lists only when the search fails); repo
     work happens only for hits.
-Test hooks (env): POLLER_HOME, POLLER_GH, POLLER_MINI_AUTO, POLLER_QUEUE_CLI, POLLER_DB_PROBE (a command; exit 0 = up and
+Test hooks (env): POLLER_CLONE_BASE (clone URL prefix), POLLER_HOME, POLLER_GH, POLLER_MINI_AUTO, POLLER_QUEUE_CLI, POLLER_DB_PROBE (a command; exit 0 = up and
 serving the model named in $POLLER_MODEL).
 
 Later: when ~/bin/mini-lane exists, the submit+report steps (submit_issue, outcome_of) can be replaced by one
@@ -182,8 +182,27 @@ def pick_model(models):
 
 
 # ------------------------------------------------------------------------------------------------ GitHub (gh) wrappers
+def gh_token():
+    """The token for `gh` when running in the queue container: the file entrypoint.sh wrote from the env
+    ISSUE_POLLER_GH_TOKEN (never read from the environment of the whole container). "" = use gh's own login (the Mac)."""
+    f = os.environ.get("ISSUE_POLLER_GH_TOKEN_FILE") or "~/.config/mini-issue-poller/gh-token"
+    try:
+        return Path(f).expanduser().read_text().strip()
+    except OSError:
+        return ""
+
+
+def gh_env():
+    env = {**os.environ, "GH_PROMPT_DISABLED": "1"}
+    if not env.get("GH_TOKEN"):
+        t = gh_token()
+        if t:
+            env["GH_TOKEN"] = t
+    return env
+
+
 def gh(*args, check=True):
-    p = subprocess.run([*GH.split(), *args], capture_output=True, text=True, timeout=120)
+    p = subprocess.run([*GH.split(), *args], capture_output=True, text=True, timeout=120, env=gh_env())
     if check and p.returncode:
         raise RuntimeError(f"gh {args[0]} {args[1] if len(args) > 1 else ''} failed rc={p.returncode}")
     return p
@@ -231,10 +250,10 @@ def owner_repos(cfg):
     """{repo: {checkout, base}}: the configured entries, plus every non-archived repo of the owner that has a local
     checkout under checkout_root. Only repos under the configured owner are ever used."""
     owner = str(cfg["owner"])
-    out = {r: rc for r, rc in cfg["repos"].items() if r.split("/")[0].lower() == owner.lower()}
+    out = {r: rc for r, rc in cfg["repos"].items() if r.split("/")[0].lower() == owner.lower() and not is_excluded(r, cfg)}
     if not cfg.get("owner_repos", True):
         return out
-    root = Path(str(cfg.get("checkout_root") or "~/dispatch-repos")).expanduser()
+    root = Path(str(cfg.get("checkout_root") or ("~/.ollama-dispatch/repos" if os.environ.get("QUEUE_IN_CONTAINER") else "~/dispatch-repos"))).expanduser()
     try:
         p = gh("repo", "list", owner, "--no-archived", "--limit", "200", "--json", "nameWithOwner", check=False)
         found = json.loads(p.stdout or "[]") if not p.returncode else []
@@ -242,17 +261,33 @@ def owner_repos(cfg):
         found = []
     for r in found if isinstance(found, list) else []:
         nm = (r or {}).get("nameWithOwner") or ""
-        if not nm.lower().startswith(owner.lower() + "/") or nm in out:
+        if not nm.lower().startswith(owner.lower() + "/") or nm in out or is_excluded(nm, cfg):
             continue
         co = root / nm.split("/", 1)[1]
-        if (co / ".git").exists():
+        if (co / ".git").exists() or auto_clone_on(cfg):
             out[nm] = {"checkout": str(co), "base": "origin/main"}
     return out
 
 
+DEFAULT_EXCLUDE = ["homelab-database", "homelab-dr", "obsidian-vault-backup", "briefd-knowledge", "claude-plans"]
+
+
+def is_excluded(repo, cfg):
+    """True for a repo that must never get a job or a PR, even when someone labels an issue by hand. Config
+    "exclude_repos" (bare names or OWNER/NAME; replaces the default list) is matched case-insensitively on the repo name
+    under the configured owner."""
+    names = cfg.get("exclude_repos")
+    names = DEFAULT_EXCLUDE if names is None else names
+    own = str(cfg.get("owner") or "").lower()
+    full = {(x.lower() if "/" in x else f"{own}/{x.lower()}") for x in map(str, names)}
+    return str(repo).lower() in full
+
+
 def eligible(issue, cfg, st, repo):
-    """(ok, why-not). Owner-authored, labelled, not already queued/tracked."""
+    """(ok, why-not). Owner-authored, labelled, not already queued/tracked, repo not excluded."""
     n = issue.get("number")
+    if is_excluded(repo, cfg):
+        return False, "excluded-repo"
     author = ((issue.get("author") or {}).get("login") or "").lower()
     if author != str(cfg["owner"]).lower():
         return False, "author-not-owner"
@@ -463,9 +498,68 @@ def package_issue(repo, rc, issue, judge=None, fetch=None, lane=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def auto_clone_on(cfg=None):
+    """Config "auto_clone" (default: on inside the queue container, off on the Mac)."""
+    v = (cfg or load_config()).get("auto_clone")
+    return bool(os.environ.get("QUEUE_IN_CONTAINER")) if v is None else bool(v)
+
+
+def git_auth_env():
+    """Environment that gives ONE git command the token without argv, .git/config or logs: GIT_CONFIG_COUNT/KEY/VALUE (git
+    2.31+) sets http.extraheader for github.com only. No token = plain env (git's own credential helper, if any)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    t = os.environ.get("GH_TOKEN") or gh_token()
+    if t:
+        import base64
+        cred = base64.b64encode(f"x-access-token:{t}".encode()).decode()
+        env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                    "GIT_CONFIG_VALUE_0": f"Authorization: Basic {cred}"})
+    return env
+
+
+def ensure_checkout(repo, rc):
+    """Auto-clone mode (the queue container starts with no checkouts): blobless-clone the repo into its checkout path the first
+    time one of its issues is accepted, and fetch before every job. Only called for a repo that already passed every gate
+    (not excluded, owner-authored labelled issue, cap). The remote URL carries no token and none is logged. A failed fetch
+    only warns (the job starts from the last fetched tip). True = go on (a checkout exists, or auto-clone is off and mini-auto decides)."""
+    co = Path(str(rc["checkout"])).expanduser()
+    if (co / ".git").exists():
+        if auto_clone_on():
+            try:
+                p = subprocess.run(["git", "-C", str(co), "fetch", "-q", "--prune", "origin"], capture_output=True, text=True,
+                                   timeout=300, env=git_auth_env())
+                if p.returncode:
+                    log(f"{repo}: fetch failed rc={p.returncode}")
+            except Exception as e:
+                log(f"{repo}: fetch error {type(e).__name__}")
+        return True
+    if not auto_clone_on():
+        return True                       # as before: mini-auto reports a missing checkout itself
+    try:
+        co.parent.mkdir(parents=True, exist_ok=True)
+        p = subprocess.run(["git", "clone", "-q", "--filter=blob:none", f"{os.environ.get('POLLER_CLONE_BASE') or 'https://github.com/'}{repo}.git", str(co)],
+                           capture_output=True, text=True, timeout=900, env=git_auth_env())
+    except Exception as e:
+        log(f"{repo}: clone error {type(e).__name__}")
+        shutil.rmtree(co, ignore_errors=True)
+        return False
+    if p.returncode:
+        shutil.rmtree(co, ignore_errors=True)
+        log(f"{repo}: clone failed rc={p.returncode}")
+        return False
+    log(f"{repo}: cloned")
+    return True
+
+
 def submit_issue(repo, rc, issue, model, judge=None, fetch=None):
     """Run mini-auto new ... --submit. -> (job_id or None, ok)."""
     n = issue["number"]
+    if is_excluded(repo, load_config()):
+        log(f"{repo}#{n}: excluded repo")
+        return None, False
+    if not ensure_checkout(repo, rc):
+        log(f"{repo}#{n}: no checkout")
+        return None, False
     name = job_name(repo, n)
     cmd = [*MINI_AUTO, "new", "--repo", str(Path(rc["checkout"]).expanduser()), "--base", rc.get("base") or "origin/main",
            "--name", name, "--desc-file", "-", "--submit", "--model", model, "--label", name]
@@ -606,7 +700,9 @@ def open_draft_pr(repo, n, rec, checkout=None):
                             capture_output=True, text=True, timeout=300)
         if sp.returncode:
             raise RuntimeError(f"private-info scan blocked the push (rc={sp.returncode})")
-        subprocess.run([*w, "push", "-q", "-u", "origin", branch], check=True, capture_output=True, timeout=300)
+        # The token as for clone/fetch (the container has no credential helper); none on the Mac = gh's own login.
+        subprocess.run([*w, "push", "-q", "-u", "origin", branch], check=True, capture_output=True, timeout=300,
+                       env=git_auth_env())
         gh("pr", "create", "--draft", "-R", repo, "--head", branch, "--title", f"Fix for issue #{int(n)}",
            "--body", PR_BODY.format(n=int(n)))
         log(f"{repo}#{n}: draft PR opened")
