@@ -15,8 +15,11 @@ The driver does every mechanical step itself and calls a pluggable judge only fo
   6 verdict   judge reads the packet: ok | reject
   7 report    judge writes the report; hard cap 120 words (deterministic fallback)
 
-Judges (J): darkbloom:<model> | unraid:<model>  -> the home queue's prompt-job door (POST /api/prompt-jobs), so a call
-            waits when the lane is busy or down; never a direct call to Darkbloom/Ollama.
+Judges (J): darkbloom:<model> | unraid:<model>  -> one queue row per call: `prompt-json-runner.py` uploaded through the
+            queue API (POST /api/jobs/upload, the token mini-submit uses) with the job's own --model and --host
+            (darkbloom -> studio-db, unraid -> unraid), so the queue picks the lane and pins that model; a call waits when
+            the lane is busy or down; never a direct call to Darkbloom/Ollama. MINI_LANE_DOOR=1 uses the old prompt-job
+            door instead (it needs the prompt token below and runs whatever model the lane has loaded).
             claude:haiku | claude:sonnet        -> signed-in `claude -p` (subscription). NEVER --bare, NEVER claude-api:
             these repos are private and private code must not go to API credits.
 Default judge: $MINI_LANE_JUDGE, else the one line in ~/.config/mini-lane/default-judge, else DEFAULT_JUDGE below.
@@ -292,9 +295,96 @@ class ClaudeJudge(Judge):
         return parse_object(raw), meta
 
 
+class EnqueueJudge(Judge):
+    """darkbloom:<model> | unraid:<model> as one queue row: prompt-json-runner.py uploaded with the job's own model and
+    host, so the queue (not the caller) picks the lane and BloomGauge pins that model on Darkbloom. No prompt token."""
+    HOSTS = {"darkbloom": "studio-db", "unraid": "unraid"}
+    LANES = {"darkbloom": "darkbloom", "unraid": "ollama"}   # prompt-json-runner's result "lane"
+
+    def __init__(self, lane, model, submit=None, fetch=None, poll_s=10.0, timeout_s=3600, sleep=time.sleep):
+        if lane not in self.HOSTS:
+            raise ValueError("lane must be darkbloom or unraid")
+        self.lane, self.model, self.spec = lane, model, f"{lane}:{model}"
+        self.submit, self.fetch = submit or self._submit, fetch or self._fetch
+        self.poll_s, self.timeout_s, self.sleep = poll_s, timeout_s, sleep
+
+    @staticmethod
+    def _qr():
+        sys.path.insert(0, str(Path.home() / "bin"))
+        import queue_config
+        import queue_remote
+        return queue_config, queue_remote
+
+    def ready(self):
+        """None when the queue API is configured with a token, else the reason."""
+        try:
+            qc, _ = self._qr()
+            return None if qc.queue_api_headers() else "no queue API token (~/.config/ollama-queue/queue-api-token)"
+        except Exception as e:  # noqa: BLE001
+            return f"queue client unavailable ({type(e).__name__})"
+
+    def _submit(self, task, job):
+        qc, qr = self._qr()
+        with tempfile.TemporaryDirectory(prefix="mini-lane-pj-") as td:
+            sp = Path(td) / "spec.json"
+            sp.write_text(json.dumps(task))
+            qr.build_package(sp, job, "prompt-json-runner.py", Path(td) / "p.tar")
+            return qr.upload(qc.queue_api()[0], qc.queue_api_headers(), Path(td) / "p.tar")["id"]
+
+    def _fetch(self, jid):
+        """-> (status, result record or None). Raises on a fetch that failed."""
+        qc, qr = self._qr()
+        with tempfile.TemporaryDirectory(prefix="mini-lane-pjr-") as td:
+            qr.fetch_result(qc.queue_api()[0], qc.queue_api_headers(), jid, td)
+            js, rs = list(Path(td).rglob("job.json")), list(Path(td).rglob("result.json"))
+            st = json.loads(js[0].read_text()).get("status") if js else None
+            return st, (json.loads(rs[0].read_text()) if rs else None)
+
+    def call(self, system, text, max_tokens=700):
+        task = {"system": fit(system, MAX_SYSTEM_B), "text": fit(text, MAX_TEXT_B), "json": True, "max_tokens": max_tokens}
+        job = {"model": self.model, "host": self.HOSTS[self.lane], "label": "lane-bakeoff-judge-" + uuid.uuid4().hex[:8]}
+        t0 = time.time()
+        try:
+            jid = self.submit(task, job)
+        except Exception as e:  # noqa: BLE001
+            raise JudgeError("E_QUEUE_DOWN", f"{type(e).__name__}: {str(e)[:160]}")
+        meta = {"judge": self.spec, "model": None, "lane": None, "wall_s": 0, "raw_chars": 0, "error": None, "job": jid}
+        rec, misses = None, 0
+        while True:
+            if time.time() - t0 > self.timeout_s:
+                raise JudgeError("E_TIMEOUT", f"{self.timeout_s}s in the queue (job {jid})")
+            try:
+                st, rec = self.fetch(jid)
+                misses = 0
+            except Exception:  # noqa: BLE001
+                st, rec, misses = None, None, misses + 1   # the queue blinked: keep waiting
+                if misses >= 30:
+                    raise JudgeError("E_QUEUE_DOWN", f"result fetch failed 30 times (job {jid})")
+            if rec is not None:
+                break
+            if st in ("failed", "cancelled", "killed", "blocked"):
+                raise JudgeError("E_FAILED", f"job {jid} {st}")
+            self.sleep(self.poll_s)
+        meta.update(model=rec.get("model"), lane=rec.get("lane"), wall_s=round(time.time() - t0, 1))
+        got = str(rec.get("model") or "")
+        if got and got.lower() != self.model.lower():
+            raise JudgeError("E_MODEL_MISMATCH", f"asked {self.model}, the queue answered with {got}")
+        if rec.get("lane") and rec.get("lane") != self.LANES[self.lane]:
+            raise JudgeError("E_LANE_MISMATCH", f"asked {self.lane}, answered on {rec.get('lane')}")
+        if not rec.get("ok") and rec.get("error") in ("E_TASK", "E_LANE"):
+            raise JudgeError(rec["error"], f"job {jid}")
+        res = rec.get("result")
+        meta["raw_chars"] = len(json.dumps(res)) if res is not None else 0
+        return (res if isinstance(res, dict) and set(res) != {"text"} else None), meta
+
+
 def make_judge(spec, **kw):
     kind, model = parse_judge_spec(spec)
-    return ClaudeJudge(model, **kw) if kind == "claude" else QueueJudge(kind, model, **kw)
+    if kind == "claude":
+        return ClaudeJudge(model, **kw)
+    if os.environ.get("MINI_LANE_DOOR") == "1":
+        return QueueJudge(kind, model, **kw)
+    return EnqueueJudge(kind, model, **kw)
 
 
 # --------------------------------------------------------------------------------------------------- judgment steps

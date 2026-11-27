@@ -45,6 +45,38 @@ class T(unittest.TestCase):
     def test_unparsed(self):
         Door.model = "m1"; Door.answer = {"nope": 1}
         self.assertFalse(L.judge_triage(self.q(), "r", "a")["parsed"])
+    def test_enqueue_judge(self):
+        subs = []
+        def submit(task, job): subs.append((task, job)); return "jid1"
+        seq = [("pending", None), ("running", None),
+               ("done", {"ok": True, "result": {"decision": "send", "reason": "x"}, "model": "m1", "lane": "ollama"})]
+        j = L.EnqueueJudge("unraid", "m1", submit=submit, fetch=lambda jid: seq.pop(0), poll_s=0, sleep=lambda s: None)
+        self.assertEqual(L.judge_triage(j, "r", "ask")["decision"], "send")
+        self.assertEqual(subs[0][1]["model"], "m1"); self.assertEqual(subs[0][1]["host"], "unraid")
+        self.assertTrue(subs[0][1]["label"].startswith("lane-bakeoff-judge-")); self.assertTrue(subs[0][0]["json"])
+        d = L.EnqueueJudge("darkbloom", "qm", submit=submit, fetch=lambda jid: ("done", {"ok": True, "result": {"a": 1}, "model": "qm", "lane": "darkbloom"}),
+                           poll_s=0, sleep=lambda s: None)
+        self.assertEqual(d.call("s", "t")[0], {"a": 1}); self.assertEqual(subs[-1][1]["host"], "studio-db")
+    def test_enqueue_judge_errors(self):
+        mk = lambda rec, st="done": L.EnqueueJudge("unraid", "m1", submit=lambda t, j: "j", fetch=lambda jid: (st, rec), poll_s=0, sleep=lambda s: None)
+        with self.assertRaises(L.JudgeError) as e: mk({"ok": True, "result": {}, "model": "other", "lane": "ollama"}).call("s", "t")
+        self.assertEqual(e.exception.code, "E_MODEL_MISMATCH")
+        with self.assertRaises(L.JudgeError) as e: mk({"ok": True, "result": {}, "model": "m1", "lane": "darkbloom"}).call("s", "t")
+        self.assertEqual(e.exception.code, "E_LANE_MISMATCH")
+        with self.assertRaises(L.JudgeError) as e: mk(None, "failed").call("s", "t")
+        self.assertEqual(e.exception.code, "E_FAILED")
+        self.assertIsNone(mk({"ok": False, "error": "E_NOT_JSON", "result": {"text": "no"}, "model": "m1", "lane": "ollama"}).call("s", "t")[0])
+        def boom(t, j): raise OSError("down")
+        with self.assertRaises(L.JudgeError) as e: L.EnqueueJudge("unraid", "m1", submit=boom, fetch=None).call("s", "t")
+        self.assertEqual(e.exception.code, "E_QUEUE_DOWN")
+        with self.assertRaises(ValueError): L.EnqueueJudge("claude", "m")
+    def test_make_judge_default_is_enqueue(self):
+        import os
+        os.environ.pop("MINI_LANE_DOOR", None)
+        self.assertIsInstance(L.make_judge("unraid:qwen3:8b"), L.EnqueueJudge)
+        os.environ["MINI_LANE_DOOR"] = "1"
+        try: self.assertIsInstance(L.make_judge("unraid:qwen3:8b", token="t"), L.QueueJudge)
+        finally: os.environ.pop("MINI_LANE_DOOR", None)
     def test_helpers(self):
         self.assertEqual(L.parse_object('<think>x</think>```json\n{"a":1}\n```'), {"a": 1})
         self.assertIsNone(L.parse_object("no json"))

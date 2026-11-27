@@ -291,7 +291,7 @@ def run_judge(spec, rnd_dir, rc, ec, limit, do_e2e, coding_model):
     out = rnd_dir / safe(spec)
     out.mkdir(parents=True, exist_ok=True)
     j = L.make_judge(spec)
-    if isinstance(j, L.QueueJudge):
+    if hasattr(j, "ready"):
         why = j.ready()
         if why:
             res = {"judge": spec, "blocked": why}
