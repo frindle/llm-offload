@@ -238,6 +238,17 @@ def job_result(job_id, qmod):
     return None
 
 
+def remote_states(prefix):
+    """{label: (state, job id)} for finished jobs on a remote queue: `ollama-queue.py status` shows nothing there (the queue's state file is
+    on another machine), so the finished ones come from the results API (`results --label <prefix> --json`)."""
+    r = subprocess.run([sys.executable, str(QUEUE), "results", "--label", prefix, "--json"], capture_output=True, text=True)
+    try:
+        rows = json.loads(r.stdout)
+    except ValueError:
+        return {}
+    return {x["label"]: (x.get("status") or "done", x["id"]) for x in rows if isinstance(x, dict) and x.get("label") and x.get("id") and (x.get("status") or "done") not in LIVE}
+
+
 def queue_is_remote():
     sys.path.insert(0, str(BIN))
     import queue_config
@@ -605,6 +616,8 @@ def main(argv=None):
                 """Poll the queue until every label in `want` ({label: task}) has left the live states or --max-wait is over."""
                 while want and time.time() - t0 < a.max_wait:
                     st = parse_status(subprocess.run([sys.executable, str(QUEUE), "status"], capture_output=True, text=True).stdout)
+                    if queue_is_remote():
+                        st = {**remote_states(f"bench-{runid}-"), **st}
                     for lab, t in list(want.items()):
                         if lab in st and st[lab][0] not in LIVE:
                             done[t] = st[lab]
