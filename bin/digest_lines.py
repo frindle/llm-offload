@@ -8,7 +8,7 @@ below is a backstop for the shapes it can see (emails, money, long numbers), not
   POST /api/digest-lines   {"app": "resell", "day": "YYYY-MM-DD", "lines": ["...", ...], "needs_you": false}
                            -> 200 {"ok": true, "day", "lines": n}; the last POST for an app + day wins ([] clears it)
 
-Rules: app in DIGEST_LINES_APPS (comma list, default "resell"); day = today or up to 2 days back (container clock);
+Rules: app in DIGEST_LINES_APPS (comma list, default "resell,claude,docker"); day = today or up to 2 days back (container clock);
 at most 10 lines of at most 200 characters; a line with "@", a currency sign or word (USD, EUR, GBP, dollars), an
 amount with cents (12.99, 12,99) or a run of 6+ digits -> 400 "line N looks private".
 needs_you (optional, default false) makes the email's subject say the app needs the operator.
@@ -35,7 +35,7 @@ APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 PRIVATE_RE = re.compile(r"[@$\u00a2-\u00a5\u20ac]|\d{6,}|\b\d+[.,]\d{2}\b|\b(?:usd|eur|gbp|dollars?)\b", re.I)
 DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")      # fromisoformat alone also takes 20261116 and 2026-W47-1
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
-TITLES = {"resell": "Resell", "claude": "Handled by Claude"}
+TITLES = {"resell": "Resell", "claude": "Handled by Claude", "docker": "Docker updates"}
 
 
 def token():
@@ -51,7 +51,7 @@ def token():
 
 
 def apps():
-    return [a.strip() for a in (os.environ.get("DIGEST_LINES_APPS") or "resell,claude").split(",") if APP_RE.match(a.strip())]
+    return [a.strip() for a in (os.environ.get("DIGEST_LINES_APPS") or "resell,claude,docker").split(",") if APP_RE.match(a.strip())]
 
 
 def store_dir(ddir=None):

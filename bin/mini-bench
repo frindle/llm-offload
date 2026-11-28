@@ -221,7 +221,7 @@ def parse_status(text):
 def enqueue_cmd(task, runid, rd, model):
     """mini-submit (checks C0-C8, fresh workdir, SUBMIT-OK.json) owns --cwd/--runner/--host/--task-kind; the rest passes through to enqueue."""
     return [sys.executable, str(BIN / "mini-submit"), str(Path(rd) / "spec.json"), "--label", f"bench-{runid}-{task}", "--model", model,
-            "--num-ctx", "131072", "--bundle", f"bench-{runid}"]
+            "--num-ctx", "131072", *([] if queue_is_remote() else ["--bundle", f"bench-{runid}"])]   # a remote queue has no bundles
 
 
 def job_result(job_id, qmod):
