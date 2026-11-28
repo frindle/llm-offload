@@ -1,0 +1,15 @@
+{
+ "repo": "plex-automation",
+ "commit": "24261f3",
+ "tests": [
+  "test_abandoned_audit.py"
+ ],
+ "allowed": [
+  "abandoned_audit.py"
+ ],
+ "baseline_green": [],
+ "red_tests": [
+  "test_no_video_dir_in_root_without_any_video",
+  "test_no_video_dir_skips_arr_folders"
+ ]
+}

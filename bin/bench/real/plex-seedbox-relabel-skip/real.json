@@ -1,0 +1,15 @@
+{
+ "repo": "plex-automation",
+ "commit": "a6e4147",
+ "tests": [
+  "test_supersede_remote_import.py"
+ ],
+ "allowed": [
+  "arr-webhook.py"
+ ],
+ "baseline_green": [],
+ "red_tests": [
+  "test_gap_fill_import_from_seedbox_does_not_ask_home_deluge",
+  "test_remote_import_supersedes_old_home_copy_without_resume"
+ ]
+}

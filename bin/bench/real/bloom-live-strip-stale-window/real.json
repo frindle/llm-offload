@@ -1,0 +1,19 @@
+{
+ "repo": "bloom-ledger",
+ "commit": "a174b02",
+ "tests": [
+  "ingest/test_live_status.py"
+ ],
+ "allowed": [
+  "ingest/bloom_accounting_live.py"
+ ],
+ "env": {
+  "PYTHONPATH": "lib"
+ },
+ "baseline_green": [
+  "test_bad_keys_are_refused_and_null_removes"
+ ],
+ "red_tests": [
+  "test_live_without_key_or_with_failures"
+ ]
+}

@@ -1,0 +1,16 @@
+{
+ "repo": "plex-automation",
+ "commit": "78f5255",
+ "tests": [
+  "tiering/offload/tests/test_newznab.py"
+ ],
+ "allowed": [
+  "tiering/offload/newznab.py"
+ ],
+ "baseline_green": [],
+ "red_tests": [
+  "test_title_matches",
+  "test_tv_search_sends_tvdbid_not_q_or_imdbid",
+  "test_tv_search_without_tvdbid_uses_title"
+ ]
+}

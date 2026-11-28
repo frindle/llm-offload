@@ -1,0 +1,16 @@
+{
+ "repo": "plex-automation",
+ "commit": "15d8e01",
+ "tests": [
+  "tiering/offload/tests/test_runner.py"
+ ],
+ "allowed": [
+  "tiering/offload/runner.py"
+ ],
+ "baseline_green": [
+  "test_always_window"
+ ],
+ "red_tests": [
+  "test_no_demote_when_the_promote_finished_before_the_demote_check"
+ ]
+}
