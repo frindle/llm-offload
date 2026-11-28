@@ -123,11 +123,23 @@ def _parse_one(text):
     if not isinstance(obj, dict):
         return out
 
+    def per_container(v):
+        """CA Auto Update's DockerUpdateSettings.json (seen 11-28): "containers": {name: {"name": .., "update": 1}}."""
+        return bool(v) and all(isinstance(x, dict) and "update" in x for x in v.values())
+
     def walk(d, depth=0):
         for k, v in d.items():
             kl = str(k).lower()
             if isinstance(v, dict) and depth < 3:
-                if re.search(r"docker|container|app", kl) and v and all(isinstance(x, (str, bool, int)) for x in v.values()):
+                if re.search(r"docker|container|app", kl) and per_container(v):
+                    for n, val in v.items():
+                        if _truthy(val["update"]) or _falsy(val["update"]):
+                            on = _truthy(val["update"])
+                            out["names"][str(n)] = on
+                            if isinstance(val.get("name"), str) and val["name"].strip():
+                                out["names"].setdefault(val["name"].strip(), on)
+                            out["known"] = True
+                elif re.search(r"docker|container|app", kl) and v and all(isinstance(x, (str, bool, int)) for x in v.values()):
                     for n, val in v.items():
                         if _truthy(val) or _falsy(val):
                             out["names"][str(n)] = _truthy(val)

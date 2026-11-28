@@ -53,6 +53,22 @@ chk("settings kv", s["known"] and s["all"] is False, s)
 s = W.parse_settings('{"x": 1}\n---FILE---\n{"dockerUpdateAll": "no", "docker": ["a"]}')
 chk("settings two files", s["known"] and s["all"] is False and s["names"] == {"a": True}, s)
 
+# CA Auto Update's real layout: AutoUpdateSettings.json (plugins) + DockerUpdateSettings.json (per container)
+CA_PLG = '{"notify": "no", "delay": 0, "Global": true, "cron": {"pluginCronFrequency": "Daily", "pluginCronHour": 0},' \
+         ' "ca.update.applications.plg": true, "community.applications.plg": true}'
+CA_DOCKER = '{"cron": {"dockerCronFrequency": "Daily", "dockerCronDay": "*", "dockerCronHour": 0},' \
+            ' "containers": {"radarr": {"name": "radarr", "update": 1}, "Some-Docker": {"name": "Some-Docker", "update": 1},' \
+            ' "off-one": {"name": "off-one", "update": 0}},' \
+            ' "global": {"dockerNotify": "yes", "dockerStopDelay": "10", "dockerUpdateAll": "no"}}'
+s = W.parse_settings(CA_PLG + "\n---FILE---\n" + CA_DOCKER)
+chk("settings CA layout", s["known"] and s["all"] is False
+    and s["names"] == {"radarr": True, "Some-Docker": True, "off-one": False}, s)
+chk("CA layout: listed container auto", W.classify(ctr("radarr", "i", DM), s) == "auto")
+chk("CA layout: name with 'docker' auto", W.classify(ctr("Some-Docker", "i", DM), s) == "auto")
+chk("CA layout: update 0 manual", W.classify(ctr("off-one", "i", DM), s) == "manual")
+chk("CA layout: unlisted dockerman manual", W.classify(ctr("other", "i", DM), s) == "manual")
+chk("CA layout: compose manual", W.classify(ctr("radarr", "i", CP), s) == "manual")
+
 # --- classify
 st_all = {"known": True, "all": True, "names": {"plex": False}}
 chk("compose is manual", W.classify(ctr("x", "i", CP), st_all) == "manual")
