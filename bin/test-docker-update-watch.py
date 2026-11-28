@@ -50,6 +50,9 @@ chk("settings list", s["known"] and s["names"] == {"a": True, "b": True}, s)
 s = W.parse_settings('dockerAll="no"\nfoo="bar"\n')
 chk("settings kv", s["known"] and s["all"] is False, s)
 
+s = W.parse_settings('{"x": 1}\n---FILE---\n{"dockerUpdateAll": "no", "docker": ["a"]}')
+chk("settings two files", s["known"] and s["all"] is False and s["names"] == {"a": True}, s)
+
 # --- classify
 st_all = {"known": True, "all": True, "names": {"plex": False}}
 chk("compose is manual", W.classify(ctr("x", "i", CP), st_all) == "manual")

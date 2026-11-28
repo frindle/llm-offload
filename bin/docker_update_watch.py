@@ -84,7 +84,22 @@ def _falsy(v):
     return not _truthy(v) and (isinstance(v, (bool, int, float)) or str(v).strip().lower() in _NO)
 
 
+FILE_SEP = "---FILE---"
+
+
 def parse_settings(text):
+    """Several files may be joined by a FILE_SEP line; their findings are merged (a named choice in a later file wins)."""
+    out = {"known": False, "all": None, "names": {}}
+    for part in (text or "").split(FILE_SEP):
+        r = _parse_one(part)
+        out["known"] = out["known"] or r["known"]
+        if r["all"] is not None:
+            out["all"] = r["all"]
+        out["names"].update(r["names"])
+    return out
+
+
+def _parse_one(text):
     """CA Auto Update's docker settings -> {"known": bool, "all": bool|None, "names": {name: bool}}.
 
     The plugin's file layout is not documented where this was written (no host access), so this is tolerant: a JSON
