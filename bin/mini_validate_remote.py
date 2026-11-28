@@ -88,6 +88,17 @@ def snapshot(spec_path):
     return text, mod.fingerprint(spec_path, json.loads(text), mod.load_runner())
 
 
+def _finished_row(base, headers, jid, td):
+    """The job's done.json (as a queue row) when the queue no longer lists the job but its result says it finished, else None."""
+    try:
+        d = Path(td) / "vanished"
+        QR.fetch_result(base, headers, jid, d)
+        row = json.loads((d / "done.json").read_text())
+    except (QR.RemoteError, OSError, ValueError):
+        return None
+    return row if isinstance(row, dict) and row.get("status") in ("done", "completed", "passed") and row.get("exit_code") == 0 else None
+
+
 def remote_validate(spec_path, model, label, say=print, timeout=7200, host="auto"):
     """Run the validate job. Returns (ok, jid, output): ok only when the queue ran V1-V8, C5 and C6 green and VALIDATION.md was
     written next to the spec. On failure output holds the reason / the job's log tail. Never raises for a queue problem.
@@ -119,6 +130,9 @@ def remote_validate(spec_path, model, label, say=print, timeout=7200, host="auto
                     break
                 # a cancelled job leaves the queue state at once: without this the submit waited out the whole timeout
                 if row is None and (seen or time.time() - start >= VANISH_GRACE_S):
+                    row = _finished_row(base, headers, jid, td)  # a PASSed job's card can be cleared at once: its result is still on the queue
+                    if row is not None:
+                        break
                     return False, jid, ("the validate job %s left the queue without finishing (cancelled?); validate again"
                                         % jid)
                 seen = seen or row is not None
