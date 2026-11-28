@@ -48,7 +48,7 @@
   {"route": "claude", "container": ["sonarr", "radarr", "lidarr"], "match": "notification to:? Webhook", "what": "An arr app could not reach its webhook"},
   {"route": "claude", "container": ["binhex-jackett", "radarr", "sonarr", "lidarr"], "match": "The tracker seems to be down|IndexerException.*failed \\(Error", "what": "An indexer's site was down (Jackett could not reach the tracker)", "counted_only": true,
    "why": "added 2026-11-20: recurring kind no rule covered"},
-  {"route": "claude", "container": "reselling-app-1", "match": "\\[fill-failure\\]", "what": "The resell extension could not fill a page (fill-failure)", "counted_only": true,
+  {"route": "claude", "container": "reselling-app-1", "match": "\\[fill-failure\\] .*(?:failed:|told=[1-9])", "what": "A resell order the extension could not fill was pushed as a note, or the fill-failure check itself failed (each run's 'told=0' count line is not counted)", "counted_only": true,
    "why": "added 2026-11-20: recurring kind no rule covered"},
   {"route": "claude", "container": "scrypted", "match": "prebuffer session .* with error|error while decoding MB", "what": "A camera stream hiccup in Scrypted (timeout or decode error)", "counted_only": true,
    "why": "added 2026-11-20: recurring kind no rule covered"},
