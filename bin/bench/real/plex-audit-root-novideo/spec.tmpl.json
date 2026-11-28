@@ -1,0 +1,13 @@
+{
+ "args": [
+  "--allowed",
+  "abandoned_audit.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "walk",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

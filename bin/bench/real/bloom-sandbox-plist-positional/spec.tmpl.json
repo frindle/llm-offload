@@ -1,0 +1,13 @@
+{
+ "args": [
+  "--allowed",
+  "lib/bloom_power_lib.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "sandbox_plist_status",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

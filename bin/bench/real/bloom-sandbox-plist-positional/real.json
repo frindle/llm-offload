@@ -1,0 +1,19 @@
+{
+ "repo": "bloom-ledger",
+ "commit": "ae57ec8",
+ "tests": [
+  "lib/test_sandbox_status_path.py"
+ ],
+ "allowed": [
+  "lib/bloom_power_lib.py"
+ ],
+ "env": {
+  "PYTHONPATH": "lib"
+ },
+ "baseline_green": [
+  "test_bounded_read_incident_once"
+ ],
+ "red_tests": [
+  "test_plist_sh_wrapper_positional_config"
+ ]
+}

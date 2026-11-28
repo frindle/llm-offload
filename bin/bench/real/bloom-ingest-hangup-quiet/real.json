@@ -1,0 +1,19 @@
+{
+ "repo": "bloom-ledger",
+ "commit": "b92ced8",
+ "tests": [
+  "ingest/test_client_hangup.py"
+ ],
+ "allowed": [
+  "ingest/server.py"
+ ],
+ "env": {
+  "PYTHONPATH": "lib"
+ },
+ "baseline_green": [
+  "test_other_errors_still_raise"
+ ],
+ "red_tests": [
+  "test_hangup_is_quiet"
+ ]
+}

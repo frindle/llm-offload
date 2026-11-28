@@ -1,0 +1,16 @@
+{
+ "args": [
+  "--allowed",
+  "tiering/offload/runner.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "_demote_block",
+  "--fn",
+  "run_pass",
+  "--single",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

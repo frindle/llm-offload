@@ -1,0 +1,20 @@
+{
+ "args": [
+  "--allowed",
+  "arr-webhook.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "handle_upgrade_import",
+  "--fn",
+  "handle_import_relabel",
+  "--single",
+  "--no-impact",
+  "--reach-anchor",
+  "handle_upgrade_import=flip_result, flip_name = relabel_download_to_base(download_id, source)",
+  "--reach-anchor",
+  "handle_import_relabel=result, name = relabel_download_to_base(download_id, source)"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

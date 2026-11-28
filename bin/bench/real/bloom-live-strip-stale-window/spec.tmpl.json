@@ -1,0 +1,12 @@
+{
+ "args": [
+  "--allowed",
+  "ingest/bloom_accounting_live.py",
+  "--runner",
+  "pytest",
+  "--no-fn",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

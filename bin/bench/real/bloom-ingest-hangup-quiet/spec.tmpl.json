@@ -1,0 +1,12 @@
+{
+ "args": [
+  "--allowed",
+  "ingest/server.py",
+  "--runner",
+  "pytest",
+  "--no-fn",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

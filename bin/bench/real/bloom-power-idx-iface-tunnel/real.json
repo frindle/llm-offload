@@ -1,0 +1,18 @@
+{
+ "repo": "bloom-ledger",
+ "commit": "a2d313b",
+ "tests": [
+  "lib/test_sampler_netbytes.py"
+ ],
+ "allowed": [
+  "lib/bloom_power_lib.py"
+ ],
+ "env": {
+  "PYTHONPATH": "lib"
+ },
+ "baseline_green": [],
+ "red_tests": [
+  "test_flows_on_a_vanished_interface_are_not_the_wire_but_still_count_for_their_process",
+  "test_tunnel_interfaces"
+ ]
+}

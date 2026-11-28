@@ -1,0 +1,16 @@
+{
+ "repo": "plex-automation",
+ "commit": "754601b",
+ "tests": [
+  "test_watch_hold.py"
+ ],
+ "allowed": [
+  "watch_hold.py"
+ ],
+ "baseline_green": [
+  "test_after_import_dry_run_writes_nothing"
+ ],
+ "red_tests": [
+  "test_ready_caps"
+ ]
+}

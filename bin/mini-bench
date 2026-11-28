@@ -36,6 +36,12 @@ from pathlib import Path
 HOME = Path.home()
 BIN = Path(os.path.realpath(__file__)).parent
 FIXTURES = BIN / "bench/mini"
+REAL = BIN / "bench/real"      # replays of merged commits: real.json {repo, commit, tests, allowed} + TASK.md + spec.tmpl.json + expect
+REAL_ORG = "https://github.com/frindle/"                 # the public repos the commits come from (clone fallback)
+REAL_LOCAL = HOME / "Desktop/GitHub Projects.nosync"     # local checkouts, preferred over a clone
+REAL_CACHE = HOME / ".ollama-dispatch/bench-real-cache"
+SANDBOX = "claude-sandbox"
+FLAGS_ON = {"MINI_ANCHORED_EDITS": "1", "MINI_CHILD_ENV": "minimal"}   # what `--flags on` sets for the job (spec "flags", read by the runner)
 QUEUE = BIN / "ollama-queue.py"
 QCTL = BIN / "qctl"
 RUNNER = BIN / "mini-swe-runner.py"
@@ -52,34 +58,118 @@ def load(path, name):
     return m
 
 
-def tasks_all():
-    return sorted(p.name for p in FIXTURES.iterdir() if (p / "spec.tmpl.json").is_file()) if FIXTURES.is_dir() else []
+def tasks_all(suite="mini"):
+    base = REAL if suite == "real" else FIXTURES
+    return sorted(p.name for p in base.iterdir() if (p / "spec.tmpl.json").is_file()) if base.is_dir() else []
+
+
+def task_dir(task):
+    return REAL / task if (REAL / task / "real.json").is_file() else FIXTURES / task
+
+
+def real_cfg(task):
+    return json.loads((REAL / task / "real.json").read_text())
+
+
+def real_repo(repo):
+    """Path of a git checkout of the public repo: the local one if present, else a clone in the cache."""
+    for p in (REAL_LOCAL / repo, REAL_CACHE / repo):
+        if (p / ".git").exists():
+            return p
+    REAL_CACHE.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "-q", REAL_ORG + repo + ".git", str(REAL_CACHE / repo)], check=True, capture_output=True)
+    return REAL_CACHE / repo
+
+
+def trim_tests(src, keep):
+    """The test file's source without every test_ function/method whose name is not in `keep` (the lane's validate gate allows at most 5 tests,
+    a real commit's file has more). Helpers, fixtures, imports and module code stay. Pure."""
+    import ast
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    drop = []
+
+    def walk(body):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test") and n.name not in keep:
+                drop.append((min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno))
+            elif isinstance(n, ast.ClassDef):
+                walk(n.body)
+    walk(tree.body)
+    for lo, hi in sorted(drop, reverse=True):
+        del lines[lo - 1:hi]
+    out = "".join(lines)
+    ast.parse(out)
+    return out
+
+
+def materialize_real(task, dst):
+    """The repo at the commit's parent, plus the commit's version of its test files (the check: fails on the parent, passes on the commit)."""
+    cfg = real_cfg(task)
+    repo = real_repo(cfg["repo"])
+    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", cfg["commit"] + "^{commit}"], check=True, capture_output=True, text=True).stdout.strip()
+    Path(dst).mkdir(parents=True)
+    arch = subprocess.Popen(["git", "-C", str(repo), "archive", commit + "~1"], stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-x", "-C", str(dst)], stdin=arch.stdout, check=True)
+    if arch.wait():
+        raise RuntimeError("git archive failed for " + task)
+    for t in cfg["tests"]:
+        out = Path(dst, t)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        data = subprocess.run(["git", "-C", str(repo), "show", f"{commit}:{t}"], check=True, capture_output=True).stdout
+        if cfg.get("red_tests") and t.endswith(".py"):   # only the tests that are red at the parent (the commit's own); the rest of the file stays in the repo's history
+            data = trim_tests(data.decode(), set(cfg["red_tests"]) | set(cfg.get("baseline_green") or [])).encode()
+        out.write_bytes(data)
 
 
 def setup(task, root):
-    """Copy the fixture's code tree to root/<task>, git init + commit. Returns the path."""
-    src, dst = FIXTURES / task, Path(root) / task
+    """Copy the fixture's code tree to root/<task> (a real task: materialize the repo at the commit's parent), git init + commit. Returns the path."""
+    src, dst = task_dir(task), Path(root) / task
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, ignore=lambda d, names: [n for n in names if Path(d) == src and (n in SKIP or n.startswith("TASK"))])
+    if (src / "real.json").is_file():
+        materialize_real(task, dst)
+    else:
+        shutil.copytree(src, dst, ignore=lambda d, names: [n for n in names if Path(d) == src and (n in SKIP or n.startswith("TASK"))])
     env = {**os.environ, **GIT_ENV}
     for c in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "bench fixture"]):
         subprocess.run(["git", *c], cwd=dst, check=True, capture_output=True, env=env)
     return dst
 
 
-def build_run(task, runid, wt, runs, ms):
+def build_run(task, runid, wt, runs, ms, flags="off"):
     """mini-spec the fixture; the fixture's TASK*.md (final contracts) replace the drafts. Returns (run dir, problems)."""
-    tmpl = json.loads((FIXTURES / task / "spec.tmpl.json").read_text())
+    tmpl = json.loads((task_dir(task) / "spec.tmpl.json").read_text())
     name = f"bench-{runid}-{task}"
-    r = subprocess.run([sys.executable, str(BIN / "mini-spec"), str(wt), str(FIXTURES / task / "TASK.md"), "--name", name, "--runs-dir", str(runs), *tmpl["args"]],
+    r = subprocess.run([sys.executable, str(BIN / "mini-spec"), str(wt), str(task_dir(task) / "TASK.md"), "--name", name, "--runs-dir", str(runs), *tmpl["args"]],
                        capture_output=True, text=True)
     rd = Path(runs) / name
     if not (rd / "spec.json").is_file():
         return rd, [f"mini-spec wrote no run dir (rc={r.returncode}): " + (r.stdout + r.stderr).strip()[-400:]]
-    for t in sorted((FIXTURES / task).glob("TASK*.md")):
+    for t in sorted(task_dir(task).glob("TASK*.md")):
         (rd / t.name).write_text(t.read_text())
     spec = json.loads((rd / "spec.json").read_text())
+    rc_ = real_cfg(task) if (REAL / task / "real.json").is_file() else {}
+    if rc_:                # the commit's own test is the frozen check (already in the baseline tree): point test_file/test_cmd/suite_cmd at it
+        tests = " ".join(rc_["tests"])
+        spec["test_file"] = rc_["tests"][0]
+        spec["baseline_green"] = list(rc_.get("baseline_green") or [])
+        spec["suite_baseline_red"] = "replayed commit: its own tests are red at the parent by design"
+        spec["test_cmd"] = spec["suite_cmd"] = f"python3 -m pytest -q -rA -p no:cacheprovider {tests}"
+        (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    if rc_:                # ref/: the allowed files as the solution commit has them (what mini-submit C1 and the reference check expect), in the run dir, never in the repo under test
+        repo = real_repo(rc_["repo"])
+        for f in rc_["allowed"]:
+            out = rd / "ref" / f
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(subprocess.run(["git", "-C", str(repo), "show", f"{rc_['commit']}:{f}"], check=True, capture_output=True).stdout)
+    renv = rc_.get("env")
+    if renv:               # check commands run with these (spec "env"), e.g. PYTHONPATH for a repo whose tests import its lib dir
+        spec["env"] = {**(spec.get("env") or {}), **renv}
+        (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
+    if flags == "on":      # the runner turns these into its MINI_* environment (spec "flags"); off leaves the spec untouched
+        spec["flags"] = dict(FLAGS_ON)
+        (rd / "spec.json").write_text(json.dumps(spec, indent=1) + "\n")
     bad = []
     got = (spec.get("intake") or {}).get("class")
     if got != tmpl.get("intake", "local-ready"):
@@ -90,11 +180,11 @@ def build_run(task, runid, wt, runs, ms):
     return rd, bad
 
 
-def check_fixture(task, runid, root, runs, ms):
+def check_fixture(task, runid, root, runs, ms, flags="off"):
     """setup + spec + lint + runner check + probe. Returns {lint, check, probe, problems}."""
     out = {"lint": None, "check": None, "probe": None, "problems": []}
     wt = setup(task, root)
-    rd, bad = build_run(task, runid, wt, runs, ms)
+    rd, bad = build_run(task, runid, wt, runs, ms, flags)
     out["run_dir"] = str(rd)
     out["problems"] += bad
     if not (rd / "spec.json").is_file():
@@ -103,6 +193,9 @@ def check_fixture(task, runid, root, runs, ms):
     out["lint"] = "ok" if lr.returncode == 0 else "FAIL"
     if lr.returncode:
         out["problems"].append("lint: " + (lr.stdout + lr.stderr).strip()[-300:])
+        return out
+    if (REAL / task / "real.json").is_file():   # a real task's tests never run on this machine: --verify-real proved them on claude-sandbox, the queue's validate job proves them again
+        out["check"] = out["probe"] = "sandbox"
         return out
     crc, cout = ms.check_only(rd)
     out["check"] = "ok" if crc == 0 else "FAIL"
@@ -145,6 +238,36 @@ def job_result(job_id, qmod):
     return None
 
 
+def queue_is_remote():
+    sys.path.insert(0, str(BIN))
+    import queue_config
+    return bool(queue_config.queue_is_remote())
+
+
+def fetch_run(jid, dest):
+    """GET the job's whole run dir from the remote queue into dest; returns the local run dir (where *.traj.json sit)."""
+    sys.path.insert(0, str(BIN))
+    import queue_config
+    import queue_remote as QR
+    base = queue_config.queue_api()[0]
+    QR.fetch_result(base, queue_config.queue_api_headers(), jid, dest, scope="run")
+    trajs = sorted(Path(dest).rglob("*.traj.json"))
+    return str(trajs[0].parent) if trajs else str(dest)
+
+
+def result_from_dir(rd, qmod):
+    """Last RESULT line found in the text files of a fetched run result (log tail, done.json), else None."""
+    for p in sorted(Path(rd).parent.rglob("*"), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True):
+        if p.is_file() and p.suffix in (".log", ".txt", ".json", ".livelog", "") and not p.name.endswith(".traj.json") and p.stat().st_size < 5_000_000:
+            try:
+                r = qmod.parse_runner_result(p.read_text(errors="replace")[-200000:])
+            except (OSError, ValueError):
+                continue
+            if r:
+                return r
+    return None
+
+
 def accepted_first_try(rd, verdict):
     names = [p.name for p in Path(rd).glob("*.traj.json")]
     return verdict == "PASS" and bool(names) and all(re.search(r"\.(?:s\d+)?[AB]1\.traj\.json$", n) for n in names)
@@ -179,6 +302,119 @@ def traj_stats(rd):
         a.pop("t0"), a.pop("t1")
     return {"attempts": att, "wall_s": round(hi - lo, 1) if lo is not None else 0.0, "steps": sum(a["steps"] for a in att),
             "peak_prompt": max((a["peak_prompt"] for a in att), default=0), "sum_prompt": sum(a["sum_prompt"] for a in att)}
+
+
+def edit_stats(rd):
+    """Edit-tool counters over a run dir's trajectories, the same for both arms: refused = `EDIT-REFUSED[kind]` outputs (anchored edits),
+    failed = edits that failed by mutation_recovery.classify (refusals past the free stale retry, shell patches that did not apply),
+    ok_anchored = `anchored_edit.py edit` calls that said EDIT-OK, failfast = trajectories that carry a `fail-fast:` / `killed by fail-fast` note."""
+    sys.path.insert(0, str(BIN))
+    import mutation_recovery as MRY
+    out = {"refused": 0, "refused_kinds": {}, "failed": 0, "ok_anchored": 0, "failfast": 0, "failfast_reasons": []}
+    for p in sorted(Path(rd).glob("*.traj.json")):
+        try:
+            msgs = json.loads(p.read_text()).get("messages", [])
+        except (OSError, ValueError):
+            continue
+        cmds, steps = {}, []
+        for m in msgs:
+            for tc in m.get("tool_calls") or []:
+                try:
+                    cmds[tc.get("id")] = (json.loads(tc["function"]["arguments"]) or {}).get("command", "")
+                except (KeyError, ValueError, TypeError):
+                    cmds[tc.get("id")] = ""
+            if m.get("role") == "tool":
+                steps.append((cmds.get(m.get("tool_call_id"), ""), str(m.get("content") or "")))
+        for c, o in steps:
+            for kind in MRY._REFUSED.findall(o):
+                out["refused"] += 1
+                out["refused_kinds"][kind] = out["refused_kinds"].get(kind, 0) + 1
+            if MRY._EDIT_CALL.search(c) and "EDIT-OK" in o:
+                out["ok_anchored"] += 1
+        k = [MRY.classify(c, o) for c, o in steps]
+        out["failed"] += sum(1 for x in k if x in ("stale", "refused", "patch"))
+        blob = " ".join(str(m.get("content") or "") for m in msgs if m.get("role") in ("user", "exit", "system") and "fail-fast" in str(m.get("content") or ""))
+        ffs = re.findall(r"(?:fail-fast: [^\n.]{0,80}|killed by fail-fast[^\n]{0,60})", blob + " " + json.dumps([m.get("extra") for m in msgs if m.get("role") == "exit"]))
+        if ffs:
+            out["failfast"] += 1
+            out["failfast_reasons"].append(ffs[0])
+    return out
+
+
+def verify_script(names):
+    """Shell script for claude-sandbox (stdin only): each real task at the commit's parent plus the commit's tests must FAIL, at the commit PASS."""
+    L = ["set -u", "W=/tmp/mini-bench-real; mkdir -p $W; cd $W",
+         "[ -x $W/venv/bin/python ] || python3 -m venv $W/venv >/dev/null 2>&1",
+         "PY=$W/venv/bin/python; $PY -m pip install -q pytest requests flask paramiko numpy cryptography blake3 >/dev/null 2>&1 || echo 'pip install failed'"]
+    for t in names:
+        c = real_cfg(t)
+        tests = " ".join(c["tests"])
+        L += [f"echo '== {t}'", f"[ -d $W/{c['repo']} ] || git clone -q {REAL_ORG}{c['repo']}.git $W/{c['repo']}", f"cd $W/{c['repo']}",
+              "git checkout -q -f --detach " + c["commit"] + "~1",
+              f"git checkout -q {c['commit']} -- {tests}",
+              f"export PYTHONPATH={c.get('env', {}).get('PYTHONPATH', '')}", f"$PY -m pytest -q -rA -p no:cacheprovider {tests} >$W/{t}.parent.log 2>&1; P=$?",
+              f"grep -E '^PASSED ' $W/{t}.parent.log | sed 's/^PASSED /BG {t} /'",
+              f"grep -E '^(FAILED|ERROR) ' $W/{t}.parent.log | sed 's/^\\(FAILED\\|ERROR\\) /RED {t} /'",
+              "git checkout -q -f --detach " + c["commit"],
+              f"$PY -m pytest -q -p no:cacheprovider {tests} >$W/{t}.commit.log 2>&1; C=$?",
+              f"echo \"VERIFY {t} parent_rc=$P commit_rc=$C\"", "git reset -q --hard; git clean -qfd", "cd $W"]
+    return "\n".join(L) + "\n"
+
+
+def verify_real(names):
+    """Run verify_script on claude-sandbox (never on this Mac); a task is sound only with parent_rc != 0 and commit_rc == 0."""
+    r = subprocess.run(["ssh", SANDBOX, "bash", "-s"], input=verify_script(names), capture_output=True, text=True, timeout=3600)
+    print(r.stdout + r.stderr[-600:])
+    bad = []
+    got = {m.group(1): (int(m.group(2)), int(m.group(3))) for m in re.finditer(r"^VERIFY (\S+) parent_rc=(\d+) commit_rc=(\d+)", r.stdout, re.M)}
+    for t in names:
+        if t not in got or got[t][0] == 0 or got[t][1] != 0:
+            bad.append(t)
+            continue
+        # tests of the commit's file that already pass on the parent are guards: the validate job needs them listed (spec baseline_green)
+        bg = sorted({m.group(1).split("::")[-1].split(" - ")[0].strip() for m in re.finditer(r"^BG " + re.escape(t) + r" (\S+)", r.stdout, re.M)})
+        red = sorted({re.sub(r"\[.*", "", m.group(1).split("::")[-1]).split(" - ")[0].strip() for m in re.finditer(r"^RED " + re.escape(t) + r" (\S+)", r.stdout, re.M)})
+        cfg = real_cfg(t)
+        guards = [g for g in bg if g not in red][:max(0, 2 - len(red))]   # the validate gate wants 2..5 tests: top up with guards (green at the parent)
+        if cfg.get("baseline_green") != guards or cfg.get("red_tests") != red:
+            cfg["baseline_green"], cfg["red_tests"] = guards, red
+            (REAL / t / "real.json").write_text(json.dumps(cfg, indent=1) + "\n")
+        print(f"verify-real: {t}: {len(red)} test(s) red at the parent" + ("" if 1 <= len(red) <= 5 else "  -- OUTSIDE the lane's 1..5 test cap: drop or split"))
+        if not 1 <= len(red) <= 5:
+            bad.append(t)
+    print("verify-real: " + ("all %d tasks fail on the parent and pass on the commit" % len(names) if not bad else "NOT SOUND: " + ", ".join(bad)))
+    return 1 if bad else 0
+
+
+def arm_summary(report):
+    """Per-arm numbers of one report: pass rate, steps (turns), wall, refusals, failed edits, fail-fast triggers."""
+    rows = [r for r in report["tasks"].values() if r.get("result_class")]
+    n = len(rows)
+    npass = sum(1 for r in rows if r["result_class"] == "PASS")
+    st = [r.get("stats") or {} for r in rows]
+    es = [r.get("edits") or {} for r in rows]
+    return {"flags": report.get("flags"), "tasks": n, "pass": npass, "pass_rate": round(npass / n, 2) if n else None,
+            "turns_total": sum(x.get("steps", 0) for x in st), "turns_mean": round(sum(x.get("steps", 0) for x in st) / n, 1) if n else None,
+            "wall_total_min": round(sum(x.get("wall_s", 0) for x in st) / 60, 1), "wall_mean_min": round(sum(x.get("wall_s", 0) for x in st) / 60 / n, 1) if n else None,
+            "edit_refused": sum(e.get("refused", 0) for e in es), "failed_edits": sum(e.get("failed", 0) for e in es),
+            "failfast_triggers": sum(e.get("failfast", 0) for e in es)}
+
+
+def compare(paths):
+    """Print the per-arm summaries and a per-task table of two or more report files (the OFF arm and the ON arm)."""
+    reps = [json.loads(Path(p).read_text()) for p in paths]
+    for r in reps:
+        print(json.dumps(arm_summary(r)))
+    tasks = sorted({t for r in reps for t in r["tasks"]})
+    print("\ntask  " + "  ".join(f"[{r.get('flags')}] result/steps/wall/refused/failed/ff" for r in reps))
+    for t in tasks:
+        cells = []
+        for r in reps:
+            x = r["tasks"].get(t) or {}
+            st, e = x.get("stats") or {}, x.get("edits") or {}
+            cells.append(f"{x.get('result_class', '-')}/{st.get('steps', '-')}/{round(st.get('wall_s', 0) / 60, 1)}m/{e.get('refused', '-')}/{e.get('failed', '-')}/{e.get('failfast', '-')}")
+        print(t + "  " + "  ".join(cells))
+    return 0
 
 
 def pctl(vals, q):
@@ -303,6 +539,11 @@ def main(argv=None):
     ap.add_argument("--runid", help="default: UTC timestamp")
     ap.add_argument("--dry-run", action="store_true", help="setup + spec + lint + check + probe only; nothing enqueued (temp dirs)")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--suite", choices=["mini", "real"], default="mini", help="mini: the fixtures in bench/mini; real: replays of merged public commits in bench/real")
+    ap.add_argument("--flags", choices=["off", "on"], default="off", help="on: the job runs with MINI_ANCHORED_EDITS=1 and MINI_CHILD_ENV=minimal (spec 'flags'); off: the runner's defaults")
+    ap.add_argument("--serial", action="store_true", help="submit one job, wait for it, then the next (default: all at once under one bundle)")
+    ap.add_argument("--verify-real", action="store_true", help="real suite: check on claude-sandbox that each task's test fails at the commit's parent and passes at the commit (no queue, no model)")
+    ap.add_argument("--compare", nargs="+", metavar="REPORT", help="print the per-arm summary of report files (OFF first, then ON) and exit")
     ap.add_argument("--self-test", action="store_true", help="pure helpers only (no fixtures built, no queue calls)")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--poll", type=int, default=60, help="seconds between queue polls")
@@ -311,7 +552,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    names = tasks_all()
+    if a.compare:
+        return compare(a.compare)
+    names = tasks_all(a.suite)
+    if a.verify_real:
+        return verify_real([n for n in names if not a.only or n in a.only.split(",")])
     if a.list:
         print("\n".join(names))
         return 0
@@ -325,7 +570,7 @@ def main(argv=None):
     if not names:
         print(f"mini-bench: no fixtures in {FIXTURES}", file=sys.stderr)
         return 2
-    runid = a.runid or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    runid = a.runid or (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) if a.suite == "mini" else ("n" if a.flags == "on" else "o") + time.strftime("%d%H%M", time.gmtime()))
     if not re.fullmatch(r"[A-Za-z0-9._-]+", runid):
         print("mini-bench: --runid must be [A-Za-z0-9._-]", file=sys.stderr)
         return 2
@@ -337,10 +582,10 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     runs.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    report = {"runid": runid, "dry_run": a.dry_run, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "tasks": {}}
+    report = {"runid": runid, "dry_run": a.dry_run, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "suite": a.suite, "flags": a.flags, "tasks": {}}
     for t in names:
         print(f"[mini-bench] {t}: setup/spec/lint/check/probe", flush=True)
-        r = check_fixture(t, runid, root, runs, ms)
+        r = check_fixture(t, runid, root, runs, ms, a.flags)
         report["tasks"][t] = r
         print(f"[mini-bench] {t}: lint={r['lint']} check={r['check']} probe={r['probe']}" + ("".join(f"\n    {p}" for p in r["problems"])), flush=True)
     sound = [t for t in names if not report["tasks"][t]["problems"]]
@@ -354,39 +599,63 @@ def main(argv=None):
     else:
         try:
             qmod = load(QUEUE, "ollama_queue")
+            done, pend, t0 = {}, {}, time.time()
+
+            def wait(want):
+                """Poll the queue until every label in `want` ({label: task}) has left the live states or --max-wait is over."""
+                while want and time.time() - t0 < a.max_wait:
+                    st = parse_status(subprocess.run([sys.executable, str(QUEUE), "status"], capture_output=True, text=True).stdout)
+                    for lab, t in list(want.items()):
+                        if lab in st and st[lab][0] not in LIVE:
+                            done[t] = st[lab]
+                            del want[lab]
+                            print(f"[mini-bench] {t}: finished ({st[lab][0]}, job {st[lab][1]})", flush=True)
+                    if want:
+                        time.sleep(a.poll)
+
             for t in sound:
                 r = report["tasks"][t]
+                if queue_is_remote():  # C3 needs a VALIDATION.md by the queue's runner: validate on the queue (V1-V8 run there, never on this machine)
+                    sys.path.insert(0, str(BIN))
+                    import mini_validate_remote as MVR
+                    for _try in range(3):  # a validate job that finishes fast can vanish from the status list before the poller sees it: validate again
+                        vok, vjid, vout = MVR.remote_validate(Path(r["run_dir"]) / "spec.json", a.model, f"bench-{runid}-{t}"[:48])
+                        if vok or "left the queue without finishing" not in str(vout):
+                            break
+                    r["validate_job"] = vjid
+                    print(f"[mini-bench] {t}: remote validate ok={vok} job={vjid}", flush=True)
+                    if not vok:
+                        r["problems"].append("validate: " + str(vout).strip()[-300:])
+                        r["enqueue_rc"] = 1
+                        continue
                 p = subprocess.run(enqueue_cmd(t, runid, r["run_dir"], a.model), capture_output=True, text=True)
                 r["enqueue_rc"] = p.returncode
-                m = re.search(r"^run_dir:\s*(\S.*)$", p.stdout, re.M)
+                m = re.search(r"^run_dir:\s*(\S.*?)(?:\s+\(on the queue\))?\s*$", p.stdout, re.M)
                 if m and not p.returncode:
-                    r["run_dir"] = m.group(1).strip()  # mini-submit's fresh <label>-<ts>/ dir: REVIEW*/traj files land here
+                    r["run_dir"] = m.group(1).strip()  # mini-submit's fresh <label>-<ts>/ dir: REVIEW*/traj files land here (on the queue when it is remote)
+                j = re.search(r"^job_id:\s*([0-9a-f]{6,64})", p.stdout, re.M)
+                r["job_id_submitted"] = j.group(1) if j else None
                 if p.returncode:
                     r["problems"].append("enqueue: " + (p.stdout + p.stderr).strip()[-300:])
-                print(f"[mini-bench] {t}: enqueue rc={p.returncode}", flush=True)
-            pend = {f"bench-{runid}-{t}": t for t in sound if not report["tasks"][t].get("enqueue_rc")}
-            t0 = time.time()
-            done = {}
-            while pend and time.time() - t0 < a.max_wait:
-                st = parse_status(subprocess.run([sys.executable, str(QUEUE), "status"], capture_output=True, text=True).stdout)
-                for lab, t in list(pend.items()):
-                    if lab in st and st[lab][0] not in LIVE:
-                        done[t] = st[lab]
-                        del pend[lab]
-                        print(f"[mini-bench] {t}: finished ({st[lab][0]}, job {st[lab][1]})", flush=True)
-                if pend:
-                    time.sleep(a.poll)
+                print(f"[mini-bench] {t}: enqueue rc={p.returncode} job={r['job_id_submitted']}", flush=True)
+                if not p.returncode:
+                    pend[f"bench-{runid}-{t}"] = t
+                    if a.serial:
+                        wait(pend)
+            wait(pend)
             for t in names:
                 r = report["tasks"][t]
                 if t in done:
                     state, jid = done[t]
-                    res = job_result(jid, qmod)
+                    if queue_is_remote():      # the queue's files are on another machine: fetch the run dir (work, trajectories, log tail) into the report dir
+                        r["run_dir"] = fetch_run(jid, out_dir / f"{runid}-{t}")
+                    res = job_result(jid, qmod) or result_from_dir(r["run_dir"], qmod)
                     verdict, cls, reason = res if res else (None, None, "")
                     r.update(job=jid, state=state, verdict=verdict, failure_class=cls, reason=reason, result_class=result_class(verdict, cls),
-                             first_try=accepted_first_try(r["run_dir"], verdict), stats=traj_stats(r["run_dir"]))
+                             first_try=accepted_first_try(r["run_dir"], verdict), stats=traj_stats(r["run_dir"]), edits=edit_stats(r["run_dir"]))
                 elif t in pend.values():
                     r.update(result_class="NO-RESULT", reason="still running at --max-wait")
-                exp = (FIXTURES / t / "expect").read_text().split()[0] if (FIXTURES / t / "expect").is_file() else "PASS"
+                exp = (task_dir(t) / "expect").read_text().split()[0] if (task_dir(t) / "expect").is_file() else "PASS"
                 r["expected"] = exp
                 rows.append({"task": t, "lint": r["lint"], "probe": r["probe"], "class": r.get("result_class") or "FIXTURE-BAD",
                              "first-try": "yes" if r.get("first_try") else "no", **stat_cells(r.get("stats")),
@@ -394,6 +663,7 @@ def main(argv=None):
         finally:
             finish_bench(runid)
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    report["summary"] = arm_summary(report)
     report["speed"] = speed_summary([r["stats"]["wall_s"] for r in report["tasks"].values() if (r.get("stats") or {}).get("attempts")])
     rp = out_dir / f"{runid}.json"
     rp.write_text(json.dumps(report, indent=1) + "\n")
@@ -402,11 +672,12 @@ def main(argv=None):
         print("\n" + attempt_table(report["tasks"]))
     if report["speed"].get("jobs"):
         print(f"\nspeed: {report['speed']} (target: median <= 15 min, p90 <= 25 min)")
+    print("\narm: " + json.dumps(report["summary"]))
     print(f"\nreport: {rp}")
     if a.dry_run:
         print(f"(dry-run: nothing enqueued; scratch dir {scratch})")
         return 0 if len(sound) == len(names) else 1
-    ok = all(report["tasks"][t].get("result_class") == "PASS" for t in names if (FIXTURES / t / "expect").read_text().split()[0] == "PASS")
+    ok = all(report["tasks"][t].get("result_class") == "PASS" for t in names if (task_dir(t) / "expect").read_text().split()[0] == "PASS")
     return 0 if ok and len(sound) == len(names) else 1
 
 

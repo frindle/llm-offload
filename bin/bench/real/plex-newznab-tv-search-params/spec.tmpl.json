@@ -1,0 +1,16 @@
+{
+ "args": [
+  "--allowed",
+  "tiering/offload/newznab.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "search_indexer",
+  "--fn",
+  "_clean",
+  "--single",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}

@@ -1,0 +1,13 @@
+{
+ "args": [
+  "--allowed",
+  "watch_hold.py",
+  "--runner",
+  "pytest",
+  "--fn",
+  "ready",
+  "--no-impact"
+ ],
+ "intake": "local-ready",
+ "steps": 1
+}
